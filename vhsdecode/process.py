@@ -1,8 +1,6 @@
-import math
 import os
 import time
 import numpy as np
-import threading
 import traceback
 import scipy.signal as sps
 from collections import namedtuple
@@ -20,8 +18,6 @@ from vhsdecode.chroma import demod_chroma_filt
 
 import vhsdecode.formats as vhs_formats
 
-from vhsdecode.addons.FMdeemph import FMDeEmphasis
-from vhsdecode.addons.FMdeemph import FMDeEmphasisB
 from vhsdecode.addons.chromasep import ChromaSepClass
 from vhsdecode.addons.resync import Resync
 from vhsdecode.addons.chromaAFC import ChromaAFC
@@ -46,6 +42,7 @@ from vhsdecode.compute_video_filters import (
     gen_fm_audio_notch_params,
     NONLINEAR_AMP_LPF_FREQ_DEFAULT,
 )
+from vhsdecode import compute_video_filters as cvf
 from vhsdecode.demodcache import DemodCacheTape
 
 
@@ -91,6 +88,7 @@ class VHSDecode(ldd.LDdecode):
         extra_options={},
         debug_plot=None,
     ):
+
         # monkey patch init with a dummy to prevent calling set_start_method twice on macos
         # and not create extra threads.
         # This is kinda hacky and should be sorted in a better way ideally.
@@ -127,8 +125,8 @@ class VHSDecode(ldd.LDdecode):
             debug_plot=debug_plot,
         )
 
-        if system == '405':
-           SysParams_PAL = sys_params_pal_temp
+        if system == "405":
+            SysParams_PAL = sys_params_pal_temp
 
         # Store reference to ourself in the rf decoder - needed to access data location for track
         # phase, may want to do this in a better way later.
@@ -248,7 +246,7 @@ class VHSDecode(ldd.LDdecode):
 
                     self.logger.status(outstr)
                 except Exception:
-                    logger.warning("file frame %d : VBI decoding error", rawloc)
+                    ldd.logger.warning("file frame %d : VBI decoding error", rawloc)
                     traceback.print_exc()
 
         return fi, False
@@ -409,11 +407,11 @@ class VHSDecode(ldd.LDdecode):
 
                     actualwhiteIRE = f.rf.hztoire(ire100_hz)
 
-                    sync_ire_diff = nb_abs(
+                    sync_ire_diff = lddu.nb_abs(
                         self.rf.hztoire(sync_hz) - self.rf.DecoderParams["vsync_ire"]
                     )
-                    whitediff = nb_abs(self.rf.hztoire(ire100_hz) - actualwhiteIRE)
-                    ire0_diff = nb_abs(self.rf.hztoire(ire0_hz))
+                    whitediff = lddu.nb_abs(self.rf.hztoire(ire100_hz) - actualwhiteIRE)
+                    ire0_diff = lddu.nb_abs(self.rf.hztoire(ire0_hz))
 
                     acceptable_diff = 2 if self.fields_written else 0.5
 
@@ -422,7 +420,7 @@ class VHSDecode(ldd.LDdecode):
                         vsync_ire = (sync_hz - ire0_hz) / hz_ire
 
                         if vsync_ire > -20:
-                            logger.warning(
+                            ldd.logger.warning(
                                 "At field #{0}, Auto-level detection malfunction (vsync IRE computed at {1}, nominal ~= -40), possible disk skipping".format(
                                     len(self.fieldinfo), np.round(vsync_ire, 2)
                                 )
@@ -551,7 +549,10 @@ class VHSRFDecode(ldd.RFDecode):
         self.last_raw_loc = None
 
         self.SysParams, self.DecoderParams = vhs_formats.get_format_params(
-            system, tape_format, ldd.logger
+            system,
+            tape_format,
+            vhs_formats.parse_tape_speed(rf_options.get("tape_speed", "sp")),
+            ldd.logger,
         )
 
         params_file = extra_options.get("params_file", None)
@@ -568,6 +569,7 @@ class VHSRFDecode(ldd.RFDecode):
         )
 
         export_raw_tbc = rf_options.get("export_raw_tbc", False)
+        ire0_adjust = rf_options.get("ire0_adjust", False)
         is_color_under = vhs_formats.is_color_under(tape_format)
         write_chroma = (
             is_color_under
@@ -601,15 +603,15 @@ class VHSRFDecode(ldd.RFDecode):
                 "export_raw_tbc",
                 "fm_audio_notch",
                 "chroma_offset",
+                "ire0_adjust",
             ],
         )(
             self.iretohz(100) * 2,
             tape_format,
             rf_options.get("disable_comb", False) or is_secam(system),
             rf_options.get("nldeemp", False),
-            self.DecoderParams.get(
-                "use_sub_deemphasis", rf_options.get("subdeemp", False)
-            ),
+            self.DecoderParams.get("use_sub_deemphasis", False)
+            or rf_options.get("subdeemp", False),
             rf_options.get("disable_right_hsync", False),
             rf_options.get("disable_dc_offset", False),
             # Always use this if we are decoding TYPEC since it doesn't have normal vsync.
@@ -631,6 +633,7 @@ class VHSRFDecode(ldd.RFDecode):
             export_raw_tbc,
             rf_options.get("fm_audio_notch", 0),
             int(self.DecoderParams.get("chroma_offset", 5) * (self.freq / 40.0)),
+            ire0_adjust,
         )
 
         # As agc can alter these sysParams values, store a copy to then
@@ -680,6 +683,7 @@ class VHSRFDecode(ldd.RFDecode):
             DP["chroma_bpf_upper"] / DP["color_under_carrier"],
             self.SysParams,
             self.DecoderParams["color_under_carrier"],
+            self.DecoderParams.get("chroma_bpf_order", 4),
             tape_format=tape_format,
             do_cafc=self._do_cafc,
         )
@@ -687,7 +691,7 @@ class VHSRFDecode(ldd.RFDecode):
         self.Filters["FVideoBurst"] = (
             self._chroma_afc.get_chroma_bandpass()
             if self._options.color_under
-            else self._chroma_afc.get_chroma_bandpass_final()
+            else self._chroma_afc.get_chroma_bandpass_final(False)
         )
 
         if self.options.chroma_deemphasis_filter:
@@ -721,9 +725,14 @@ class VHSRFDecode(ldd.RFDecode):
 
         # The following filters are for post-TBC:
         # The output sample rate is 4fsc
-        self.Filters["FChromaFinal"] = self._chroma_afc.get_chroma_bandpass_final()
+        out_size = self.SysParams["outlinelen"] * (
+            (self.SysParams["frame_lines"] // 2) + 1
+        )
+        self.Filters["FChromaFinal"] = self._chroma_afc.get_chroma_bandpass_final(
+            self._options.color_under
+        )
+
         if is_color_under:
-            self.Filters["FBurstNarrow"] = self._chroma_afc.get_burst_narrow()
             self.chroma_heterodyne = self._chroma_afc.getChromaHet()
             self.fsc_wave, self.fsc_cos_wave = self._chroma_afc.getFSCWaves()
 
@@ -854,39 +863,79 @@ class VHSRFDecode(ldd.RFDecode):
             )
         else:
             # Filter for rf before demodulating.
-            y_fm = lddu.filtfft(
-                sps.butter(
-                    DP["video_bpf_order"],
-                    [
-                        DP["video_bpf_low"] / self.freq_hz_half,
-                        DP["video_bpf_high"] / self.freq_hz_half,
-                    ],
-                    btype="bandpass",
-                ),
-                self.blocklen,
-            )
+            # Only use bpf if order defined - otherwise skip
+            if DP.get("video_bpf_order", None):
+                y_fm = lddu.filtfft(
+                    sps.butter(
+                        DP["video_bpf_order"],
+                        [
+                            DP["video_bpf_low"] / self.freq_hz_half,
+                            DP["video_bpf_high"] / self.freq_hz_half,
+                        ],
+                        btype="bandpass",
+                    ),
+                    self.blocklen,
+                )
+            else:
+                y_fm = None
 
-            y_fm_lowpass = lddu.filtfft(
+            # Gen fft filter from sos filter
+            # TODO: Move this elsewhere
+            def sosfiltfft(filter_value, block_len):
+                return sps.sosfreqz(filter_value, block_len, whole=True)[1]
+
+            y_fm_lowpass = sosfiltfft(
                 sps.butter(
                     DP["video_lpf_extra_order"],
                     [DP["video_lpf_extra"] / self.freq_hz_half],
                     btype="lowpass",
+                    output="sos",
                 ),
                 self.blocklen,
             )
 
-            y_fm_highpass = lddu.filtfft(
+            y_fm_highpass = sosfiltfft(
                 sps.butter(
                     DP["video_hpf_extra_order"],
                     [DP["video_hpf_extra"] / self.freq_hz_half],
                     btype="highpass",
+                    output="sos",
                 ),
                 self.blocklen,
             )
 
-            self.Filters["RFVideo"] = abs(y_fm) * abs(y_fm_lowpass) * abs(y_fm_highpass)
+            if y_fm is not None:
+                # Only use this if defined
+                self.Filters["RFVideo"] = (
+                    abs(y_fm) * abs(y_fm_lowpass) * abs(y_fm_highpass)
+                )
+            else:
+                self.Filters["RFVideo"] = abs(y_fm_lowpass) * abs(y_fm_highpass)
 
-        if self.options.fm_audio_notch != 0:
+        if DP.get("video_rf_peak_freq", False):
+            # Add optional rf peaking filter
+            from vhsdecode.addons.biquad import peaking
+
+            peaking_filter = lddu.filtfft(
+                peaking(
+                    DP["video_rf_peak_freq"] / self.freq_hz_half,
+                    DP.get("video_rf_peak_gain", 3),
+                    BW=DP.get("video_rf_peak_bandwidth", 2.5e6) / self.freq_hz_half,
+                    type="constantq",
+                ),
+                self.blocklen,
+            )
+            self.Filters["RFVideo"] *= abs(peaking_filter)
+
+        # b, a = ([1, -1], [1])
+        # rf_eq = filtfft((b, a), self.blocklen)
+        # self.Filters["rf_eq"] = b, a
+        # self.Filters["rf_eq_fft"] = abs(rf_eq)
+
+        # self.Filters["RFVideo"] *= abs(rf_eq)
+
+        # Make sure this is an int in case it could be passed in as a string via the gui.
+        if int(self.options.fm_audio_notch) > 0:
             if "fm_audio_channel_0_freq" in DP and "fm_audio_channel_1_freq" in DP:
                 # Optionally enable double notch filter on fm audio channel frequencies.
                 # This is mainly useful on VHS (and possibly PAL betamax with hifi?)
@@ -907,12 +956,15 @@ class VHSRFDecode(ldd.RFDecode):
                 )
 
         if DP.get("boost_rf_linear_0", None) is not None:
-            ramp = np.linspace(
-                DP["boost_rf_linear_0"],
-                DP["boost_rf_linear_20"] * (self.freq_hz_half / 20e6),
-                self.blocklen // 2,
+            ramp = cvf.gen_ramp_filter_params(
+                DP,
+                self.freq_hz_half,
+                self.blocklen,
             )
-            self.Filters["RFVideo"] *= np.concatenate((ramp, np.flip(ramp)))
+
+            self.Filters["RFVideo"] *= ramp
+            if DP.get("boost_rf_linear_double", False):
+                self.Filters["RFVideo"] *= ramp
 
         self.Filters["RFTop"] = sps.butter(
             1,
@@ -1069,7 +1121,7 @@ class VHSRFDecode(ldd.RFDecode):
         # on sharp transitions. Using filtfilt to avoid phase issues.
         if len(np.where(env == 0)[0]) == 0:  # checks for zeroes on env
             if self._high_boost is not None:
-                data_filtered = npfft.ifft(indata_fft)
+                data_filtered = npfft.ifft(indata_fft).real
                 high_part = utils.filter_simple(
                     data_filtered, self.Filters["RFTop"]
                 ) * ((env_mean * 0.9) / env)
@@ -1084,7 +1136,7 @@ class VHSRFDecode(ldd.RFDecode):
         demod = unwrap_hilbert(hilbert, self.freq_hz).real
 
         # If there are obviously out of bounds values, do an extra demod on a diffed waveform and
-        # replace the spikes with data from the diffed demod.
+        # replace the spikes with data from the diffed demod. (Which in practice is an extra EQed signal)
         if not self._disable_diff_demod:
             check_value = self.options.diff_demod_check_value
 
@@ -1164,7 +1216,7 @@ class VHSRFDecode(ldd.RFDecode):
                 self.blocklen,
                 self.Filters["FVideoNotch"],
                 self._notch,
-                move=int(self.options.chroma_offset)
+                move=int(self.options.chroma_offset),
                 # TODO: Do we need to tweak move elsewhere too?
                 # if cafc is enabled, this filtering will be done after TBC
             )
@@ -1195,6 +1247,7 @@ class VHSRFDecode(ldd.RFDecode):
                 chroma=out_chroma,
                 rf_filter=self.Filters["RFVideo"],
                 rfdecode=self,
+                plot_chroma_fft=True,
             )
 
         if self.options.export_raw_tbc:

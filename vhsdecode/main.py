@@ -27,6 +27,7 @@ from vhsdecode.cmdcommons import (
     test_input_file,
     test_output_file,
 )
+from vhsdecode.formats import TAPE_SPEEDS
 
 supported_tape_formats = {
     "VHS",
@@ -36,6 +37,7 @@ supported_tape_formats = {
     "UMATIC_HI",
     "BETAMAX",
     "BETAMAX_HIFI",
+    "SUPERBETA",
     "VIDEO8",
     "HI8",
     "EIAJ",
@@ -50,7 +52,8 @@ def main(args=None, use_gui=False):
     import vhsdecode.formats as f
 
     parser, debug_group = common_parser(
-        "Extracts video from raw rf captures of colour-under tapes", use_gui=use_gui
+        "Extracts video from RAW RF captures of colour-under & composite modulated tapes",
+        use_gui=use_gui,
     )
     if not use_gui:
         parser.add_argument(
@@ -76,7 +79,17 @@ def main(args=None, use_gui=False):
         metavar="tape_format",
         default="VHS",
         choices=supported_tape_formats,
-        help="Tape format, currently VHS (Default), VHSHQ, SVHS, UMATIC, UMATIC_HI, BETAMAX, BETAMAX_HIFI, VIDEO8, HI8 ,EIAJ, VCR, VCR_LP, TYPEC and TYPEB, are supported",
+        help="Tape format, currently VHS (Default), VHSHQ, SVHS, UMATIC, UMATIC_HI, BETAMAX, BETAMAX_HIFI, SUPERBETA, VIDEO8, HI8 ,EIAJ, VCR, VCR_LP, TYPEC and TYPEB, are supported",
+    )
+    parser.add_argument(
+        "--ts",
+        "--tape_speed",
+        type=str.lower,
+        dest="tape_speed",
+        metavar="tape_speed",
+        default="sp",
+        choices=TAPE_SPEEDS.keys(),
+        help="Tape speed selection for adjusting format parameters. SP (default), LP, SLP, EP, and VP. Only supported for some formats. SLP and EP refers to the same speed.",
     )
     parser.add_argument(
         "--params_file",
@@ -95,6 +108,13 @@ def main(args=None, use_gui=False):
         type=float,
         default=0.1,
         help="Multiply top/bottom IRE in json by 1 +/- this value (used to avoid clipping on RGB conversion in chroma decoder).",
+    )
+    luma_group.add_argument(
+        "--ire0_adjust",
+        dest="ire0_adjust",
+        action="store_true",
+        default=False,
+        help="Automatic adjust of ire0 based blanking level",
     )
     luma_group.add_argument(
         "--high_boost",
@@ -119,6 +139,7 @@ def main(args=None, use_gui=False):
         nargs="?",
         default=0,
         const=10,
+        type=float,
         help="Enable notch filter on FM audio frequencies to filter out wave-like pattern from interference, mainly useful on VHS. Optional argument to specify Q factor (filter width)",
     )
     if not use_gui:
@@ -377,6 +398,8 @@ def main(args=None, use_gui=False):
     rf_options["saved_levels"] = args.saved_levels
     rf_options["skip_hsync_refine"] = args.skip_hsync_refine
     rf_options["export_raw_tbc"] = args.export_raw_tbc
+    rf_options["tape_speed"] = args.tape_speed
+    rf_options["ire0_adjust"] = args.ire0_adjust
 
     extra_options = get_extra_options(args, not use_gui)
     extra_options["params_file"] = args.params_file
@@ -416,7 +439,7 @@ def main(args=None, use_gui=False):
         system=system,
         tape_format=tape_format,
         doDOD=not args.nodod,
-        threads=args.threads if not debug_plot else 1,
+        threads=args.threads if not debug_plot else 0,
         inputfreq=sample_freq,
         level_adjust=args.level_adjust,
         rf_options=rf_options,

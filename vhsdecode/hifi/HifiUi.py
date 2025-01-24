@@ -52,7 +52,7 @@ class MainUIParameters:
         self.grc = False
         self.preview: bool = False
         self.preview_available: bool = True
-        self.audio_sample_rate: int = 44100
+        self.audio_sample_rate: int = 48000
         self.standard: str = "PAL"
         self.format: str = "VHS"
         self.audio_mode: str = "Stereo"
@@ -82,7 +82,7 @@ def ui_parameters_to_decode_options(values: MainUIParameters):
     decode_options = {
         "input_rate": float(values.input_sample_rate) * 1e6,
         "standard": "p" if values.standard == "PAL" else "n",
-        "format": "vhs" if values.format == "VHS" else "h8",
+        "format": "vhs" if values.format == "VHS" else "8mm",
         "preview": values.preview,
         "original": False,
         "noise_reduction": values.noise_reduction,
@@ -93,15 +93,19 @@ def ui_parameters_to_decode_options(values: MainUIParameters):
         "gain": values.volume,
         "input_file": values.input_file,
         "output_file": values.output_file,
-        "mode": "s"
-        if values.audio_mode == "Stereo"
-        else "l"
-        if values.audio_mode == "L"
-        else "r"
-        if values.audio_mode == "R"
-        else "mpx"
-        if values.audio_mode == "Stereo MPX"
-        else "sum",
+        "mode": (
+            "s"
+            if values.audio_mode == "Stereo"
+            else (
+                "l"
+                if values.audio_mode == "L"
+                else (
+                    "r"
+                    if values.audio_mode == "R"
+                    else "mpx" if values.audio_mode == "Stereo MPX" else "sum"
+                )
+            )
+        ),
     }
     return decode_options
 
@@ -167,7 +171,7 @@ class InputDialog(QDialog):
 
     def get_input_value(self):
         result = self.exec()  # Ejecutar el diálogo de entrada
-        if result == QDialog.Accepted:
+        if result == QDialog.accepted:
             return self.input_line.text()
         else:
             return None
@@ -283,6 +287,8 @@ class HifiUi(QMainWindow):
         self.input_samplerate_combo.addItems(
             [
                 "DdD (40.0)",
+                "Clockgen (10.0)",
+                "RTLSDR (8.0)",
                 "cxadc (28.64)",
                 "cxadc3 (35.8)",
                 "10cxadc (14.32)",
@@ -292,6 +298,8 @@ class HifiUi(QMainWindow):
         )
         self._input_combo_rates = [
             40.0,
+            10.0,
+            8.0,
             28.64,
             35.8,
             14.32,
@@ -371,7 +379,9 @@ class HifiUi(QMainWindow):
         )
         self.change_button_color(self.stop_button, "#eee")
         # disables maximize button
-        self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowType.WindowMaximizeButtonHint)
+        self.setWindowFlags(
+            self.windowFlags() & ~QtCore.Qt.WindowType.WindowMaximizeButtonHint
+        )
         # disables resize
         self.setFixedWidth(int(self.sizeHint().width() * 3 / 4))
         # sets fixed height
@@ -583,7 +593,10 @@ class HifiUi(QMainWindow):
             ]
 
     def generic_message_box(
-        self, title: str, message: str, type: QMessageBox.Icon = QMessageBox.Icon.Information
+        self,
+        title: str,
+        message: str,
+        type: QMessageBox.Icon = QMessageBox.Icon.Information,
     ):
         message_box = QMessageBox(type, title, message, parent=self)
         message_box.setIcon(type)

@@ -18,6 +18,7 @@ class ChromaAFC:
         under_ratio,
         sys_params,
         color_under_carrier_f,
+        chroma_bandpass_order=4,
         linearize=False,
         plot=False,
         tape_format="VHS",
@@ -37,6 +38,7 @@ class ChromaAFC:
         self.out_sample_rate_mhz = self.fsc_mhz * 4
         self.samp_rate = self.out_sample_rate_mhz * 1e6
         self.bpf_under_ratio = under_ratio
+        self._chroma_bandpass_order = chroma_bandpass_order
         self.out_frequency_half = self.out_sample_rate_mhz / 2
         self.fieldlen = sys_params["outlinelen"] * max(sys_params["field_lines"])
         self.samples = np.arange(self.fieldlen)
@@ -355,9 +357,7 @@ class ChromaAFC:
             fine_tune_threshold = (
                 self.fh
                 if self.tape_format == "UMATIC"
-                else self.fh / 2
-                if self.tape_format == "BETAMAX"
-                else self.fh / 4
+                else self.fh / 2 if self.tape_format == "BETAMAX" else self.fh / 4
             )
 
             carrier_freq = self.fineTune(peak_freq, fine_tune_threshold)
@@ -456,40 +456,61 @@ class ChromaAFC:
     def get_chroma_bandpass(self):
         freq_hz_half = self.demod_rate / 2
         return sps.butter(
-            2,
+            self._chroma_bandpass_order,
             [
-                50000 / freq_hz_half,
+                60000 / freq_hz_half,
                 self.cc_freq_mhz * 1e6 * self.bpf_under_ratio / freq_hz_half,
             ],
             btype="bandpass",
             output="sos",
         )
 
-    def get_burst_narrow(self):
-        return sps.butter(
-            2,
-            [
-                self.cc_freq_mhz - 0.2 / self.out_frequency_half,
-                self.cc_freq_mhz + 0.2 / self.out_frequency_half,
-            ],
-            btype="bandpass",
-            output="sos",
-        )
+    # def get_burst_narrow(self):
+    #     return sps.butter(
+    #        2,
+    #        [
+    #            self.cc_freq_mhz - 0.2 / self.out_frequency_half,
+    #            self.cc_freq_mhz + 0.2 / self.out_frequency_half,
+    #        ],
+    #        btype="bandpass",
+    #        output="sos",
+    #    )
 
     # Final band-pass filter for chroma output.
     # Mostly to filter out the higher-frequency wave that results from signal mixing.
     # Needs tweaking.
     # Note: order will be doubled since we use filtfilt.
-    def get_chroma_bandpass_final(self):
+    def get_chroma_bandpass_final(self, color_under_format=True):
+        if color_under_format:
+            lower = (self.color_under / 1e6) * 1
+            upper = (self.color_under / 1e6) * 0.85
+        else:
+            # Using a narrow filter atm as this is just used for
+            # picking out burst signal in this case.
+            lower = 0.1
+            upper = 0.1
+
         return sps.butter(
-            1,
+            4,
             [
-                (self.fsc_mhz - 0.64) / self.out_frequency_half,
-                (self.fsc_mhz + 0.54) / self.out_frequency_half,
+                (self.fsc_mhz - lower) / self.out_frequency_half,
+                (self.fsc_mhz + upper) / self.out_frequency_half,
             ],
             btype="bandpass",
             output="sos",
         )
+
+    # def get_chroma_bandpass_final_fft(self, block_len):
+    #    color_under_mhz = self.color_under / 1e6
+    #    return compute_video_filters.gen_bpf_supergauss(
+    #        # TODO: Need to check whether these values are
+    #        # quite what we want for all formats.
+    #        self.fsc_mhz - 0.64,
+    #        self.fsc_mhz + 0.64,
+    #        8,
+    #        self.out_frequency_half,
+    #        block_len,
+    #    )
 
     def get_narrowband_bandpass(self):
         min_f, max_f = self.get_band_tolerance()

@@ -263,9 +263,11 @@ def process_chroma(
         lineoffset,
         linesout,
         outwidth,
-        field.rf.chroma_afc.getChromaHet()
-        if (field.rf.do_cafc and not disable_tracking_cafc)
-        else field.rf.chroma_heterodyne,
+        (
+            field.rf.chroma_afc.getChromaHet()
+            if (field.rf.do_cafc and not disable_tracking_cafc)
+            else field.rf.chroma_heterodyne
+        ),
         phase_rotation,
         starting_phase,
     )
@@ -276,6 +278,12 @@ def process_chroma(
     # carrier frequency here.
     # We do however want to be careful to avoid filtering out too much of the sideband.
     uphet = utils.filter_simple(uphet, field.rf.Filters["FChromaFinal"])
+
+    # FFT filter way to use a supergauss filter to more sharply cut out the upper harmonic
+    # This may be a better approach but slows down things a bit much so not using for now
+    # orig_len = len(uphet)
+    # uphet = np_fft.irfft(np_fft.rfft(uphet) * field.rf.Filters["FChromaFinal"], n=orig_len)
+
     if do_chroma_deemphasis:
         b, a = field.rf.Filters["chroma_deemphasis"]
         uphet = sps.lfilter(b, a, uphet)

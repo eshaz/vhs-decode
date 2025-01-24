@@ -21,6 +21,7 @@ def plot_data_and_pulses(
     linelocs=None,
     pulses=None,
     extra_lines=None,
+    vblank_lines=None,
     threshold=None,
 ):
     import matplotlib.pyplot as plt
@@ -39,6 +40,8 @@ def plot_data_and_pulses(
         if pulses is not None:
             plots += 1
         if extra_lines is not None:
+            plots += 1
+        if vblank_lines is not None:
             plots += 1
 
         plots = max(2, plots)
@@ -72,10 +75,26 @@ def plot_data_and_pulses(
             for ll in linelocs:
                 ax[ax_number].axvline(ll)
 
+        if vblank_lines is not None:
+            ax_number += 1
+            ax[ax_number].set_title("V-blanking Pulses")
+            for ll in vblank_lines:
+                ax[ax_number].axvline(ll)
+
         if extra_lines is not None:
             ax_number += 1
-            for extra_line in extra_lines:
-                ax[ax_number].axvline(extra_line, color="#0000FF")
+            colors = [
+                "#FF0000",
+                "#00FF00",
+                "#0000FF",
+                "#FF0000",
+                "#FFFF00",
+                "#000000",
+                "#00FFFF",
+                "#888888",
+            ]
+            for extra_line, color in zip(extra_lines, colors):
+                ax[ax_number].axvline(extra_line, color=color)
 
         # to_right_edge = self.usectoinpx(self.rf.SysParams["hsyncPulseUS"]) + (
         #    2.25 * (self.rf.freq / 40.0)
@@ -142,6 +161,7 @@ def plot_input_data(
     rfdecode,
     plot_db=True,
     plot_demod_fft=False,
+    plot_chroma_fft=False,
 ):
     import matplotlib.pyplot as plt
     from matplotlib import rc_context
@@ -213,6 +233,21 @@ def plot_input_data(
                 freq_array,
                 to_db_power(abs(np.fft.rfft(filtered_video))),
                 color="#FF0000",
+            )
+        elif plot_chroma_fft:
+            fig2, (ax4, ax5) = plt.subplots(2, 1, sharex=True, sharey=False)
+            # ax5 = fig2.add_subplot(2, 1, 2)
+            ax5.plot(
+                freq_array,
+                to_plot(raw_fft[:half_size]),
+                color="#00FF00",
+                label="Raw input",
+            )
+            ax5.plot(
+                freq_array,
+                to_db_power(abs(np.fft.rfft(chroma))),
+                color="#FF0000",
+                label="Filtered chroma",
             )
         else:
             fig2, ax4 = plt.subplots(1, 1, sharey=False)
@@ -412,9 +447,36 @@ def plot_deemphasis(rf, filter_video_lpf, decoder_params, filter_deemp):
     ax3.plot(
         freqs,
         rf.Filters["FVideo"][:blocklen_half].imag,
-        label="Deemphasis + lpf phase", color="#990000",
+        label="Deemphasis + lpf phase",
+        color="#990000",
     )
     ax2.legend()
     ax3.legend()
     plt.show()
     sys.exit()
+
+
+def plot_final_chroma_field(input_chroma, final_chroma) -> None:
+    import math
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import scipy.signal as sps
+
+    import matplotlib.pyplot as plt
+    from matplotlib import rc_context
+    import numpy as np
+
+    with rc_context(
+        {"figure.figsize": (14, 10), "figure.constrained_layout.use": True}
+    ):
+        fig, (ax1, ax2) = plt.subplots(2, 1)  # , sharex=True)
+
+        ax1.plot(input_chroma)
+        ax1.plot(final_chroma, color="#AA0000")
+        ax2.plot(to_db_power(np.fft.rfft(input_chroma)))
+        ax2.plot(to_db_power(np.fft.rfft(final_chroma)), color="#AA0000")
+
+        ax1.legend()
+        ax2.legend()
+        plt.show()
+        sys.exit()

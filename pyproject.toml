@@ -6,7 +6,7 @@ requires = ["setuptools>=61", "setuptools_scm>=6.2", "wheel", "Cython", "numpy"]
 [project]
 name = "vhs_decode"
 description = "Software Decoder for raw rf captures of laserdisc, vhs and other analog video formats"
-readme = "README.md"
+readme = "README_pypi.md"
 requires-python = ">=3.8"
 keywords = ["laserdisc", "vhs", "video", "tape", "decoder"]
 license = {file = "LICENSE"}
@@ -14,7 +14,7 @@ classifiers = [
     "Topic :: Multimedia :: Video",
 ]
 dependencies = [
-    "numpy>=1.22","numba>=0.58.1","scipy>=1.10.1","samplerate", "static-ffmpeg", "cython", "soundfile", "sounddevice", "importlib_resources >= 5.0; python_version < '3.10'"
+    "numpy>=1.22","numba>=0.58.1","scipy>=1.10.1","samplerate", "static-ffmpeg", "cython", "soundfile", "sounddevice", "importlib_resources >= 5.0; python_version < '3.10'", "matplotlib"
 ]
 dynamic = ["version"]
 # version = "0.2.1dev0"

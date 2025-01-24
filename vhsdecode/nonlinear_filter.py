@@ -2,7 +2,6 @@ import numpy.fft as npfft
 
 import scipy.signal as sps
 import numpy as np
-import lddecode.utils as lddu
 import math
 from vhsdecode.utils import filter_simple
 
@@ -73,20 +72,20 @@ def sub_deemphasis_inner(
     # Get the instantaneous amplitude of the signal using the hilbert transform
     # and divide by the formats specified deviation so we get a amplitude compared to the specifications references.
     amplitude = abs(sps.hilbert(hf_part)) / deviation
-    amplitude = filter_simple(amplitude, filters["NLAmplitudeLPF"])
-
+    # Clip the value after filtering to make sure we don't go negative
+    amplitude = np.clip(filter_simple(amplitude, filters["NLAmplitudeLPF"]), 0, None)
     if debug_const_amplitude:
         amplitude = debug_const_amplitude
 
     if linear_scale_1 is not None:
         amplitude *= linear_scale_1
-    # Scale the amplitude by a exponential factore (typically less than 1 so it ends up being a root function of osrts)
+    # Scale the amplitude by a exponential factore (typically less than 1 so it ends up being a root function of sorts)
     amplitude = np.power(amplitude, exponential_scale)
     if linear_scale_2 is not None:
         amplitude *= linear_scale_2
 
     if logistic_rate is not None and logistic_rate > 0:
-        amplitude *= (1 / (1 + np.e**(-logistic_rate * (amplitude - logistic_mid))))
+        amplitude *= 1 / (1 + np.e ** (-logistic_rate * (amplitude - logistic_mid)))
 
     # Scale the band-pass filtered signal by one minus the resulting referenc
     # e.g this means it get scaled more at lower amplitudes.

@@ -87,13 +87,12 @@ def gen_custom_video_filters(filter_list, freq_hz, block_len):
 
 def gen_video_lpf(corner_freq, order, nyquist_hz, block_len):
     """Generate real-value fir and fft post-demodulation low pass filters from parameters"""
-    video_lpf = sps.butter(order, corner_freq / nyquist_hz, "lowpass")
     video_lpf_b = sps.butter(order, corner_freq / nyquist_hz, "lowpass", output="sos")
     video_lpf_fft = abs(
         sps.sosfreqz(video_lpf_b, block_len, whole=True)[1][: block_len // 2 + 1]
     )
 
-    return (video_lpf, video_lpf_fft)
+    return (video_lpf_b, video_lpf_fft)
 
 
 def gen_video_lpf_supergauss(corner_freq, order, nyquist_hz, block_len):
@@ -195,8 +194,8 @@ def gen_nonlinear_bandpass(upper_freq, lower_freq, order, nyquist_hz, block_len)
 
 
 def gen_fm_audio_notch_params(rf_params, notch_q, nyquist_hz, block_len):
-    """ Generate dual notch filter for fm audio frequencies specified in rf_params
-        assumes these keys exist.
+    """Generate dual notch filter for fm audio frequencies specified in rf_params
+    assumes these keys exist.
     """
     return gen_fft_notch(
         rf_params["fm_audio_channel_0_freq"], notch_q, nyquist_hz, block_len
@@ -208,4 +207,39 @@ def gen_fm_audio_notch_params(rf_params, notch_q, nyquist_hz, block_len):
 def gen_fft_notch(notch_freq, notch_q, nyquist_hz, block_len):
     return filtfft(
         sps.iirnotch(notch_freq / nyquist_hz, notch_q), block_len, whole=True
+    )
+
+
+def gen_ramp_filter(
+    start_freq_hz: float,
+    boost_start: float,
+    # max_freq_hz: float,
+    boost_max: float,
+    nyquist_freq_hz: float,
+    block_len: int,
+) -> np.ndarray:
+
+    max_freq_hz = 20e6
+
+    zero_ratio = int((start_freq_hz / nyquist_freq_hz) * (block_len // 2))
+
+    zero_part = np.zeros(int(zero_ratio))
+    ramp_part = np.linspace(
+        boost_start,
+        boost_max * (nyquist_freq_hz / max_freq_hz),
+        (block_len // 2) - zero_ratio,
+    )
+    ramp = np.concatenate((zero_part, ramp_part))
+    output = np.concatenate((ramp, np.flip(ramp)))
+    return output
+
+
+def gen_ramp_filter_params(rf_params, nyquist_freq_hz, block_len):
+    return gen_ramp_filter(
+        rf_params.get("start_rf_linear", 0),
+        rf_params.get("boost_rf_linear_0", 0),
+        # rf_params.get("max_rf_linear", 20e6),
+        rf_params.get("boost_rf_linear_20", 1),
+        nyquist_freq_hz,
+        block_len,
     )

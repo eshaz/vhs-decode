@@ -55,20 +55,26 @@ except ImportError:
 
 
 parser, _ = common_parser_cli(
-    "Extracts audio from raw VHS HiFi FM capture",
+    "Extracts audio from RAW HiFi FM RF captures",
     default_threads=round(cpu_count() / 2),
 )
 
 parser.add_argument(
+    "--ar",
     "--audio_rate",
     dest="rate",
     type=int,
-    default=44100,
-    help="Output sample rate in Hz (default 44100)",
+    default=48000,
+    help="Output sample rate in Hz (default 48000)",
 )
 
 parser.add_argument(
-    "--bg", dest="BG", action="store_true", default=False, help="Do carrier bias guess"
+    "--bg",
+    "--bias_guess",
+    dest="BG",
+    action="store_true",
+    default=False,
+    help="Do carrier bias guess",
 )
 
 parser.add_argument(
@@ -121,11 +127,11 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--h8",
-    dest="H8",
+    "--8mm",
+    dest="format_8mm",
     action="store_true",
     default=False,
-    help="Video8/Hi8, 8mm tape format",
+    help="Use settings for Video8 and Hi8 tape formats.",
 )
 
 parser.add_argument(
@@ -137,19 +143,22 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--ui",
+    "--gui",
     dest="UI",
     action="store_true",
     default=False,
-    help="Opens hifi-ui",
+    help="Opens hifi-decode GUI graphical user interface",
 )
 
 parser.add_argument(
     "--audio_mode",
     dest="mode",
     type=str,
-    default="s",
-    help="Audio mode (s: stereo, mpx: stereo with mpx, l: left channel, r: right channel, sum: mono sum)",
+    help=(
+        "Audio mode (s: stereo, mpx: stereo with mpx, l: left channel, r: right channel, sum: mono sum) - "
+        "defaults to s other than on 8mm which defaults to mpx."
+        " 8mm mono is not auto detected currently so has to be manually specified as l."
+    ),
 )
 
 
@@ -319,7 +328,7 @@ class UnSigned16BitFileReader(io.RawIOBase):
 
 # This part is what opens the file
 # The samplerate here could be anything
-def as_soundfile(pathR, sample_rate=44100):
+def as_soundfile(pathR, sample_rate=48000):
     path = pathR.lower()
     if ".raw" in path or ".s16" in path:
         return sf.SoundFile(
@@ -768,13 +777,16 @@ def main() -> int:
 
     print("Initializing ...")
 
-    real_mode = "s" if not args.H8 else "mpx"
-    real_mode = args.mode if args.mode in ["l", "r", "sum"] else real_mode
+    # 8mm AFM uses a mono channel, or L-R/L+R rather than L/R channels
+    # The spec defines a dual audio mode but not sure if it was ever used.
+    default_mode = "s" if not args.format_8mm else "mpx"
+
+    real_mode = default_mode if not args.mode else args.mode
 
     decode_options = {
         "input_rate": sample_freq * 1e6,
         "standard": "p" if system == "PAL" else "n",
-        "format": "vhs" if not args.H8 else "h8",
+        "format": "vhs" if not args.format_8mm else "8mm",
         "preview": args.preview,
         "preview_available": SOUNDDEVICE_AVAILABLE,
         "original": args.original,
@@ -789,16 +801,12 @@ def main() -> int:
         "mode": real_mode,
     }
 
-    if decode_options["format"] == "vhs":
-        print("PAL VHS format selected") if system == "PAL" else print(
-            "NTSC VHS format selected"
-        )
-    else:
-        print("NTSC Hi8 format selected")
-
     if args.UI and not HIFI_UI:
         print(
-            "PyQt5/PyQt6 is not installed, can not use graphical UI, falling back to command line interface.."
+            (
+                "PyQt5/PyQt6 is not installed, can not use graphical UI,"
+                " falling back to command line interface.."
+            )
         )
 
     if args.UI and HIFI_UI:
@@ -809,6 +817,9 @@ def main() -> int:
                 if ui_t.window.transport_state == 1:
                     print("Starting decode...")
                     options = ui_parameters_to_decode_options(ui_t.window.getValues())
+
+                    print("options", options)
+
                     # change to output file directory
                     if os.path.dirname(options["output_file"]) != "":
                         os.chdir(os.path.dirname(options["output_file"]))
@@ -841,6 +852,18 @@ def main() -> int:
         return decoder_state
     else:
         if test_input_file(filename) and test_output_file(outname):
+            if decode_options["format"] == "vhs":
+                (
+                    print(f"PAL VHS format selected, Audio mode is {real_mode}")
+                    if system == "PAL"
+                    else print(f"NTSC VHS format selected, Audio mode is {real_mode}")
+                )
+            else:
+                if system == "PAL":
+                    print(f"PAL Hi8 format selected, Audio mode is {real_mode}")
+                else:
+                    print(f"NTSC Hi8 format selected, Audio mode is {real_mode}")
+
             return run_decoder(args, decode_options)
         else:
             parser.print_help()

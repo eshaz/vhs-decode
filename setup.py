@@ -1,7 +1,22 @@
-
 from setuptools import setup
+import distutils.ccompiler
+from distutils.extension import Extension
 from Cython.Build import cythonize
+
+# Uncomment to view C code generated from Cython files
+# import Cython.Compiler.Options
+# Cython.Compiler.Options.annotate = True
+
 import numpy
+
+compiler = distutils.ccompiler.new_compiler()
+
+if compiler.compiler_type == "unix":
+    extra_compile_args=["-O3", "-flto"]
+    extra_link_args=["-O3", "-flto"]
+else:
+    extra_compile_args=[]
+    extra_link_args=[]
 
 setup(
     # name='ld-decode',
@@ -29,9 +44,9 @@ setup(
     # TODO: should be done in pyproject.toml but did not find any way
     # of including without making them modules.
     scripts=[
-        'ld-cut',
-        'cx-expander',
-        'decode.py',
+        "ld-cut",
+        "cx-expander",
+        "decode.py",
     ],
     # scripts=[
     #    'cx-expander',
@@ -42,7 +57,29 @@ setup(
     #    'cvbs-decode',
     #    'hifi-decode',
     # ],
-    ext_modules=cythonize(["vhsdecode/*.pyx"], language_level=3),
+    ext_modules=cythonize([
+        Extension(
+            "vhsdecode.sync",
+            ["vhsdecode/sync.pyx"],
+            language_level=3,
+            extra_compile_args=extra_compile_args,
+            extra_link_args=extra_link_args
+        ),
+        Extension(
+            "vhsdecode.hilbert",
+            ["vhsdecode/hilbert.pyx"],
+            language_level=3,
+            extra_compile_args=extra_compile_args,
+            extra_link_args=extra_link_args
+        ),
+        Extension(
+            "vhsdecode.linear_filter",
+            ["vhsdecode/linear_filter.pyx"],
+            language_level=3,
+            extra_compile_args=extra_compile_args,
+            extra_link_args=extra_link_args
+        )
+    ]),
     # Needed for using numpy in cython.
     include_dirs=[numpy.get_include()],
     # These are just the minimal runtime dependencies for the Python scripts --

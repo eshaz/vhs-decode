@@ -5,6 +5,14 @@ project(ld-decode-tools)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake_modules")
 include(CTest)
 
+include(CheckIPOSupported)
+check_ipo_supported(RESULT is_ipo_supported OUTPUT lto_error)
+if(is_ipo_supported)
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL ON)
+endif()
+
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,6 +27,9 @@ option(USE_QWT
 # Needed for ezpwd as it uses alternative operators
 if(MSVC)
     add_compile_options(/permissive-)
+else()
+    add_compile_options(-O3)
+    add_link_options(-O3)
 endif()
 
 set(USE_QT_VERSION "" CACHE STRING
@@ -198,3 +209,4 @@ if(BUILD_PYTHON)
 endif()
 
 install(PROGRAMS gen_chroma_vid.sh TYPE BIN)
+install(PROGRAMS scripts/ld-compress TYPE BIN)
