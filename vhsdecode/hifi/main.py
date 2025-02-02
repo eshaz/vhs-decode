@@ -822,49 +822,64 @@ def write_soundfile(queue, output_file, audio_rate):
             w.write(stereo)
             w.flush()
 
+# multiprocessing hifi decoders
+def create_decoder(decode_options, LCRef, RCRef):
+    global process_decoder
+    global process_decoder_options
+
+    process_decoder_options = decode_options
+    process_decoder = HiFiDecode(decode_options)
+    process_decoder.updateAFE(LCRef, RCRef)
+
+def block_decode_worker(block, current_block):
+    global process_decoder
+    global process_decoder_options
+
+    decoded = process_decoder.block_decode(block, current_block)
+
+    if process_decoder_options["auto_fine_tune"]:
+        log_bias(process_decoder)
+
+    return decoded
+
 def decode_parallel(
-    decoders: List[HiFiDecode],
+    decoder: HiFiDecode,
     decode_options: dict,
+    LCRef,
+    RCRef,
     threads: int = 8,
     ui_t: Optional[AppWindow] = None,
 ):
     input_file = decode_options["input_file"]
     output_file = decode_options["output_file"]
     start_time = datetime.now()
-    block_size = decoders[0].blockSize
-    read_overlap = decoders[0].readOverlap
+    
     futures_queue = list()
     current_block = 0
     stereo_play_buffer = list()
 
     output_file_queue = Queue()
-    output_file_process = Process(target=write_soundfile, args=(output_file_queue, output_file, decode_options["audio_rate"]))
+    output_file_process = Process(target=write_soundfile, args=(output_file_queue, output_file, decode_options["audio_rate"]), daemon=True)
     output_file_process.start()
 
-    with ProcessPoolExecutor(threads) as executor:
+    with ProcessPoolExecutor(threads, initializer=create_decoder, initargs=(decode_options, LCRef, RCRef)) as executor:
         post_processor = PostProcessor(
             executor,
             decode_options,
-            decoders[0]
+            decoder
         )
         with as_soundfile(input_file) as f:
             progressB = TimeProgressBar(f.frames, f.frames)
             try:
                 print(f"Starting decode...")
-                for block in f.blocks(blocksize=block_size, overlap=read_overlap):
+                for block in f.blocks(blocksize=decoder.blockSize, overlap=decoder.readOverlap):
                     if exit_requested:
                         break
                     
-                    decoder = decoders[current_block % threads]
                     if len(block) > 0:
-                        futures_queue.append(
-                            executor.submit(HiFiDecode.block_decode_worker, decoder, block, current_block)
-                        )
+                        futures_queue.append(executor.submit(block_decode_worker, block, current_block))
                     else:
                         break
-    
-                    if decode_options["auto_fine_tune"]:
-                        log_bias(decoder)
     
                     current_block += 1
                     progressB.print(f.tell())
@@ -977,11 +992,7 @@ def run_decoder(args, decode_options, ui_t: Optional[AppWindow] = None):
             decoder.updateAFE(LCRef, RCRef)
 
         if args.threads > 1 and not args.GRC:
-            decoders = list()
-            for i in range(0, args.threads):
-                decoders.append(HiFiDecode(decode_options))
-                decoders[i].updateAFE(LCRef, RCRef)
-            decode_parallel(decoders, decode_options, threads=args.threads, ui_t=ui_t)
+            decode_parallel(decoder, decode_options, LCRef, RCRef, threads=args.threads, ui_t=ui_t)
         else:
             decode(decoder, decode_options, ui_t=ui_t)
         print("Decode finished successfully")
