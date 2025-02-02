@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import subprocess
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, wait
 from multiprocessing import cpu_count
 from datetime import datetime, timedelta
 import os
@@ -828,6 +828,9 @@ def decode_parallel(
     current_block = 0
     stereo_play_buffer = list()
 
+    output_file_executor = ThreadPoolExecutor(1)
+    output_file_queue = list()
+
     with ProcessPoolExecutor(threads) as executor:
         post_processor = PostProcessor(
             executor,
@@ -835,6 +838,14 @@ def decode_parallel(
             decoders[0]
         )
         with as_outputfile(output_file, decode_options["audio_rate"]) as w:
+            def write_async(stereo):
+                output_file_queue.append(output_file_executor.submit(w.write, stereo))
+                while len(output_file_queue) != 0:
+                    if output_file_queue[0].done():
+                        output_file_queue.pop(0)
+                    else:
+                        break
+
             with as_soundfile(input_file) as f:
                 progressB = TimeProgressBar(f.frames, f.frames)
                 try:
@@ -857,10 +868,8 @@ def decode_parallel(
                         current_block += 1
                         progressB.print(f.tell())
         
-                        while len(futures_queue) > threads:
+                        while len(futures_queue) > threads or (len(futures_queue) >= 1 and futures_queue[0].done()):
                             future = futures_queue.pop(0)
-                            if not future.done():
-                                break
 
                             blocknum, l, r = future.result()
         
@@ -869,7 +878,8 @@ def decode_parallel(
                                 log_decode(start_time, f.tell(), decode_options)
         
                                 try:
-                                    w.write(stereo)
+                                    write_async(stereo)
+
                                     if decode_options["preview"]:
                                         if SOUNDDEVICE_AVAILABLE:
                                             if (
@@ -910,9 +920,11 @@ def decode_parallel(
     
                 for stereo in post_processor.flush():
                     try:
-                        w.write(stereo)
+                        write_async(stereo)
                     except ValueError:
                         pass
+
+                wait(output_file_queue)
     
             elapsed_time = datetime.now() - start_time
             dt_string = elapsed_time.total_seconds()
