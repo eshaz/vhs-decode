@@ -871,6 +871,7 @@ class HiFiDecode:
 
     def carrierOffsets(self, standard, cL, cR):
         return standard.LCarrierRef - cL, standard.RCarrierRef - cR
+
     
     @staticmethod
     def block_decode_worker(decoder, block, current_block):
