@@ -862,9 +862,11 @@ def decode_parallel(
     output_file_process = Process(target=write_soundfile, args=(output_file_queue, output_file, decode_options["audio_rate"]), daemon=True)
     output_file_process.start()
 
+    post_processor_pool = ProcessPoolExecutor(threads)
+
     with ProcessPoolExecutor(threads, initializer=create_decoder, initargs=(decode_options, LCRef, RCRef)) as executor:
         post_processor = PostProcessor(
-            executor,
+            post_processor_pool,
             decode_options,
             decoder
         )
