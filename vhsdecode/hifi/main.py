@@ -859,6 +859,9 @@ def decode_parallel(
         
                         while len(futures_queue) > threads:
                             future = futures_queue.pop(0)
+                            if not future.done():
+                                break
+
                             blocknum, l, r = future.result()
         
                             post_processor.submit(l, r)
