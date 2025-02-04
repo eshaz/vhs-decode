@@ -6,8 +6,6 @@ from dataclasses import dataclass
 from fractions import Fraction
 from math import log, pi, sqrt, ceil, floor
 from typing import Tuple
-from concurrent.futures import ProcessPoolExecutor
-from multiprocessing import get_context
 import sys
 
 import numpy as np
@@ -917,14 +915,14 @@ class HiFiDecode:
         )
         preL, preR = self.demodblock(data)
         
-        with ProcessPoolExecutor(2, mp_context=get_context("spawn")) as stereo_executor:
-            audioL_future = stereo_executor.submit(HiFiDecode.audio_process, preL, self.audio_process_params)
-            audioR_future = stereo_executor.submit(HiFiDecode.audio_process, preR, self.audio_process_params)
-            preL, dcL = audioL_future.result()
-            preR, dcR = audioR_future.result()
+        # with ProcessPoolExecutor(2, mp_context=get_context("spawn")) as stereo_executor:
+        #     audioL_future = stereo_executor.submit(HiFiDecode.audio_process, preL, self.audio_process_params)
+        #     audioR_future = stereo_executor.submit(HiFiDecode.audio_process, preR, self.audio_process_params)
+        #     preL, dcL = audioL_future.result()
+        #     preR, dcR = audioR_future.result()
 
-        # preL, dcL = HiFiDecode.audio_process(preL, self.audio_process_params)
-        # preR, dcR = HiFiDecode.audio_process(preR, self.audio_process_params)
+        preL, dcL = HiFiDecode.audio_process(preL, self.audio_process_params)
+        preR, dcR = HiFiDecode.audio_process(preR, self.audio_process_params)
 
         if self.options["auto_fine_tune"]:
             self.devL, self.devR = self.carrierOffsets(self.afe_params, dcL, dcR)
