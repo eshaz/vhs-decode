@@ -2,7 +2,7 @@
 import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from multiprocessing import cpu_count
+from multiprocessing import cpu_count, get_context
 from datetime import datetime, timedelta
 import os
 import sys
@@ -466,15 +466,21 @@ def seconds_to_str(seconds: float) -> str:
     return str(timedelta(seconds=seconds))
 
 
-def log_decode(start_time: datetime, frames: int, decode_options: dict):
+def log_decode(start_time: datetime, frames: int, audio_samples: int, decode_options: dict):
     elapsed_time: timedelta = datetime.now() - start_time
-    audio_time: float = frames / (2 * decode_options["input_rate"])
-    relative_speed: float = audio_time / elapsed_time.total_seconds()
-    elapsed_time_format: str = seconds_to_str(elapsed_time.total_seconds())
+
+    input_time: float = frames / (2 * decode_options["input_rate"])
+    input_time_format: str = seconds_to_str(input_time)
+
+    audio_time: float = audio_samples / decode_options["audio_rate"]
     audio_time_format: str = seconds_to_str(audio_time)
+
+    relative_speed: float = input_time / elapsed_time.total_seconds()
+    elapsed_time_format: str = seconds_to_str(elapsed_time.total_seconds())
 
     print(
         f"- Decoding speed: {round(frames / (1e3 * elapsed_time.total_seconds()))} kFrames/s ({relative_speed:.2f}x)\n"
+        + f"- Input position: {str(input_time_format)[:-3]}\n"
         + f"- Audio position: {str(audio_time_format)[:-3]}\n"
         + f"- Wall time     : {str(elapsed_time_format)[:-3]}"
     )
@@ -484,6 +490,7 @@ class PostProcessor:
     def __init__(
         self,
         process_executor: ProcessPoolExecutor,
+        threads: int,
         decode_options: dict,
         decoder: HiFiDecode,
     ):
@@ -491,6 +498,7 @@ class PostProcessor:
         self.nr_thread_executor = ThreadPoolExecutor(2)
         self.thread_executor_queue = list()
         self.thread_executor = ThreadPoolExecutor(1) # must only be one thread to enforce sequential processing
+        self.threads = threads
 
         self.noise_reduction_l = NoiseReduction(
             decode_options["nr_side_gain"],
@@ -679,12 +687,9 @@ class PostProcessor:
         self.thread_executor_queue.append(future)
 
     def read(self):
-        while len(self.thread_executor_queue) > 0:
-            if self.thread_executor_queue[0].done():
-                stereo_future = self.thread_executor_queue.pop(0)
-                yield stereo_future.result()
-            else:
-                break     
+        while len(self.thread_executor_queue) > self.threads or (len(self.thread_executor_queue) > 0 and self.thread_executor_queue[0].done()):
+            stereo_future = self.thread_executor_queue.pop(0)
+            yield stereo_future.result()
 
     def flush(self):
         while len(self.thread_executor_queue) > 0:
@@ -724,12 +729,14 @@ class AppWindow:
 def decode(decoder, decode_options, ui_t: Optional[AppWindow] = None):
     input_file = decode_options["input_file"]
     output_file = decode_options["output_file"]
-    start_time = datetime.now()
+    start_time =  datetime.now()
     stereo_play_buffer = list()
+    total_samples_decoded = 0
 
     with ProcessPoolExecutor(1) as executor:
         post_processor = PostProcessor(
             executor,
+            1,
             decode_options,
             decoder
         )
@@ -758,9 +765,12 @@ def decode(decoder, decode_options, ui_t: Optional[AppWindow] = None):
 
                         current_block += 1
                         for stereo in post_processor.read():
-                            log_decode(start_time, f.tell(), decode_options)
                             try:
                                 w.write(stereo)
+
+                                total_samples_decoded += len(stereo)
+                                log_decode(start_time, f.tell(), total_samples_decoded, decode_options)
+
                                 if decode_options["preview"]:
                                     if SOUNDDEVICE_AVAILABLE:
                                         if (
@@ -796,6 +806,9 @@ def decode(decoder, decode_options, ui_t: Optional[AppWindow] = None):
                 for stereo in post_processor.flush():
                     try:
                         w.write(stereo)
+
+                        total_samples_decoded += len(stereo)
+                        log_decode(start_time, f.tell(), total_samples_decoded, decode_options)
                     except ValueError:
                         pass
     
@@ -811,16 +824,18 @@ def decode_parallel(
 ):
     input_file = decode_options["input_file"]
     output_file = decode_options["output_file"]
-    start_time = datetime.now()
+    start_time =  datetime.now()
     block_size = decoders[0].blockSize
     read_overlap = decoders[0].readOverlap
     futures_queue = list()
     current_block = 0
     stereo_play_buffer = list()
+    total_samples_decoded = 0
 
-    with ProcessPoolExecutor(threads) as executor:
+    with ProcessPoolExecutor(threads, mp_context=get_context("spawn")) as executor:
         post_processor = PostProcessor(
             executor,
+            threads,
             decode_options,
             decoders[0]
         )
@@ -847,36 +862,37 @@ def decode_parallel(
                         current_block += 1
                         progressB.print(f.tell())
         
-                        while len(futures_queue) > threads:
-                            future = futures_queue.pop(0)
-                            blocknum, l, r = future.result()
-        
+                        while len(futures_queue) > threads or (len(futures_queue) > 0 and futures_queue[0].done()):
+                            blocknum, l, r = futures_queue.pop(0).result()
                             post_processor.submit(l, r, False)
-                            for stereo in post_processor.read():
-                                log_decode(start_time, f.tell(), decode_options)
-        
-                                try:
-                                    w.write(stereo)
-                                    if decode_options["preview"]:
-                                        if SOUNDDEVICE_AVAILABLE:
-                                            if (
-                                                len(stereo_play_buffer)
-                                                > decode_options["audio_rate"] * 5
-                                            ):
-                                                sd.wait()
-                                                sd.play(
-                                                    stereo_play_buffer,
-                                                    decode_options["audio_rate"],
-                                                    blocking=False,
-                                                )
-                                                stereo_play_buffer = list()
-                                            stereo_play_buffer += stereo
-                                        else:
-                                            print(
-                                                "Import of sounddevice failed, preview is not available!"
+
+                        for stereo in post_processor.read():
+                            try:
+                                w.write(stereo)
+                                total_samples_decoded += len(stereo)
+
+                                log_decode(start_time, f.tell(), total_samples_decoded, decode_options)
+
+                                if decode_options["preview"]:
+                                    if SOUNDDEVICE_AVAILABLE:
+                                        if (
+                                            len(stereo_play_buffer)
+                                            > decode_options["audio_rate"] * 5
+                                        ):
+                                            sd.wait()
+                                            sd.play(
+                                                stereo_play_buffer,
+                                                decode_options["audio_rate"],
+                                                blocking=False,
                                             )
-                                except ValueError:
-                                    pass
+                                            stereo_play_buffer = list()
+                                        stereo_play_buffer += stereo
+                                    else:
+                                        print(
+                                            "Import of sounddevice failed, preview is not available!"
+                                        )
+                            except ValueError:
+                                pass
         
                         if ui_t is not None:
                             ui_t.app.processEvents()
@@ -898,6 +914,9 @@ def decode_parallel(
                 for stereo in post_processor.flush():
                     try:
                         w.write(stereo)
+
+                        total_samples_decoded += len(stereo)
+                        log_decode(start_time, f.tell(), total_samples_decoded, decode_options)
                     except ValueError:
                         pass
     
