@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from math import log, pi, sqrt, ceil, floor
 from typing import Tuple
+from concurrent.futures import ProcessPoolExecutor
 import sys
 
 import numpy as np
@@ -479,6 +480,7 @@ class HiFiDecode:
         if options is None:
             options = dict()
         self.options = options
+        self.stereo_executor = ProcessPoolExecutor(2)
         self.sample_rate: int = options["input_rate"]
         self.rfBandPassParams = AFEParamsFront()
         self.audio_rate: int = 192000
@@ -978,15 +980,13 @@ class HiFiDecode:
         preL = preL[trim:-trim]
         preR = preR[trim:-trim]
 
-        
-        # with ProcessPoolExecutor(2) as stereo_executor:
-        #     audioL_future = stereo_executor.submit(HiFiDecode.audio_process, preL, self.audio_process_params)
-        #     audioR_future = stereo_executor.submit(HiFiDecode.audio_process, preR, self.audio_process_params)
-        #     preL, dcL = audioL_future.result()
-        #     preR, dcR = audioR_future.result()
+        audioL_future = self.stereo_executor.submit(HiFiDecode.audio_process, preL, self.audio_process_params)
+        audioR_future = self.stereo_executor.submit(HiFiDecode.audio_process, preR, self.audio_process_params)
+        preL, dcL = audioL_future.result()
+        preR, dcR = audioR_future.result()
 
-        preL, dcL = HiFiDecode.audio_process(preL, self.audio_process_params)
-        preR, dcR = HiFiDecode.audio_process(preR, self.audio_process_params)
+        # preL, dcL = HiFiDecode.audio_process(preL, self.audio_process_params)
+        # preR, dcR = HiFiDecode.audio_process(preR, self.audio_process_params)
 
         preL, preR = HiFiDecode.mix_for_mode_stereo(preL, preR, self.audio_process_params["decode_mode"])
 
