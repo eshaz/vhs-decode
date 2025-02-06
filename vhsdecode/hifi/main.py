@@ -437,7 +437,10 @@ class AsyncSoundFile():
                 try:
                     next_block = await loop.run_in_executor(None, next, blocks_generator)
                     is_last_block = len(next_block) == 0
+                    if is_last_block:
+                        print("last block, check")
                 except StopIteration:
+                    print("last block, generator")
                     is_last_block = True
 
                 async with cond:
@@ -874,7 +877,6 @@ def decode(decoder, decode_options, ui_t: Optional[AppWindow] = None):
     input_file = decode_options["input_file"]
     output_file = decode_options["output_file"]
     start_time =  datetime.now()
-    stereo_play_buffer = list()
     total_samples_decoded = 0
 
     post_processor = PostProcessor(
@@ -991,7 +993,6 @@ async def decode_parallel(
     block_size = decoders[0].blockSize
     read_overlap = decoders[0].readOverlap
     current_block = 0
-    stereo_play_buffer = list()
     total_samples_decoded = 0
 
     # spin up the decoders
