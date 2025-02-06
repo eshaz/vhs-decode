@@ -3,6 +3,7 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import cpu_count, Pipe, Queue, Process, Manager
+from threading import Thread
 from datetime import datetime, timedelta
 import os
 import sys
@@ -479,7 +480,9 @@ class AsyncSoundFile():
         need_data_event = asyncio.Event()
         need_data_event.set()
 
-        asyncio.create_task(self._read_blocks(block_params, have_data_event, need_data_event))
+        loop = asyncio.get_running_loop()
+        thread = Thread(target=asyncio.run_coroutine_threadsafe, args=(self._read_blocks(block_params, have_data_event, need_data_event), loop))
+        thread.start()
 
         while True:
             await have_data_event.wait()
@@ -492,6 +495,7 @@ class AsyncSoundFile():
                 need_data_event.set()
     
                 if len(block) == 0: # nothing more to read
+                    thread.join()
                     return
 
     def tell(self):
