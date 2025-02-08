@@ -1042,6 +1042,46 @@ def write_soundfile_process_worker(conn, output_file, audio_rate):
                 write_executor.submit(w.buffer_write, stereo, dtype='float32')
 
 
+async def post_processor_reader_task(post_processor, is_done_condition, start_time, f, output_parent_conn, decode_options):
+    # send any completed data to post processor
+    output_thread_executor = ThreadPoolExecutor(1)
+    atexit.register(output_thread_executor.shutdown)
+
+    total_samples_decoded = 0
+
+    with SoundFileProcess(decode_options["audio_rate"]) as player:
+        while is_done_condition.locked():
+            for stereo in post_processor.read():
+                try:
+                    output_thread_executor.submit(output_parent_conn.send_bytes, stereo)
+                    total_samples_decoded += len(stereo) / 8
+            
+                    log_decode(start_time, f.tell(), total_samples_decoded, decode_options)
+            
+                    if decode_options["preview"]:
+                        if SOUNDDEVICE_AVAILABLE:
+                            player.play(stereo)
+                        else:
+                            print(
+                                "Import of sounddevice failed, preview is not available!"
+                            )
+                except ValueError:
+                    pass
+
+            await asyncio.sleep(1)
+
+        for stereo in post_processor.flush():
+            try:
+                output_thread_executor.submit(output_parent_conn.send_bytes, stereo)
+                total_samples_decoded += len(stereo) / 8
+    
+                log_decode(start_time, f.tell(), total_samples_decoded, decode_options)
+            except ValueError:
+                pass
+
+        output_thread_executor.submit(output_parent_conn.send_bytes, b"").result()        
+        
+
 async def decode_parallel(
     decoders: List[HiFiDecode],
     decode_options: dict,
@@ -1054,7 +1094,6 @@ async def decode_parallel(
     block_size = decoders[0].blockSize
     read_overlap = decoders[0].readOverlap
     current_block = 0
-    total_samples_decoded = 0
 
     # spin up the decoders
     decoder_processes: list[Process] = []
@@ -1076,9 +1115,6 @@ async def decode_parallel(
         decoder_in_queues.append(in_queue)
         decoder_buffers.append(buffer)
 
-    output_thread_executor = ThreadPoolExecutor(1)
-    atexit.register(output_thread_executor.shutdown)
-
     output_child_conn, output_parent_conn = Pipe(duplex=False)
     output_file_process = Process(target=write_soundfile_process_worker, name="HiFiDecode Soundfile Encoder", args=(output_child_conn, output_file, decode_options["audio_rate"]))
     output_file_process.start()
@@ -1091,119 +1127,103 @@ async def decode_parallel(
     )
     decoders_running = set()
     decoders_idle = set(range(threads))
-    with SoundFileProcess(decode_options["audio_rate"]) as player:
-        with as_soundfile(input_file) as sf:
-            f = AsyncSoundFile(sf, threads)
-    
-            progressB = TimeProgressBar(f.frames, f.frames)
-            try:
-                print(f"Starting decode...")
-                async for block in f.blocks_async(blocksize=block_size, overlap=read_overlap):
-                    done = len(block) == 0
-                    if exit_requested or done:
-                        break
-    
-                    # read completed data from decoders pool
-                    # block if all decoders are running
-                    while len(decoders_running) >= threads or not decoder_out_queue.empty():
-                        # get the next decoder that is done
-                        decoder_id, block_num, channel_length = decoder_out_queue.get()
+    with as_soundfile(input_file) as sf:
+        f = AsyncSoundFile(sf, threads)
 
-                        # copy the data from the decoder's buffer
-                        buffer = decoder_buffers[decoder_id]
-                        l, r = buffer.read_channels(channel_length)
+        progressB = TimeProgressBar(f.frames, f.frames)
+        post_processor_is_done = asyncio.Lock()
+        await post_processor_is_done.acquire()
 
-                        # send the result to the post processor and mark this decoder as idle
-                        post_processor.submit(block_num, l, r, False)
-                        decoders_running.remove(decoder_id)
-                        decoders_idle.add(decoder_id)
+        # async task that periodically reads from the post processor
+        post_processor_task = asyncio.create_task(post_processor_reader_task(
+            post_processor,
+            post_processor_is_done,
+            start_time,
+            f,
+            output_parent_conn,
+            decode_options
+        ))
 
-                    # submit this block to the idle decoder
-                    decoder_id = decoders_idle.pop()
+        try:
+            print(f"Starting decode...")
+            async for block in f.blocks_async(blocksize=block_size, overlap=read_overlap):
+                done = len(block) == 0
+                if exit_requested or done:
+                    break
 
+                # read completed data from decoders pool
+                # block if all decoders are running
+                while len(decoders_running) >= threads or not decoder_out_queue.empty():
+                    # get the next decoder that is done
+                    decoder_id, block_num, channel_length = decoder_out_queue.get()
+
+                    # copy the data from the decoder's buffer
                     buffer = decoder_buffers[decoder_id]
-                    buffer.write_block(block)
+                    l, r = buffer.read_channels(channel_length)
 
-                    decoder_in_queues[decoder_id].put((current_block, len(block)))
-                    decoders_running.add(decoder_id)
+                    # send the result to the post processor and mark this decoder as idle
+                    post_processor.submit(block_num, l, r, False)
+                    decoders_running.remove(decoder_id)
+                    decoders_idle.add(decoder_id)
 
-                    print(decoders_idle, decoders_running, len(decoders_running), threads)
+                # submit this block to the idle decoder
+                decoder_id = decoders_idle.pop()
 
-                    current_block += 1
-    
-                    # send any completed data to post processor
-                    # maybe can be put in an async loop...
-                    for stereo in post_processor.read():
-                        try:
-                            output_thread_executor.submit(output_parent_conn.send_bytes, stereo)
-                            total_samples_decoded += len(stereo) / 8
-    
-                            log_decode(start_time, f.tell(), total_samples_decoded, decode_options)
-    
-                            if decode_options["preview"]:
-                                if SOUNDDEVICE_AVAILABLE:
-                                    player.play(stereo)
-                                else:
-                                    print(
-                                        "Import of sounddevice failed, preview is not available!"
-                                    )
-                        except ValueError:
-                            pass
-    
-                    if ui_t is not None:
-                        ui_t.app.processEvents()
-                        if ui_t.window.transport_state == 0:
-                            break
-                        elif ui_t.window.transport_state == 2:
-                            while ui_t.window.transport_state == 2:
-                                ui_t.app.processEvents()
-                                time.sleep(0.01)
-    
-                    progressB.print(f.tell())
-            except KeyboardInterrupt:
-                pass
-
-            print("")
-            print("Decode finishing up. Emptying the queue")
-            print("")
-    
-            # signal the decoders to shutdown
-            for i in decoders_running:
-                decoder_in_queues[i].put((-1, 0))
-        
-            while len(decoders_running) > 0 or not decoder_out_queue.empty():
-                # get the next decoder that is done
-                decoder_id, block_num, channel_length = decoder_out_queue.get()
-
-                # copy the data from the decoder's buffer
                 buffer = decoder_buffers[decoder_id]
-                l, r = buffer.read_channels(channel_length)
+                buffer.write_block(block)
 
-                # send the result to the post processor and mark this decoder as idle
-                post_processor.submit(block_num, l, r, block_num == current_block - 1)
-                decoders_running.remove(decoder_id)
-        
-                for stereo in post_processor.read():
-                    output_thread_executor.submit(output_parent_conn.send_bytes, stereo)
-                    total_samples_decoded += len(stereo) / 8
-        
-                    log_decode(start_time, f.tell(), total_samples_decoded, decode_options)       
-        
-            for stereo in post_processor.flush():
-                try:
-                    output_thread_executor.submit(output_parent_conn.send_bytes, stereo)
-                    total_samples_decoded += len(stereo) / 8
-        
-                    log_decode(start_time, f.tell(), total_samples_decoded, decode_options)
-                except ValueError:
-                    pass
-        
-            for i in range(threads):
-                process = decoder_processes[i]
-                process.terminate()
-        
-            output_thread_executor.submit(output_parent_conn.send_bytes, b"").result()
-            output_file_process.join()
+                decoder_in_queues[decoder_id].put((current_block, len(block)))
+                decoders_running.add(decoder_id)
+
+                print(decoders_idle, decoders_running, len(decoders_running), threads)
+
+                current_block += 1
+
+                if ui_t is not None:
+                    ui_t.app.processEvents()
+                    if ui_t.window.transport_state == 0:
+                        break
+                    elif ui_t.window.transport_state == 2:
+                        while ui_t.window.transport_state == 2:
+                            ui_t.app.processEvents()
+                            time.sleep(0.01)
+
+                progressB.print(f.tell())
+        except KeyboardInterrupt:
+            pass
+
+        print("")
+        print("Decode finishing up. Emptying the queue")
+        print("")
+
+        # signal the decoders to shutdown
+        for i in decoders_running:
+            decoder_in_queues[i].put((-1, 0))
+    
+        # feed through any remaining data to the decoders
+        while len(decoders_running) > 0 or not decoder_out_queue.empty():
+            # get the next decoder that is done
+            decoder_id, block_num, channel_length = decoder_out_queue.get()
+
+            # copy the data from the decoder's buffer
+            buffer = decoder_buffers[decoder_id]
+            l, r = buffer.read_channels(channel_length)
+
+            # send the result to the post processor and mark this decoder as idle
+            post_processor.submit(block_num, l, r, block_num == current_block - 1)
+            decoders_running.remove(decoder_id)
+            
+        # wait for the post processing to complete
+        post_processor_is_done.release()
+        await post_processor_task
+
+        # wait for all the data to write to the file
+        output_file_process.join()
+
+    
+        for i in range(threads):
+            process = decoder_processes[i]
+            process.terminate()
         
     elapsed_time = datetime.now() - start_time
     dt_string = elapsed_time.total_seconds()
