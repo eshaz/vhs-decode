@@ -1538,6 +1538,7 @@ if current_process().name == 'MainProcess':
     signal.signal(signal.SIGINT, parent_signal_handler)
 else:
     signal.signal(signal.SIGINT, child_signal_handler)
+    signal.siginterrupt(signal.SIGINT, False)
 
 if __name__ == "__main__":
     freeze_support()
