@@ -2,7 +2,7 @@
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import cpu_count, Pipe, Queue, Process, Lock, set_start_method, parent_process, freeze_support
+from multiprocessing import cpu_count, Pipe, Queue, Process, Lock, set_start_method, parent_process, freeze_support, current_process
 from threading import Lock as ThreadLock
 from multiprocessing.shared_memory import SharedMemory
 from datetime import datetime, timedelta
@@ -1529,8 +1529,10 @@ def child_signal_handler(sig, frame):
         sys.exit(1)
     signal_count += 1
 
-signal.signal(signal.SIGINT, parent_signal_handler)
-os.register_at_fork(after_in_child=lambda: signal.signal(signal.SIGINT, child_signal_handler))
+if current_process().name == 'MainProcess':
+    signal.signal(signal.SIGINT, parent_signal_handler)
+else:
+    signal.signal(signal.SIGINT, child_signal_handler)
 
 if __name__ == "__main__":
     freeze_support()
