@@ -1504,15 +1504,16 @@ def main() -> int:
 
 signal_count = 0
 exit_requested = False
-main_pid = None
-def signal_handler(sig, frame):
+main_pid = os.getpid()
+NUM_SIGINT_BEFORE_FORCE_EXIT = 1
+def parent_signal_handler(sig, frame):
     global signal_count
     global main_pid
     global exit_requested
 
     exit_requested = True
     is_main_thread = main_pid == os.getpid()
-    if signal_count >= 1:
+    if signal_count >= NUM_SIGINT_BEFORE_FORCE_EXIT:
         if is_main_thread:
             # prevent reentrant calls https://stackoverflow.com/a/75368797
             os.write(sys.stdout.fileno(), b"\nCtrl-C was pressed again, stopping immediately...\n")
@@ -1522,9 +1523,15 @@ def signal_handler(sig, frame):
             os.write(sys.stdout.fileno(), b"\nCtrl-C was pressed, stopping decode...\n")
     signal_count += 1
 
-signal.signal(signal.SIGINT, signal_handler)
+def child_signal_handler(sig, frame):
+    exit_requested = True
+    if signal_count >= NUM_SIGINT_BEFORE_FORCE_EXIT:
+        sys.exit(1)
+    signal_count += 1
+
+signal.signal(signal.SIGINT, parent_signal_handler)
+os.register_at_fork(after_in_child=lambda: signal.signal(signal.SIGTERM, child_signal_handler))
 
 if __name__ == "__main__":
     freeze_support()
-    main_pid = os.getpid()
     sys.exit(main())
