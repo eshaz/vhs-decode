@@ -1524,6 +1524,9 @@ def parent_signal_handler(sig, frame):
     signal_count += 1
 
 def child_signal_handler(sig, frame):
+    global signal_count
+    global exit_requested
+
     exit_requested = True
     if signal_count >= NUM_SIGINT_BEFORE_FORCE_EXIT:
         sys.exit(1)
