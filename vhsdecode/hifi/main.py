@@ -1530,7 +1530,7 @@ def child_signal_handler(sig, frame):
     signal_count += 1
 
 signal.signal(signal.SIGINT, parent_signal_handler)
-os.register_at_fork(after_in_child=lambda: signal.signal(signal.SIGTERM, child_signal_handler))
+os.register_at_fork(after_in_child=lambda: signal.signal(signal.SIGINT, child_signal_handler))
 
 if __name__ == "__main__":
     freeze_support()
