@@ -773,7 +773,7 @@ class PostProcessor:
                 audio_length = len(audio)
                 shared_memory.write_block(audio)
                 conn.send((blocknum, audio_length))
-            except InterruptedError e:
+            except InterruptedError:
                 pass
 
     @staticmethod
@@ -793,7 +793,7 @@ class PostProcessor:
                 shared_memory.write_stereo(stereo)
     
                 conn.send(len(stereo))
-            except InterruptedError e:
+            except InterruptedError:
                 pass
 
     @staticmethod
@@ -858,7 +858,7 @@ class PostProcessor:
                 try:
                     l_block_num, l_length = self.nr_worker_l_parent.recv()
                     break
-                except InterruptedError e:
+                except InterruptedError:
                     # retry if a signal is received
                     continue
 
@@ -869,7 +869,7 @@ class PostProcessor:
                 try:
                     r_block_num, r_length = self.nr_worker_r_parent.recv()
                     break
-                except InterruptedError e:
+                except InterruptedError:
                     # retry if a signal is received
                     continue
 
@@ -888,7 +888,7 @@ class PostProcessor:
         while True:
             try:
                 stereo_length = self.discard_merge_worker_parent.recv()
-            except InterruptedError e:
+            except InterruptedError:
                 # retry if a signal is received
                 continue
 
@@ -1020,7 +1020,7 @@ class SoundDeviceProcess():
                 interleaved = np.ndarray(interleaved_len, dtype=REAL_DTYPE, buffer=stereo)
                 stacked = SoundDeviceProcess.build_stereo(interleaved)
                 output_stream.write(stacked)
-            except InterruptedError e:
+            except InterruptedError:
                 pass
     
     def play(self, stereo):
@@ -1137,7 +1137,7 @@ def decoder_process_worker(
     
             # tell the parent thread that this is done
             out_queue.put((decoder_id, block_num, channel_length))
-        except InterruptedError e:
+        except InterruptedError:
             pass
 
 def send_to_write_soundfile_process_worker(output_file_lock, output_file_buffer, output_parent_conn, stereo):
@@ -1166,7 +1166,7 @@ def write_soundfile_process_worker(
                     stereo = output_buffer.read_stereo(length)
                     output_file_lock.release()
                     write_executor.submit(w.buffer_write, stereo, dtype="float32")
-                except InterruptedError e:
+                except InterruptedError:
                     pass
 
 

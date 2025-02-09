@@ -61,21 +61,18 @@ setup(
         Extension(
             "vhsdecode.sync",
             ["vhsdecode/sync.pyx"],
-            language_level=3,
             extra_compile_args=extra_compile_args,
             extra_link_args=extra_link_args
         ),
         Extension(
             "vhsdecode.hilbert",
             ["vhsdecode/hilbert.pyx"],
-            language_level=3,
             extra_compile_args=extra_compile_args,
             extra_link_args=extra_link_args
         ),
         Extension(
             "vhsdecode.linear_filter",
             ["vhsdecode/linear_filter.pyx"],
-            language_level=3,
             extra_compile_args=extra_compile_args,
             extra_link_args=extra_link_args
         )

@@ -10,7 +10,7 @@ import numpy
 # We want to run this before importing other modules to make sure modules are auto-compiled.
 # Black will separate this statement and cause warnings so make it ignore it.
 # fmt: off
-import pyximport; pyximport.install(language_level=3, setup_args={'include_dirs': numpy.get_include()}, reload_support=True)  # noqa: E702
+import pyximport; pyximport.install(setup_args={'include_dirs': numpy.get_include()}, reload_support=True)  # noqa: E702
 # fmt: on
 
 import lddecode.utils as lddu
