@@ -2,7 +2,7 @@
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import cpu_count, Pipe, Queue, Process, Lock, set_start_method, parent_process
+from multiprocessing import cpu_count, Pipe, Queue, Process, Lock, set_start_method, parent_process, freeze_support
 from threading import Lock as ThreadLock
 from multiprocessing.shared_memory import SharedMemory
 from datetime import datetime, timedelta
@@ -1526,4 +1526,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    freeze_support()
     sys.exit(main())

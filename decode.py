@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import sys
+from multiprocessing import freeze_support
 from importlib import import_module
 
 # from vhsdecode.main import main
@@ -43,4 +44,5 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    freeze_support()
     main(sys.argv[1:])
