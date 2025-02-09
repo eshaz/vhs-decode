@@ -1527,9 +1527,11 @@ def child_signal_handler(sig, frame):
     global signal_count
     global exit_requested
 
+    print("child process signal rx", signal_count)
+
     exit_requested = True
-    if signal_count >= NUM_SIGINT_BEFORE_FORCE_EXIT:
-        sys.exit(1)
+    #if signal_count >= NUM_SIGINT_BEFORE_FORCE_EXIT:
+    #    sys.exit(1)
     signal_count += 1
 
 if current_process().name == 'MainProcess':
