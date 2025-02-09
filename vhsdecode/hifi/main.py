@@ -200,28 +200,6 @@ parser.add_argument(
     ),
 )
 
-signal_count = 0
-exit_requested = False
-main_pid = os.getpid()
-def signal_handler(sig, frame):
-    global signal_count
-    global main_pid
-    global exit_requested
-
-    exit_requested = True
-    is_main_thread = main_pid == os.getpid()
-    if signal_count >= 1:
-        if is_main_thread:
-            # prevent reentrant calls https://stackoverflow.com/a/75368797
-            os.write(sys.stdout.fileno(), b"\nCtrl-C was pressed again, stopping immediately...\n")
-        sys.exit(1)
-    if signal_count == 0:
-        if is_main_thread:
-            os.write(sys.stdout.fileno(), b"\nCtrl-C was pressed, stopping decode...\n")
-    signal_count += 1
-
-signal.signal(signal.SIGINT, signal_handler)
-
 def test_if_ffmpeg_is_installed():
     shell_command = ["ffmpeg", "-version"]
     try:
@@ -1524,7 +1502,29 @@ def main() -> int:
             )
             return 1
 
+signal_count = 0
+exit_requested = False
+main_pid = None
+def signal_handler(sig, frame):
+    global signal_count
+    global main_pid
+    global exit_requested
+
+    exit_requested = True
+    is_main_thread = main_pid == os.getpid()
+    if signal_count >= 1:
+        if is_main_thread:
+            # prevent reentrant calls https://stackoverflow.com/a/75368797
+            os.write(sys.stdout.fileno(), b"\nCtrl-C was pressed again, stopping immediately...\n")
+        sys.exit(1)
+    if signal_count == 0:
+        if is_main_thread:
+            os.write(sys.stdout.fileno(), b"\nCtrl-C was pressed, stopping decode...\n")
+    signal_count += 1
+
+signal.signal(signal.SIGINT, signal_handler)
 
 if __name__ == "__main__":
     freeze_support()
+    main_pid = os.getpid()
     sys.exit(main())
