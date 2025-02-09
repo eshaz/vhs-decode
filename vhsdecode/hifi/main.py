@@ -888,6 +888,7 @@ class PostProcessor:
         while True:
             try:
                 stereo_length = self.discard_merge_worker_parent.recv()
+                break
             except InterruptedError:
                 # retry if a signal is received
                 continue
