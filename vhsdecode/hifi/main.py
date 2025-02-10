@@ -1250,6 +1250,9 @@ async def decode_parallel(
     output_file_send_executor = ThreadPoolExecutor(1)
     atexit.register(output_file_send_executor.shutdown)
 
+    decoder_ready_executor = ThreadPoolExecutor(1)
+    atexit.register(decoder_ready_executor.shutdown)
+
     
     decoders_running = set()
     decoders_idle = set(range(threads))
@@ -1278,12 +1281,8 @@ async def decode_parallel(
         while not done:
             # get the next decoder that is done
             if in_queue.empty():
-                decoder_ready.wait(0.01)
-                if decoder_ready.is_set():
-                    decoder_ready.clear()
-                else:
-                    await asyncio.sleep(0.1)
-                continue
+                await asyncio.get_running_loop().run_in_executor(decoder_ready_executor, decoder_ready.wait)
+                decoder_ready.clear()
 
             decoder_id, block_num, channel_length, done = in_queue.get()
             # print("send decoded to post processor")
