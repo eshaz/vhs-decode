@@ -899,7 +899,6 @@ class PostProcessor:
         stereo = self.discard_merge_worker_shared_memory.read_stereo(stereo_length)
 
         self.discard_merge_worker_lock.release()
-        print("send from post processor to out queue")
         self.out_queue.put_nowait((stereo, l_block_num, is_last_block))
 
         return stereo, l_block_num
@@ -1204,7 +1203,7 @@ async def decode_parallel(
     # spin up the decoders
     decoder_processes: list[Process] = []
     decoder_in_conns: list = []
-    decoder_out_queue: Queue = Queue()
+    decoder_out_queue = Queue()
     decoder_buffers: list[DecoderSharedMemory] = []
     decoder_buffer_instances = []
 
@@ -1224,7 +1223,7 @@ async def decode_parallel(
         decoder_buffer_instances.append(buffer_instance)
         decoder_buffers.append(buffer)
 
-    post_processor_out_queue = Queue()
+    post_processor_out_queue = asyncio.Queue()
 
     # set up the post processor
     post_processor = PostProcessor(
@@ -1254,31 +1253,33 @@ async def decode_parallel(
     # set up the pipeline
 
     # blocks_in -> read from block in, send to decoder buffer -> decoder_in_buffer
-    decoder_in_queue = Queue(threads)
-    decoder_idle_queue = Queue()
+    decoder_in_queue = asyncio.Queue(threads)
+    decoder_idle_queue = asyncio.Queue()
     for i in range(threads):
-        decoder_idle_queue.put(i)
+        decoder_idle_queue.put_nowait(i)
 
-    def write_to_decoder(in_queue):
+    async def write_to_decoder(in_queue):
         done = False
         while not done:
-            current_block, block, done = in_queue.get()
-            #print("send block to decoder")
+            current_block, block, done = await in_queue.get()
 
-            decoder_id = decoder_idle_queue.get()
+            # print("send block to decoder")
+            decoder_id = await decoder_idle_queue.get()
 
             decoder_buffers[decoder_id].write_block(block)
             decoder_in_conns[decoder_id].send((current_block, len(block), done))
 
-    write_to_decoder_thread = Thread(target=write_to_decoder, args=[decoder_in_queue])
-
     # decoder_out_queue -> read from decoder_out buffer, send to post processor out -> post_processor_out_queue
-    def write_to_processor(in_queue, out_queue):
+    async def write_to_processor(in_queue, out_queue):
         done = False
         while not done:
             # get the next decoder that is done
+            if in_queue.empty():
+                await asyncio.sleep(0.1)
+                continue
+
             decoder_id, block_num, channel_length, done = in_queue.get()
-            #print("send decoded to post processor")
+            # print("send decoded to post processor")
 
             # copy the data from the decoder's buffer
             l, r = decoder_buffers[decoder_id].read_channels(channel_length)
@@ -1286,22 +1287,19 @@ async def decode_parallel(
             # send the result to the post processor and mark this decoder as idle
             post_processor.submit(block_num, l, r, done)
             
-            out_queue.put(decoder_id)
+            out_queue.put_nowait(decoder_id)
             
 
-    write_to_post_processor_thread = Thread(target=write_to_processor, args=[decoder_out_queue, decoder_idle_queue])
-
     # post_processor_out_queue => read from post processor, send to sound file out and player process
-    samples_decoded_in_queue = Queue()
-    def write_to_soundfile(in_queue, out_queue):
+    samples_decoded_in_queue = asyncio.Queue()
+    async def write_to_soundfile(in_queue, out_queue):
         with SoundDeviceProcess(decode_options["audio_rate"]) as player:
             done = False
             while not done:
-                stereo, out_block_num, done = in_queue.get()
-                print("reading from post processor")
+                stereo, out_block_num, done = await in_queue.get()
 
                 output_file_send_executor.submit(send_to_write_soundfile_process_worker, output_file_lock, output_file_buffer, output_parent_conn, stereo)
-                out_queue.put((out_block_num, len(stereo) / 2))
+                out_queue.put_nowait((out_block_num, len(stereo) / 2))
         
                 if decode_options["preview"]:
                     if SOUNDDEVICE_AVAILABLE:
@@ -1310,8 +1308,6 @@ async def decode_parallel(
                         print(
                             "Import of sounddevice failed, preview is not available!"
                         )
-
-    write_to_sound_file_thread = Thread(target=write_to_soundfile, args=[post_processor_out_queue, samples_decoded_in_queue])
 
     # sound_file_out_queue => read from sound file out queue and send to sound file ot process
 
@@ -1322,10 +1318,11 @@ async def decode_parallel(
     # flush the pipeline
     # wait for each loop to finish
 
-    write_to_decoder_thread.start()
-    write_to_post_processor_thread.start()
-    write_to_sound_file_thread.start()
-
+    asyncio.create_task(write_to_decoder(decoder_in_queue))
+    asyncio.create_task(write_to_processor(decoder_out_queue, decoder_idle_queue))
+    asyncio.create_task(write_to_soundfile(post_processor_out_queue, samples_decoded_in_queue))
+    print("created tasks")
+    
     with as_soundfile(input_file) as sf:
         f = AsyncSoundFile(sf, threads)
 
@@ -1338,12 +1335,11 @@ async def decode_parallel(
                 assert len(decoders_running.intersection(decoders_idle)) == 0, "Warning, a decoder process is both idle and active"
 
                 # submit this block to an idle decoder
-                print("putting to decoder")
-                decoder_in_queue.put((current_block, block, done))
+                await decoder_in_queue.put((current_block, block, done))
                 current_block += 1
 
                 if (not samples_decoded_in_queue.empty()):
-                    out_block_num, samples_decoded = samples_decoded_in_queue.get()
+                    out_block_num, samples_decoded = await samples_decoded_in_queue.get()
                     total_samples_decoded += samples_decoded
 
                 log_decode(start_time, f.tell(), total_samples_decoded, decode_options, len(decoders_running))
