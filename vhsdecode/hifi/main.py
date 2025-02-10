@@ -928,15 +928,6 @@ class PostProcessor:
                 self.next_block += 1
                 self.last_block_submitted = block_num
 
-    def flush(self):
-        # read all blocks until the queue is empty, and terminate the workers
-        while len(self.submit_thread_executor_queue) > 0:    
-            yield self._read()
-
-        self.nr_worker_l.terminate()
-        self.nr_worker_r.terminate()
-        self.discard_merge_worker_process.terminate()
-
 class AppWindow:
     def __init__(self, argv, decode_options):
         self._app, self._window = self.open_ui(argv, decode_options)
@@ -1036,54 +1027,58 @@ def decode(decoder, decode_options, ui_t: Optional[AppWindow] = None):
         with as_outputfile(output_file, decode_options["audio_rate"]) as w:
             with as_soundfile(input_file) as f:
                 progressB = TimeProgressBar(f.frames, f.frames)
-                current_block = 0
+                current_block_num = 0
                 try:
                     print(f"Starting decode...")
-                    for block in f.blocks(
+                    current_block = np.empty(0)
+                    for next_block in f.blocks(
                         blocksize=decoder.blockSize, overlap=decoder.readOverlap
                     ):
-                        is_last_block = f.tell() == f.frames or exit_requested
-                        done = len(block) == 0 or exit_requested
-    
-                        progressB.print(f.tell())
+                        if len(current_block) > 0:
+                            is_last_block = len(next_block) == 0 or exit_requested
+
+                            if ui_t is not None:
+                                ui_t.app.processEvents()
+                                if ui_t.window.transport_state == 0:
+                                    is_last_block = True
+                                elif ui_t.window.transport_state == 2:
+                                    while ui_t.window.transport_state == 2:
+                                        ui_t.app.processEvents()
+                                        time.sleep(0.01)
         
-                        l, r = decoder.block_decode(block)
+                            progressB.print(f.tell())
+            
+                            l, r = decoder.block_decode(current_block)
+            
+                            if decode_options["auto_fine_tune"]:
+                                log_bias(decoder)
+            
+                            post_processor.submit(current_block_num, l, r, is_last_block)
+    
+                            current_block_num += 1
         
-                        if decode_options["auto_fine_tune"]:
-                            log_bias(decoder)
+                            while not post_processor_out_queue.empty():
+                                stereo, block_num_out, is_last_block_out = post_processor_out_queue.get()
+                                try:
+                                    w.buffer_write(stereo, "float32")
         
-                        post_processor.submit(current_block, l, r, is_last_block)
-    
-                        current_block += 1
-                        while not post_processor_out_queue.empty():
-                            stereo, block_num_out, is_last_block_out = post_processor_out_queue.get()
-                            try:
-                                w.buffer_write(stereo, "float32")
-    
-                                total_samples_decoded += len(stereo) / 2
-                                log_decode(start_time, f.tell(), total_samples_decoded, decode_options)
-    
-                                if decode_options["preview"]:
-                                    if SOUNDDEVICE_AVAILABLE:
-                                        player.play(stereo)
-                                    else:
-                                        print(
-                                            "Import of sounddevice failed, preview is not available!"
-                                        )
-                            except ValueError:
-                                pass
-    
-                        if ui_t is not None:
-                            ui_t.app.processEvents()
-                            if ui_t.window.transport_state == 0:
+                                    total_samples_decoded += len(stereo) / 2
+                                    log_decode(start_time, f.tell(), total_samples_decoded, decode_options)
+        
+                                    if decode_options["preview"]:
+                                        if SOUNDDEVICE_AVAILABLE:
+                                            player.play(stereo)
+                                        else:
+                                            print(
+                                                "Import of sounddevice failed, preview is not available!"
+                                            )
+                                except ValueError:
+                                    pass
+        
+                            if is_last_block:
                                 break
-                            elif ui_t.window.transport_state == 2:
-                                while ui_t.window.transport_state == 2:
-                                    ui_t.app.processEvents()
-                                    time.sleep(0.01)
-    
-                        if done:
-                            break
+
+                        current_block = next_block
                 except KeyboardInterrupt:
                     pass
                     print("Emptying the decode queue ...")
@@ -1162,9 +1157,9 @@ def write_soundfile_process_worker(
                 except InterruptedError:
                     pass
 
-            decode_done.set()
             write_executor.submit(w.flush)
             write_executor.shutdown(wait=True)
+            decode_done.set()
 
 
 async def decode_parallel(
@@ -1178,7 +1173,7 @@ async def decode_parallel(
     start_time =  datetime.now()
     block_size = decoders[0].blockSize
     read_overlap = decoders[0].readOverlap
-    current_block = 0
+    current_block_num = 0
 
     # spin up the decoders
     decoder_processes: list[Process] = []
@@ -1255,8 +1250,6 @@ async def decode_parallel(
     async def stream_from_decoder_to_post_processor():
         done = False
         while not done or len(decoders_running) > 0:
-            #if decoder_out_queue.empty():
-            # wait for a decoder to finish
             decoder_id, block_num, channel_length, done = await asyncio.get_running_loop().run_in_executor(decoder_ready_executor, decoder_out_queue.get)
 
             decoders_running.remove(decoder_id)
@@ -1291,6 +1284,7 @@ async def decode_parallel(
     with as_soundfile(input_file) as sf:
         f = AsyncSoundFile(sf, threads)
 
+        # start decode pipeline tasks
         stream_from_input_to_decoder_task = asyncio.create_task(stream_from_input_to_decoder())
         stream_from_decoder_to_post_processor_task = asyncio.create_task(stream_from_decoder_to_post_processor())
         stream_from_post_processor_to_output_task = asyncio.create_task(stream_from_post_processor_to_output(f))
@@ -1298,26 +1292,30 @@ async def decode_parallel(
         progressB = TimeProgressBar(f.frames, f.frames)
         try:
             print(f"Starting decode...")
-            async for block in f.blocks_async(blocksize=block_size, overlap=read_overlap):
-                done = len(block) == 0 or exit_requested
+            current_block = np.empty(0)
+            async for next_block in f.blocks_async(blocksize=block_size, overlap=read_overlap):
+                if len(current_block) > 0:
+                    is_last_block = len(next_block) == 0 or exit_requested
 
-                # send this block to the decoder processing pipeline
-                await decoder_in_queue.put((current_block, block, done))
-                current_block += 1
-                
-                if ui_t is not None:
-                    ui_t.app.processEvents()
-                    if ui_t.window.transport_state == 0:
+                    if ui_t is not None:
+                        ui_t.app.processEvents()
+                        if ui_t.window.transport_state == 0:
+                            is_last_block = True
+                        elif ui_t.window.transport_state == 2:
+                            while ui_t.window.transport_state == 2:
+                                ui_t.app.processEvents()
+                                time.sleep(0.01)
+    
+                    # send this block to the decoder processing pipeline
+                    await decoder_in_queue.put((current_block_num, current_block, is_last_block))
+                    current_block_num += 1
+                    
+                    progressB.print(f.tell())
+    
+                    if is_last_block:
                         break
-                    elif ui_t.window.transport_state == 2:
-                        while ui_t.window.transport_state == 2:
-                            ui_t.app.processEvents()
-                            time.sleep(0.01)
 
-                progressB.print(f.tell())
-
-                if done:
-                    break
+                current_block = next_block
         except KeyboardInterrupt:
             pass
 
@@ -1328,9 +1326,12 @@ async def decode_parallel(
         while not decode_done.wait(0.01):
             await asyncio.sleep(1)
 
-        stream_from_input_to_decoder_task.cancel()
-        stream_from_decoder_to_post_processor_task.cancel()
-        stream_from_post_processor_to_output_task.cancel()
+        try:
+            stream_from_input_to_decoder_task.cancel()
+            stream_from_decoder_to_post_processor_task.cancel()
+            stream_from_post_processor_to_output_task.cancel()
+        except Exception:
+            pass
 
         for i in range(threads):
             process = decoder_processes[i]
