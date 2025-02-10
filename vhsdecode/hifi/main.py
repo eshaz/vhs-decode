@@ -2,8 +2,8 @@
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import cpu_count, Pipe, Queue, Process, Lock, freeze_support, current_process
-from threading import Lock as ThreadLock, Thread
+from multiprocessing import cpu_count, Pipe, Queue, Process, Lock, freeze_support, current_process, Event
+from threading import Lock as ThreadLock
 from multiprocessing.shared_memory import SharedMemory
 from datetime import datetime, timedelta
 import os
@@ -1132,7 +1132,8 @@ def decoder_process_worker(
     auto_fine_tune: bool,
     in_conn,
     out_queue: Queue,
-    buffer_name: str
+    buffer_name: str,
+    decoder_ready
 ):
     buffer = DecoderSharedMemory(buffer_name)
     while True:
@@ -1153,6 +1154,7 @@ def decoder_process_worker(
     
             # tell the parent thread that this is done
             out_queue.put((decoder_id, block_num, channel_length, done))
+            decoder_ready.set()
         except InterruptedError:
             pass
 
@@ -1206,6 +1208,7 @@ async def decode_parallel(
     decoder_out_queue = Queue()
     decoder_buffers: list[DecoderSharedMemory] = []
     decoder_buffer_instances = []
+    decoder_ready = Event()
 
     for i in range(len(decoders)):
         decoder = decoders[i]
@@ -1214,7 +1217,7 @@ async def decode_parallel(
         buffer = DecoderSharedMemory(buffer_instance.name)
         atexit.register(buffer.close)
         atexit.register(buffer.unlink)
-        decoder_process = Process(target=decoder_process_worker, name=f"HiFiDecode Decoder Thread {i}", args=(i, decoder, decode_options["auto_fine_tune"], decoder_in_conn_parent, decoder_out_queue, buffer_instance.name))
+        decoder_process = Process(target=decoder_process_worker, name=f"HiFiDecode Decoder Thread {i}", args=(i, decoder, decode_options["auto_fine_tune"], decoder_in_conn_parent, decoder_out_queue, buffer_instance.name, decoder_ready))
         decoder_process.start()
 
         atexit.register(decoder_process.terminate)
@@ -1275,7 +1278,11 @@ async def decode_parallel(
         while not done:
             # get the next decoder that is done
             if in_queue.empty():
-                await asyncio.sleep(0.1)
+                decoder_ready.wait(0.01)
+                if decoder_ready.is_set():
+                    decoder_ready.clear()
+                else:
+                    await asyncio.sleep(0.1)
                 continue
 
             decoder_id, block_num, channel_length, done = in_queue.get()
