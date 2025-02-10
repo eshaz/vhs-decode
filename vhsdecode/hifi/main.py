@@ -1107,7 +1107,7 @@ async def decode_parallel(
     decode_done = Event()
 
     decoders_running = set()
-    decoder_in_queue = asyncio.Queue(threads)
+    decoder_in_queue = asyncio.Queue(1)
     decoder_idle_queue = asyncio.Queue()
 
     # spin up the decoders
@@ -1193,7 +1193,11 @@ async def decode_parallel(
                     stop_requested = await handle_ui_events()
                     is_last_block = len(next_block) == 0 or exit_requested or stop_requested
 
-                    await decoder_in_queue.put((current_block_num, current_block, is_last_block))
+                    decoder_id = await decoder_idle_queue.get()
+                    decoder_buffers[decoder_id].write_block(current_block)
+                    decoder_in_conns[decoder_id].send((current_block_num, len(current_block), is_last_block))
+                    decoders_running.add(decoder_id)
+
                     if is_last_block:
                         break
 
@@ -1206,15 +1210,15 @@ async def decode_parallel(
         print("Decode finishing up. Emptying the queue")
         print("")
 
-    async def stream_from_blocks_to_decoder():
-        done = False
-        while not done:
-            block_num, block, done = await decoder_in_queue.get()
-
-            decoder_id = await decoder_idle_queue.get()
-            decoder_buffers[decoder_id].write_block(block)
-            decoder_in_conns[decoder_id].send((block_num, len(block), done))
-            decoders_running.add(decoder_id)
+    #async def stream_from_blocks_to_decoder():
+    #    done = False
+    #    while not done:
+    #        block_num, block, done = await decoder_in_queue.get()
+#
+    #        decoder_id = await decoder_idle_queue.get()
+    #        decoder_buffers[decoder_id].write_block(block)
+    #        decoder_in_conns[decoder_id].send((block_num, len(block), done))
+    #        decoders_running.add(decoder_id)
 
     async def stream_from_decoder_to_post_processor():
         done = False
@@ -1255,7 +1259,7 @@ async def decode_parallel(
     # set up each async task to stream the decoded data through each step
     await asyncio.gather(
         asyncio.create_task(stream_from_input_to_blocks(), context=input_position_ctx),
-        asyncio.create_task(stream_from_blocks_to_decoder()),
+        #asyncio.create_task(stream_from_blocks_to_decoder()),
         asyncio.create_task(stream_from_decoder_to_post_processor()),
         asyncio.create_task(stream_from_post_processor_to_output(), context=input_position_ctx)
     )
