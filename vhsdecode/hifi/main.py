@@ -656,6 +656,7 @@ class PostProcessor:
         atexit.register(self.discard_merge_worker_shared_memory.unlink)
 
         self.out_queue = out_queue
+        self.done = False
 
     @staticmethod
     def noise_reduction_worker(
@@ -844,12 +845,14 @@ class PostProcessor:
 
                 self.next_block += 1
                 self.last_block_submitted = block_num
+                self.done = is_last_block
+
+        return self.done
 
     def close(self):        
         self.nr_worker_l.terminate()
         self.nr_worker_r.terminate()
         self.discard_merge_worker_process.terminate()
-        self.submit_thread_executor.shutdown(wait=False)
 
 class AppWindow:
     def __init__(self, argv, decode_options):
@@ -1097,7 +1100,6 @@ async def decode_parallel(
     start_time =  datetime.now()
     block_size = decoders[0].blockSize
     read_overlap = decoders[0].readOverlap
-    current_block_num = 0
 
     decoder_processes: list[Process] = []
     decoder_in_conns: list = []
@@ -1106,8 +1108,7 @@ async def decode_parallel(
     decoder_buffer_instances = []
     decode_done = Event()
 
-    decoders_running = set()
-    decoder_in_queue = asyncio.Queue(1)
+    decoder_in_queue = asyncio.Queue(threads)
     decoder_idle_queue = asyncio.Queue()
 
     # spin up the decoders
@@ -1153,15 +1154,6 @@ async def decode_parallel(
     output_file_send_executor = ThreadPoolExecutor(1)
     atexit.register(output_file_send_executor.shutdown)
 
-    decoder_ready_executor = ThreadPoolExecutor(1)
-    atexit.register(decoder_ready_executor.shutdown)
-
-    post_processor_out_queue_executor = ThreadPoolExecutor(1)
-    atexit.register(post_processor_out_queue_executor.shutdown)
-
-    log_executor = ThreadPoolExecutor(1)
-    atexit.register(log_executor.shutdown)
-
     input_position = contextvars.ContextVar('input_position')
     input_position.set(0)
     input_position_ctx = contextvars.copy_context()
@@ -1185,9 +1177,7 @@ async def decode_parallel(
 
             current_block_num = 0
             current_block = np.empty(0)
-            avg_duration = 0
             for next_block in f.blocks(blocksize=block_size, overlap=read_overlap):
-                start = time.perf_counter()
                 # send this block to the decoder processing pipeline
                 input_position.set(f.tell())
 
@@ -1195,7 +1185,17 @@ async def decode_parallel(
                     stop_requested = await handle_ui_events()
                     is_last_block = len(next_block) == 0 or exit_requested or stop_requested
 
-                    await decoder_in_queue.put((current_block_num, current_block, is_last_block))
+                    while True:
+                        # fill the buffer if empty, or everything else is busy
+                        if (decoder_in_queue.empty() or (
+                            decoder_idle_queue.empty() and
+                            decoder_out_queue.empty() and
+                            post_processor_out_queue.empty()
+                        )):
+                            await decoder_in_queue.put((current_block_num, current_block, is_last_block))
+                            break
+                        await asyncio.sleep(0) # yield to the next stop if there's nothing to do
+                    
                     if is_last_block:
                         break
 
@@ -1204,67 +1204,65 @@ async def decode_parallel(
 
                 current_block = next_block
 
-                end = time.perf_counter()
-                duration = (end - start)
-                avg_duration = (avg_duration + duration) / 2 if avg_duration != 0 else duration
-                print(f"stream_from_input_to_blocks, duration {avg_duration}")
-
         print("")
         print("Decode finishing up. Emptying the queue")
         print("")
 
     async def stream_from_blocks_to_decoder():
         done = False
-        avg_duration = 0
         while not done:
-            block_num, block, done = await decoder_in_queue.get()
-            start = time.perf_counter()
+            # read the next block
+            while not done:
+                if not decoder_in_queue.empty():
+                    block_num, block, done = await decoder_in_queue.get()
+                    break
+                await asyncio.sleep(0) # yield to the next stop if there's nothing to do
     
-            decoder_id = await decoder_idle_queue.get()
+            # send the block to the decoder
+            while True:
+                if not decoder_idle_queue.empty():
+                    decoder_id = await decoder_idle_queue.get()
+                    break
+                await asyncio.sleep(0) # yield to the next stop if there's nothing to do
+
             decoder_buffers[decoder_id].write_block(block)
             decoder_in_conns[decoder_id].send((block_num, len(block), done))
-            decoders_running.add(decoder_id)
-
-            end = time.perf_counter()
-            duration = (end - start)
-            avg_duration = (avg_duration + duration) / 2 if avg_duration != 0 else duration
-            print(f"stream_from_blocks_to_decoder, duration {avg_duration}")
+            #decoders_running.add(decoder_id)
 
     async def stream_from_decoder_to_post_processor():
         done = False
-        avg_duration = 0
-        while not done or len(decoders_running) > 0:
-            decoder_id, block_num, channel_length, done = await asyncio.get_running_loop().run_in_executor(decoder_ready_executor, decoder_out_queue.get)
+        while not done:
+            while not done:
+                if not decoder_out_queue.empty():
+                    decoder_id, block_num, channel_length, is_last_block = decoder_out_queue.get()
+                    break
+                await asyncio.sleep(0) # yield to the next stop if there's nothing to do
 
-            start = time.perf_counter()
-    
-            decoders_running.remove(decoder_id)
+            #decoders_running.remove(decoder_id)
     
             # copy the data from the decoder's buffer
             l, r = decoder_buffers[decoder_id].read_channels(channel_length)
             # send the result to the post processor and mark this decoder as idle
-            post_processor.submit(block_num, l, r, done)
-            decoder_idle_queue.put_nowait(decoder_id)
+            done = post_processor.submit(block_num, l, r, is_last_block)
 
-            end = time.perf_counter()
-            duration = (end - start)
-            avg_duration = (avg_duration + duration) / 2 if avg_duration != 0 else duration
-            print(f"stream_from_decoder_to_post_processor, duration {avg_duration}")
+            decoder_idle_queue.put_nowait(decoder_id)
             
     async def stream_from_post_processor_to_output():
         total_samples_decoded = 0
         with SoundDeviceProcess(decode_options["audio_rate"]) as player:
             done = False
-            avg_duration = 0
             while not done:
-                stereo, out_block_num, done = await asyncio.get_running_loop().run_in_executor(post_processor_out_queue_executor, post_processor_out_queue.get)
-                start = time.perf_counter()
+                while not done:
+                    if not post_processor_out_queue.empty():
+                        stereo, out_block_num, done = post_processor_out_queue.get()
+                        break
+                    await asyncio.sleep(0) # yield to the next stop if there's nothing to do
 
                 total_samples_decoded += len(stereo) / 2
     
-                log_executor.submit(log_decode, start_time, input_position.get(), total_samples_decoded, decode_options, len(decoders_running))
+                log_decode(start_time, input_position.get(), total_samples_decoded, decode_options, threads - decoder_idle_queue.qsize())
                 output_file_send_executor.submit(send_to_write_soundfile_process_worker, output_file_lock, output_file_buffer, output_parent_conn, stereo, done)
-            
+
                 if decode_options["preview"]:
                     if SOUNDDEVICE_AVAILABLE:
                         player.play(stereo)
@@ -1273,12 +1271,6 @@ async def decode_parallel(
                             "Import of sounddevice failed, preview is not available!"
                         )
 
-                end = time.perf_counter()
-                duration = (end - start)
-                avg_duration = (avg_duration + duration) / 2 if avg_duration != 0 else duration
-                print(f"stream_from_post_processor_to_output, duration {avg_duration}")
-
-                        
     print(f"Starting decode...")
     
     # set up each async task to stream the decoded data through each step
@@ -1292,10 +1284,6 @@ async def decode_parallel(
     while not decode_done.wait(0.01):
         await asyncio.sleep(1)
     
-    output_file_send_executor.shutdown(wait=False)
-    decoder_ready_executor.shutdown(wait=False)
-    post_processor_out_queue_executor.shutdown(wait=False)
-    log_executor.shutdown(wait=False)
     post_processor.close()
     
     output_file_process.join()
