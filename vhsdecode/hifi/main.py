@@ -1192,8 +1192,7 @@ async def decode_parallel(
                             decoder_buffers[decoder_id].write_block(current_block)
                             decoder_in_conns[decoder_id].send((current_block_num, len(current_block), is_last_block))
                             break
-                        else:
-                            await asyncio.sleep(0) # yield to the next stop if there's nothing to do
+                        await asyncio.sleep(0) # yield to the next stop if there's nothing to do
                     
                     if is_last_block:
                         break
