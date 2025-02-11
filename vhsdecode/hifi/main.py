@@ -1231,7 +1231,7 @@ async def decode_parallel(
                     if not post_processor_out_queue.empty():
                         stereo, out_block_num, done = post_processor_out_queue.get()
                         break
-                    await asyncio.sleep(0.1) # yield to the next stop if there's nothing to do
+                    await asyncio.sleep(0) # yield to the next stop if there's nothing to do
 
                 total_samples_decoded += len(stereo) / 2
     
