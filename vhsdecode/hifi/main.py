@@ -1250,9 +1250,9 @@ async def decode_parallel(
     
     # set up each async task to stream the decoded data through each step
     await asyncio.gather(
-        asyncio.create_task(stream_from_post_processor_to_output(), context=input_position_ctx),
-        asyncio.create_task(stream_from_decoder_to_post_processor()),
         asyncio.create_task(stream_from_input_to_blocks(), context=input_position_ctx),
+        asyncio.create_task(stream_from_decoder_to_post_processor()),
+        asyncio.create_task(stream_from_post_processor_to_output(), context=input_position_ctx),
     )
 
     while not decode_done.wait(0.01):
