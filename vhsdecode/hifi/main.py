@@ -10,7 +10,6 @@ import asyncio
 from typing import List, Optional
 import signal
 from numba import njit, prange
-from collections import deque
 import atexit
 
 import numpy as np
@@ -932,9 +931,11 @@ def decoder_process_worker(
             pre_l_out = buffer.get_pre_left()
             pre_r_out = buffer.get_pre_right()
 
+            print("decoder start", buffer_params["block_num"])
             pre_audio_trimmed = decoder.block_decode(raw_data_in, pre_l_out, pre_r_out)
             if auto_fine_tune:
                 log_bias(decoder)
+            print("decoder end", buffer_params["block_num"])
 
             buffer_params["pre_audio_trimmed"] = pre_audio_trimmed
     
@@ -963,6 +964,7 @@ def post_processor_worker(
     done = False
     while not done:
         buffer_params = decoder_out_queue.get()
+        print("post processor start", buffer_params["block_num"])
         done = post_processor.submit(buffer_params)
 
     decode_done.wait()
@@ -986,6 +988,7 @@ def write_soundfile_process_worker(
             while not done:
                 try:
                     buffer_params = post_processor_out_queue.get()
+                    print("post processor end", buffer_params["block_num"])
                     buffer = DecoderSharedMemory(buffer_params)
                     stereo = buffer.get_stereo()
 
@@ -1009,8 +1012,6 @@ def write_soundfile_process_worker(
             w.flush()
             decode_done.set()
 
-    print("write_soundfile_process_worker done")
-
 
 async def decode_parallel(
     decoders: List[HiFiDecode],
@@ -1030,7 +1031,6 @@ async def decode_parallel(
     decoder_buffer_instances = []
     decode_done = Event()
 
-    decoder_idle_queue = asyncio.Queue()
     shared_memory_idle_queue = Queue()
 
     # create shared memory
@@ -1046,7 +1046,6 @@ async def decode_parallel(
         decoder = decoders[i]
 
         decoder_process = Process(target=decoder_process_worker, name=f"HiFiDecode Decoder Thread {i}", args=(decoder, decode_options["auto_fine_tune"], decoder_in_queue, decoder_out_queue))
-        decoder_idle_queue.put_nowait(i)
         decoder_process.start()
 
         atexit.register(decoder_process.terminate)
