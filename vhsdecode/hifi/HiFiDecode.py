@@ -23,6 +23,8 @@ from vhsdecode.addons.chromasep import samplerate_resample
 from vhsdecode.addons.gnuradioZMQ import ZMQSend, ZMQ_AVAILABLE
 from vhsdecode.utils import firdes_lowpass, firdes_highpass, StackableMA
 
+from vhsdecode.hifi.utils import DecoderSharedMemory
+
 import matplotlib.pyplot as plt
 
 # lower increases expander strength and decreases overall gain
@@ -517,6 +519,7 @@ class HiFiDecode:
         self.blocks_second: int = BLOCKS_PER_SECOND
         self.block_size: int = int(self.sample_rate / self.blocks_second)
         self.block_audio_size: int = int(self.audio_rate / self.blocks_second)
+        self.block_final_audio_size: int = int(self.audio_final_rate / self.blocks_second)
 
         # trim off peaks at edges of if
         self.pre_trim = 50
@@ -846,13 +849,20 @@ class HiFiDecode:
 
         return ifL, ifR
 
+    # size of the raw data block coming in
     @property
     def blockSize(self) -> int:
         return self.block_size
     
+    # size of the audio decoded audio before resampling
     @property
     def blockAudioSize(self) -> int:
         return self.block_audio_size
+        
+    # size of the audio decoded audio after resampling
+    @property
+    def blockFinalAudioSize(self) -> int:
+        return self.block_final_audio_size
 
     @property
     def readOverlap(self) -> int:
@@ -890,10 +900,6 @@ class HiFiDecode:
 
     def carrierOffsets(self, standard, cL, cR):
         return standard.LCarrierRef - cL, standard.RCarrierRef - cR
-    
-    @staticmethod
-    def block_decode_worker(decoder, block, current_block):
-        return decoder.block_decode(block, current_block)
 
     @staticmethod
     @njit(cache=True, fastmath=True, nogil=True)
@@ -966,8 +972,10 @@ class HiFiDecode:
 
     def block_decode(
         self,
-        raw_data: NDArray[np.int16]
-    ) -> Tuple[int, NDArray[REAL_DTYPE], NDArray[REAL_DTYPE]]:
+        raw_data: NDArray[np.int16],
+        l_out: NDArray[REAL_DTYPE],
+        r_out: NDArray[REAL_DTYPE]
+    ):
         # Do a bandpass filter to remove the video components from the signal.
         # 8mm only. 8mm has the FM and Video combined in one rf signal.
         if self.options["format"] == "8mm":
@@ -1008,7 +1016,10 @@ class HiFiDecode:
         assert preL.dtype == REAL_DTYPE, f"Audio data must be in {REAL_DTYPE} format, instead got {preL.dtype}"
         assert preR.dtype == REAL_DTYPE, f"Audio data must be in {REAL_DTYPE} format, instead got {preR.dtype}"
 
-        return preL, preR
+        DecoderSharedMemory.copy_data(preL, l_out, 0, len(preL))
+        DecoderSharedMemory.copy_data(preR, r_out, 0, len(preR))
+
+        return len(preL)
     
     @staticmethod
     def debug_peak_interpolation(audio, filtered_signal, filtered_signal_abs, peaks, interpolation_boundaries, interpolated, headswitch_signal_rate):
