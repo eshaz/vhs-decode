@@ -730,8 +730,7 @@ class PostProcessor:
             while len(self.block_queue) > 0 and (self.block_queue[0]["block_num"] <= self.next_block):
                 buffer_params = self.block_queue.pop(0)
 
-                future = self.submit_thread_executor.submit(self.process_audio_worker, buffer_params)
-                self.submit_thread_executor_queue.append(future)
+                self.process_audio_worker(buffer_params)
 
                 self.next_block += 1
                 self.last_block_submitted = buffer_params["block_num"]
