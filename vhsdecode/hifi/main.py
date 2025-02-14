@@ -1069,7 +1069,6 @@ async def decode_parallel(
                     while True:
                         # wait for an idle decoder to become available and send the block to it
                         if not shared_memory_idle_queue.empty():
-                            print("adding block", current_block_num)
                             buffer_name = shared_memory_idle_queue.get()
                             buffer_params = {
                                 "name": buffer_name,
