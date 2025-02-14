@@ -708,7 +708,8 @@ class PostProcessor:
                 # retry if a signal is received
                 continue
 
-        self.out_queue.put_nowait(stereo_buffer_params)
+        print("post processor send", stereo_buffer_params["block_num"])
+        self.out_queue.put(stereo_buffer_params)
 
     def submit(
         self,
