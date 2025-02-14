@@ -1034,7 +1034,7 @@ async def decode_parallel(
     shared_memory_idle_queue = Queue()
 
     # create shared memory
-    for i in range(len(decoders) + 4):
+    for i in range(len(decoders) * 2):
         buffer_instance = DecoderSharedMemory.get_shared_memory(block_size, audio_block_size, f"HiFiDecode Shared Memory {i}")
         decoder_buffer_instances.append(buffer_instance)
         atexit.register(buffer_instance.close)
