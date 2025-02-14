@@ -546,18 +546,21 @@ class PostProcessor:
         self.spectral_nr_amount = decode_options["spectral_nr_amount"]
         self.nr_side_gain = decode_options["nr_side_gain"]
         
-        self.nr_worker_l_parent, nr_worker_l_child = Pipe()
-        self.nr_worker_l = Process(target=PostProcessor.noise_reduction_worker, name="HiFiDecode NoiseReduction L", args=(nr_worker_l_child, self.spectral_nr_amount, self.use_noise_reduction, self.nr_side_gain, self.final_audio_rate))
+        self.nr_worker_l_in_queue = Queue()
+        self.nr_worker_l_out_queue = Queue()
+        self.nr_worker_l = Process(target=PostProcessor.noise_reduction_worker, name="HiFiDecode NoiseReduction L", args=(self.nr_worker_l_in_queue, self.nr_worker_l_out_queue, self.spectral_nr_amount, self.use_noise_reduction, self.nr_side_gain, self.final_audio_rate))
         self.nr_worker_l.start()
         atexit.register(self.nr_worker_l.terminate)
 
-        self.nr_worker_r_parent, nr_worker_r_child = Pipe()
-        self.nr_worker_r = Process(target=PostProcessor.noise_reduction_worker, name="HiFiDecode NoiseReduction R", args=(nr_worker_r_child, self.spectral_nr_amount, self.use_noise_reduction, self.nr_side_gain, self.final_audio_rate))
+        self.nr_worker_r_in_queue = Queue()
+        self.nr_worker_r_out_queue = Queue()
+        self.nr_worker_r = Process(target=PostProcessor.noise_reduction_worker, name="HiFiDecode NoiseReduction R", args=(self.nr_worker_r_in_queue, self.nr_worker_r_out_queue, self.spectral_nr_amount, self.use_noise_reduction, self.nr_side_gain, self.final_audio_rate))
         self.nr_worker_r.start()
         atexit.register(self.nr_worker_r.terminate)
 
-        self.discard_merge_worker_parent, discard_merge_worker_child = Pipe()
-        self.discard_merge_worker_process = Process(target=PostProcessor.discard_merge_worker, name="HiFiDecode Stereo Merge", args=(discard_merge_worker_child, self.final_audio_rate, self.decoder_audio_rate, self.decoder_audio_block_size, self.decoder_audio_discard_size))
+        self.discard_merge_worker_in_queue = Queue()
+        self.discard_merge_worker_out_queue = Queue()
+        self.discard_merge_worker_process = Process(target=PostProcessor.discard_merge_worker, name="HiFiDecode Stereo Merge", args=(self.discard_merge_worker_in_queue, self.discard_merge_worker_out_queue, self.final_audio_rate, self.decoder_audio_rate, self.decoder_audio_block_size, self.decoder_audio_discard_size))
         self.discard_merge_worker_process.start()
         atexit.register(self.discard_merge_worker_process.terminate)
 
@@ -566,7 +569,8 @@ class PostProcessor:
 
     @staticmethod
     def noise_reduction_worker(
-        conn,
+        in_queue,
+        out_queue,
         spectral_nr_amount,
         use_noise_reduction,
         nr_side_gain,
@@ -583,7 +587,7 @@ class PostProcessor:
 
         while True:
             try:
-                buffer_params, channel_num = conn.recv()
+                buffer_params, channel_num = in_queue.get()
                 buffer = DecoderSharedMemory(buffer_params)
 
                 if channel_num == 0:
@@ -605,15 +609,15 @@ class PostProcessor:
                 DecoderSharedMemory.copy_data(audio, nr_out, 0, len(audio))
                 buffer_params["post_audio_trimmed"] = len(audio)
 
-                conn.send(buffer_params)
+                out_queue.put(buffer_params)
             except InterruptedError:
                 pass
 
     @staticmethod
-    def discard_merge_worker(conn, audio_rate, decoder_audio_rate, decoder_audio_block_size, decoder_audio_discard_size):
+    def discard_merge_worker(in_queue, out_queue, audio_rate, decoder_audio_rate, decoder_audio_block_size, decoder_audio_discard_size):
         while True:
             try:
-                buffer_params = conn.recv()
+                buffer_params = in_queue.get()
                 buffer = DecoderSharedMemory(buffer_params)
                 l = buffer.get_nr_left()
                 r = buffer.get_nr_right()
@@ -623,7 +627,7 @@ class PostProcessor:
                 stereo_len = PostProcessor.stereo_interleave(l, r, stereo, overlap_start, overlap_end)
 
                 buffer_params["stereo_audio_trimmed"] = stereo_len
-                conn.send(buffer_params)
+                out_queue.put(buffer_params)
             except InterruptedError:
                 pass
 
@@ -675,12 +679,12 @@ class PostProcessor:
     ) -> np.array:
         # thread theses calls to avoid blocking on memory reads and writes
         if self.spectral_nr_amount > 0 or self.use_noise_reduction:
-            self.nr_worker_l_parent.send((buffer_params_in, 0))
-            self.nr_worker_r_parent.send((buffer_params_in, 1))
+            self.nr_worker_l_in_queue.put((buffer_params_in, 0))
+            self.nr_worker_r_in_queue.put((buffer_params_in, 1))
 
             while True:
                 try:
-                    l_nr_buffer_params = self.nr_worker_l_parent.recv()
+                    l_nr_buffer_params = self.nr_worker_l_out_queue.get()
                     break
                 except InterruptedError:
                     # retry if a signal is received
@@ -688,7 +692,7 @@ class PostProcessor:
 
             while True:
                 try:
-                    r_nr_buffer_params = self.nr_worker_r_parent.recv()
+                    r_nr_buffer_params = self.nr_worker_r_out_queue.get()
                     break
                 except InterruptedError:
                     # retry if a signal is received
@@ -698,17 +702,16 @@ class PostProcessor:
         else:
             l_nr_buffer_params = buffer_params_in
 
-        self.discard_merge_worker_parent.send(l_nr_buffer_params)
+        self.discard_merge_worker_in_queue.put(l_nr_buffer_params)
 
         while True:
             try:
-                stereo_buffer_params = self.discard_merge_worker_parent.recv()
+                stereo_buffer_params = self.discard_merge_worker_out_queue.get()
                 break
             except InterruptedError:
                 # retry if a signal is received
                 continue
 
-        print("post processor send", stereo_buffer_params["block_num"])
         self.out_queue.put(stereo_buffer_params)
 
     def submit(
@@ -720,8 +723,6 @@ class PostProcessor:
         assert self.last_block_submitted < in_buffer_params["block_num"], f"Warning, block was repeated, got {in_buffer_params["block_num"]}, already processed {self.last_block_submitted}"
         self.block_queue.append(in_buffer_params)
 
-        print("post processor got:", in_buffer_params["block_num"], "need:", self.next_block)
-
         if in_buffer_params["block_num"] == self.next_block:
             # process queued data in order of block number
             self.block_queue.sort(key=lambda x: x["block_num"])
@@ -730,7 +731,8 @@ class PostProcessor:
             while len(self.block_queue) > 0 and (self.block_queue[0]["block_num"] <= self.next_block):
                 buffer_params = self.block_queue.pop(0)
 
-                self.process_audio_worker(buffer_params)
+                future = self.submit_thread_executor.submit(self.process_audio_worker, buffer_params)
+                self.submit_thread_executor_queue.append(future)
 
                 self.next_block += 1
                 self.last_block_submitted = buffer_params["block_num"]
@@ -933,11 +935,9 @@ def decoder_process_worker(
             pre_l_out = buffer.get_pre_left()
             pre_r_out = buffer.get_pre_right()
 
-            print("decoder start", buffer_params["block_num"])
             pre_audio_trimmed = decoder.block_decode(raw_data_in, pre_l_out, pre_r_out)
             if auto_fine_tune:
                 log_bias(decoder)
-            print("decoder end", buffer_params["block_num"])
 
             buffer_params["pre_audio_trimmed"] = pre_audio_trimmed
     
@@ -966,7 +966,6 @@ def post_processor_worker(
     done = False
     while not done:
         buffer_params = decoder_out_queue.get()
-        print("post processor start", buffer_params["block_num"])
         done = post_processor.submit(buffer_params)
 
     decode_done.wait()
@@ -990,7 +989,6 @@ def write_soundfile_process_worker(
             while not done:
                 try:
                     buffer_params = post_processor_out_queue.get()
-                    print("post processor end", buffer_params["block_num"])
                     buffer = DecoderSharedMemory(buffer_params)
                     stereo = buffer.get_stereo()
 
@@ -1003,7 +1001,7 @@ def write_soundfile_process_worker(
                                 "Import of sounddevice failed, preview is not available!"
                             )
     
-                    shared_memory_idle_queue.put_nowait(buffer_params["name"])
+                    shared_memory_idle_queue.put(buffer_params["name"])
 
                     done = buffer_params["is_last_block"]
                     total_samples_decoded += buffer_params["stereo_audio_trimmed"] / 2

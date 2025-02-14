@@ -320,9 +320,12 @@ class SpectralNoiseReduction():
 
     def _get_chunk(self, audio, chunks):
         chunk = np.zeros((1, self.padding * 2 + self.chunk_size * self.chunk_count), dtype=REAL_DTYPE)
+
+        audio_copy = np.empty(len(audio), dtype=REAL_DTYPE)
+        DecoderSharedMemory.copy_data(audio, audio_copy, 0, len(audio))
         
         chunks.pop(0)
-        chunks.append(audio)
+        chunks.append(audio_copy)
 
         for i in range(self.chunk_count):
             position = self.padding + self.chunk_size*i

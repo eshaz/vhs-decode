@@ -81,11 +81,13 @@ class DecoderSharedMemory():
 
     @staticmethod
     def get_shared_memory(block_len, pre_audio_len, name, block_dtype=np.int16, audio_dtype=REAL_DTYPE):
-
-        byte_size = (
+        max_audio_size = pre_audio_len * 6 * np.dtype(audio_dtype).itemsize
+        block_size_with_audio = (
             block_len * np.dtype(block_dtype).itemsize + 
             pre_audio_len * 2 * np.dtype(audio_dtype).itemsize
         )
+
+        byte_size = max(max_audio_size, block_size_with_audio)
         # allow more than one instance to run at a time
         system_random = SystemRandom()
         name += "_" + ''.join(system_random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
