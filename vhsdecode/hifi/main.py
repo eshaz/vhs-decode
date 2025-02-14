@@ -719,6 +719,8 @@ class PostProcessor:
         assert self.last_block_submitted < in_buffer_params["block_num"], f"Warning, block was repeated, got {in_buffer_params["block_num"]}, already processed {self.last_block_submitted}"
         self.block_queue.append(in_buffer_params)
 
+        print("post processor got:", in_buffer_params["block_num"], "need:", self.next_block)
+
         if in_buffer_params["block_num"] == self.next_block:
             # process queued data in order of block number
             self.block_queue.sort(key=lambda x: x["block_num"])
@@ -1034,7 +1036,7 @@ async def decode_parallel(
     shared_memory_idle_queue = Queue()
 
     # create shared memory
-    for i in range(len(decoders) * 2):
+    for i in range(len(decoders) + 4):
         buffer_instance = DecoderSharedMemory.get_shared_memory(block_size, audio_block_size, f"HiFiDecode Shared Memory {i}")
         decoder_buffer_instances.append(buffer_instance)
         atexit.register(buffer_instance.close)
