@@ -493,6 +493,7 @@ def as_outputfile(path, sample_rate):
             samplerate=int(sample_rate),
             format="FLAC",
             subtype="PCM_24",
+            compression_level=0.0
         )
 
 
@@ -1044,7 +1045,7 @@ def decode_parallel(
         decoder_buffer_instances.append(buffer_instance)
         atexit.register(buffer_instance.close)
         atexit.register(buffer_instance.unlink)
-        print("Adding new shared memory", buffer_instance.name)
+        print("Adding new shared memory", buffer_instance.name, buffer_instance.size / 1024 / 2014)
         shared_memory_idle_queue.put(buffer_instance.name)
 
     # spin up the decoders
