@@ -41,11 +41,11 @@ cpdef complex[:] diff_forward(complex[:] input_array):
     return output_array
 
 
-def unwrap_hilbert(double complex[:] hilbert, cython.double freq_hz):
+def unwrap_hilbert(float complex[:] hilbert, cython.float freq_hz):
     cdef cython.double pi = math.pi
     cdef cython.double tau = math.tau
-    cdef double[:] tangles = np.angle(hilbert)
-    cdef double[:] dangles = np.ediff1d(tangles, to_begin=0)
+    cdef float[:] tangles = np.angle(hilbert)
+    cdef float[:] dangles = np.ediff1d(tangles, to_begin=0)
     del tangles
     cdef np.ndarray tdangles2
     # make sure unwapping goes the right way

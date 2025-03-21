@@ -10,6 +10,8 @@ import lddecode.core as ldd
 # from lddecode.core import npfft
 # Use numpy fft rather than scipy fft as is imported in lddecode core as it seems to be slightly faster.
 import numpy.fft as npfft
+from numba import njit, prange
+import numba as nb
 
 import lddecode.utils as lddu
 import vhsdecode.utils as utils
@@ -1025,9 +1027,9 @@ class VHSRFDecode(ldd.RFDecode):
 
         self.Filters["FVideo"] = (
             filter_deemp * filter_video_lpf * self.Filters["FCustomVideo"]
-        )
+        ).astype(np.complex64, copy=True)
 
-        SF["FVideo05"] = filter_video_lpf * filter_deemp * filter_05
+        SF["FVideo05"] = (filter_video_lpf * filter_deemp * filter_05).astype(np.complex64, copy=True)
 
         # SF["YNRHighPass"] = sps.butter(
         #     1,
@@ -1079,42 +1081,124 @@ class VHSRFDecode(ldd.RFDecode):
         self.delays["video_sync"] = 0
         self.delays["video_white"] = 0
 
+    @staticmethod
+    @njit(nb.types.void(
+        nb.types.Array(nb.types.float32, 1, "C"),
+        nb.types.Array(nb.types.complex64, 1, "C"),
+        nb.types.Array(nb.types.float32, 1, "C"),
+        nb.types.boolean,
+        nb.types.boolean,
+        nb.types.int32,
+        nb.types.boolean,
+        nb.types.Array(nb.types.float32, 1, "C"),
+        nb.types.Array(nb.types.float32, 1, "C"),
+        nb.types.Array(nb.types.float32, 1, "C")
+    ), cache=True, fastmath=True, nogil=True)
+    def demod_fft_ifft_env_numba(
+        data, # input / output
+        indata_fft, # input / output
+        raw_env, # output
+        has_data,
+        has_indata_fft,
+        blocklen,
+        notch,
+        FVideoNotchF,
+        RFVideo,
+        hilbert
+    ):
+        if not has_indata_fft:
+            i = 0
+            for value in npfft.fft(data[: blocklen]):
+                indata_fft[i] = value
+                i += 1
+
+        if not has_data:
+            i = 0
+            for value in npfft.ifft(indata_fft).real:
+                data[i] = value
+                i += 1
+
+        if notch:
+            for i in range(len(indata_fft)):
+                indata_fft[i] = indata_fft[i] * FVideoNotchF[i]
+
+        # Applies RF filters
+        for i in range(len(indata_fft)):
+            indata_fft[i] = indata_fft[i] * RFVideo[i]
+
+        # Calculate an evelope with signal strength using absolute of hilbert transform.
+        # Roll this a bit to compensate for filter delay, value eyballed for now.
+        i = 4
+        indata_len = len(indata_fft)
+        for raw_filtered in npfft.ifft(indata_fft * hilbert).real:
+            raw_env[i] = -raw_filtered if raw_filtered < 0 else raw_filtered
+            i = (i + 1) % indata_len
+
+    @staticmethod
+    @njit(nb.types.void(
+        nb.types.Array(nb.types.complex64, 1, "C"),
+        nb.types.Array(nb.types.float64, 1, "C"),
+        nb.types.Array(nb.types.complex64, 1, "C"),
+        nb.types.float64
+    ), cache=True, fastmath=True, nogil=True)
+    def demod_out_video05_numba(
+        demod_fft,
+        out_video05,
+        FVideo05,
+        F05_offset
+    ):
+        out_video05_len = len(out_video05)
+        i = int(out_video05_len - F05_offset)
+        for out_video05_fft in npfft.irfft(demod_fft * FVideo05).real:
+            out_video05[i] = out_video05_fft
+            i = (i + 1) % out_video05_len
+        
     def demodblock(
         self, data=None, mtf_level=0, fftdata=None, cut=False, thread_benchmark=False
     ):
         rv = {}
         demod_start_time = time.time()
-        if fftdata is not None:
-            indata_fft = fftdata
-        elif data is not None:
-            indata_fft = npfft.fft(data[: self.blocklen])
-        else:
+
+        # if self.debug_plot and self.debug_plot.is_plot_requested("demodblock"):
+        #     # If we're doing a plot make a copy of the input to be able to plot it since we
+        #     # are modifying the data in place.
+        #     indata_fft_copy = indata_fft.copy()
+
+        if data is None and fftdata is None:
             raise Exception("demodblock called without raw or FFT data")
-
+        
         if data is None:
-            data = npfft.ifft(indata_fft).real
+            has_data = False
+            data = np.empty(self.blocklen, dtype=np.float32)
+        else:
+            has_data = True
+            data = data.astype(np.float32, copy=False)
 
-        if self.debug_plot and self.debug_plot.is_plot_requested("demodblock"):
-            # If we're doing a plot make a copy of the input to be able to plot it since we
-            # are modifying the data in place.
-            indata_fft_copy = indata_fft.copy()
+        if fftdata is None:
+            has_fftdata = False
+            indata_fft = np.empty(self.blocklen, dtype=np.complex64)
+        else:
+            has_fftdata = True
+            indata_fft = fftdata.astype(np.complex64, copy=False)
 
-        if self._notch is not None:
-            indata_fft *= self.Filters["FVideoNotchF"]
+        raw_env = np.empty(self.blocklen, dtype=np.float32)
 
-        # Applies RF filters
-        indata_fft *= self.Filters["RFVideo"]
+        VHSRFDecode.demod_fft_ifft_env_numba(
+            data,
+            indata_fft,
+            raw_env,
+            has_data,
+            has_fftdata,
+            self.blocklen,
+            self._notch is not None,
+            self.Filters["FVideoNotchF"].astype(np.float32, copy=False) if self._notch is not None else np.empty(0, np.float32),
+            self.Filters["RFVideo"].astype(np.float32, copy=False),
+            self.Filters["hilbert"].astype(np.float32, copy=False)
+        )
 
-        raw_filtered = npfft.ifft(indata_fft * self.Filters["hilbert"]).real
-
-        # Calculate an evelope with signal strength using absolute of hilbert transform.
-        # Roll this a bit to compensate for filter delay, value eyballed for now.
-        np.abs(raw_filtered, out=raw_filtered)
-        raw_env = np.roll(raw_filtered, 4)
-        del raw_filtered
         # Downconvert to single precision for some possible speedup since we don't need
         # super high accuracy for the dropout detection.
-        env = utils.filter_simple(raw_env, self.Filters["FEnvPost"]).astype(np.single)
+        env = utils.filter_simple(raw_env, self.Filters["FEnvPost"]).astype(np.single, copy=False)
         del raw_env
         env_mean = np.mean(env)
 
@@ -1131,7 +1215,7 @@ class VHSRFDecode(ldd.RFDecode):
         else:
             ldd.logger.warning("RF signal is weak. Is your deck tracking properly?")
 
-        hilbert = npfft.ifft(indata_fft * self.Filters["hilbert"])
+        hilbert = npfft.ifft(indata_fft * self.Filters["hilbert"]).astype(np.complex64, copy=False)
 
         # FM demodulator
         demod = unwrap_hilbert(hilbert, self.freq_hz).real
@@ -1143,7 +1227,7 @@ class VHSRFDecode(ldd.RFDecode):
 
             if np.max(demod[20:-20]) > check_value:
                 demod_b = unwrap_hilbert(
-                    np.ediff1d(hilbert, to_begin=0), self.freq_hz
+                    np.ediff1d(hilbert, to_begin=0).astype(np.complex64, copy=False), self.freq_hz
                 ).real
 
                 demod = replace_spikes(demod, demod_b, check_value)
@@ -1166,7 +1250,7 @@ class VHSRFDecode(ldd.RFDecode):
             demod = self.chromaTrap.work(demod)
 
         # applies main deemphasis filter
-        demod_fft = npfft.rfft(demod)
+        demod_fft = npfft.rfft(demod).astype(np.complex64, copy=False)
         out_video_fft = demod_fft * self.Filters["FVideo"]
         out_video = npfft.irfft(out_video_fft).real
 
@@ -1183,6 +1267,14 @@ class VHSRFDecode(ldd.RFDecode):
 
             # And subtract it from the output signal.
             out_video -= hf_part
+
+        out_video05 = np.empty(len(out_video), dtype=np.float64)
+        VHSRFDecode.demod_out_video05_numba(
+            demod_fft,
+            out_video05,
+            self.Filters["FVideo05"],
+            self.Filters["F05_offset"]
+        )
 
         if self.options.subdeemp:
             out_video = sub_deemphasis(
@@ -1204,9 +1296,6 @@ class VHSRFDecode(ldd.RFDecode):
             out_video = sps.filtfilt(
                 self.Filters["fsc_notch"][0], self.Filters["fsc_notch"][1], out_video
             )
-
-        out_video05 = npfft.irfft(demod_fft * self.Filters["FVideo05"]).real
-        out_video05 = np.roll(out_video05, -self.Filters["F05_offset"])
 
         # Filter out the color-under signal from the raw data.
         chroma_source = data if self.options.color_under else out_video
@@ -1241,7 +1330,7 @@ class VHSRFDecode(ldd.RFDecode):
                 raw_data=data,
                 env=env,
                 env_mean=env_mean,
-                raw_fft=indata_fft_copy,
+                raw_fft=indata_fft,
                 filtered_fft=indata_fft,
                 demod_video=demod,
                 filtered_video=out_video,
@@ -1251,6 +1340,7 @@ class VHSRFDecode(ldd.RFDecode):
                 plot_chroma_fft=True,
             )
 
+        # debugging option, performance isn't too important here
         if self.options.export_raw_tbc:
             out_video = demod
 
