@@ -1064,39 +1064,6 @@ class HiFiDecode:
             self.audioFinal_denominator,
         )
 
-    def log_bias(self):
-        devL = (self.standard_original.LCarrierRef - self.standard.LCarrierRef) / 1e3
-        devR = (self.standard_original.RCarrierRef - self.standard.RCarrierRef) / 1e3
-
-        print("Bias L %.02f kHz, R %.02f kHz" % (devL, devR), end=" ")
-        if abs(devL) < 9 and abs(devR) < 9:
-            print("(good player/recorder calibration)")
-        elif 9 <= abs(devL) < 10 or 9 <= abs(devR) < 10:
-            print("(maybe marginal player/recorder calibration)")
-        else:
-            print(
-                "\nWARN: the player or the recorder may be uncalibrated and/or\n"
-                "the standard and/or the sample rate specified are wrong"
-            )
-
-    def updateAFE(self, newLC, newRC):
-        self.standard.LCarrierRef = (
-            max(
-                min(newLC, self.standard_original.LCarrierRef + 10e3),
-                self.standard_original.LCarrierRef - 10e3,
-            )
-            if self.options["format"] == "vhs"
-            else newLC
-        )
-        self.standard.RCarrierRef = (
-            max(
-                min(newRC, self.standard_original.RCarrierRef + 10e3),
-                self.standard_original.RCarrierRef - 10e3,
-            )
-            if self.options["format"] == "vhs"
-            else newRC
-        )
-
     @staticmethod
     @njit(
         [(
@@ -1180,7 +1147,6 @@ class HiFiDecode:
 
         return i_osc_left, q_osc_left, i_osc_right, q_osc_right
         
-
     def get_carrier_filters(self, standard):
         afeL = AFEFilterable(standard, self.if_rate, 0)
         afeR = AFEFilterable(standard, self.if_rate, 1)
@@ -1195,76 +1161,92 @@ class HiFiDecode:
 
         return afeL, afeR, fmL, fmR
 
-    @staticmethod
-    @njit(
-        numba.types.void(NumbaAudioArray, NumbaAudioArray, numba.types.int32),
-        cache=True,
-        fastmath=True,
-        nogil=True,
-    )
-    def smooth(data_in: np.array, data_out: np.array, half_window: int):
-        data_in_len = len(data_in)
-        for i in range(data_in_len):
-            start = max(0, i - half_window)
-            end = min(data_in_len, i + half_window + 1)
-            data_out[i] = np.mean(data_in[start:end])  # Apply moving average
-
-    @staticmethod
-    def headswitch_interpolate_boundaries(
-        audio: np.array, boundaries: list[list[int, int]]
-    ) -> np.array:
-        interpolated_signal = np.empty_like(audio)
-        interpolator_in = np.empty_like(audio)
-        DecoderSharedMemory.copy_data_float32(
-            audio, interpolated_signal, len(interpolated_signal)
+    def guessBiases(self, blocks: list[np.array]) -> Tuple[float, float]:
+        meanL, meanR = StackableMA(window_average=len(blocks)), StackableMA(
+            window_average=len(blocks)
         )
-        DecoderSharedMemory.copy_data_float32(
-            audio, interpolator_in, len(interpolator_in)
+        for block in blocks:
+            data = self.bandpassRF.work(block)
+            data = data.astype(REAL_DTYPE, copy=False)
+
+            data = samplerate_resample(
+                data,
+                self.ifresample_numerator,
+                self.ifresample_denominator,
+                converter_type=self.if_resampler_converter,
+            )
+
+            filterL, filterR = self.filterCarriers(data)
+            preL = np.empty_like(filterL)
+            preR = np.empty_like(filterR)
+
+            self.fmL.work(filterL, preL)
+            self.fmR.work(filterR, preR)
+
+            meanL.push(np.mean(preL))
+            meanR.push(np.mean(preR))
+
+        return meanL.pull(), meanR.pull()
+
+    def log_bias(self):
+        devL = (self.standard_original.LCarrierRef - self.standard.LCarrierRef) / 1e3
+        devR = (self.standard_original.RCarrierRef - self.standard.RCarrierRef) / 1e3
+
+        print("Bias L %.02f kHz, R %.02f kHz" % (devL, devR), end=" ")
+        if abs(devL) < 9 and abs(devR) < 9:
+            print("(good player/recorder calibration)")
+        elif 9 <= abs(devL) < 10 or 9 <= abs(devR) < 10:
+            print("(maybe marginal player/recorder calibration)")
+        else:
+            print(
+                "\nWARN: the player or the recorder may be uncalibrated and/or\n"
+                "the standard and/or the sample rate specified are wrong"
+            )
+
+    def updateAFE(self, newLC, newRC):
+        self.standard.LCarrierRef = (
+            max(
+                min(newLC, self.standard_original.LCarrierRef + 10e3),
+                self.standard_original.LCarrierRef - 10e3,
+            )
+            if self.options["format"] == "vhs"
+            else newLC
+        )
+        self.standard.RCarrierRef = (
+            max(
+                min(newRC, self.standard_original.RCarrierRef + 10e3),
+                self.standard_original.RCarrierRef - 10e3,
+            )
+            if self.options["format"] == "vhs"
+            else newRC
         )
 
-        # setup interpolator input by copying and removing any samples that are peaks
-        time = np.arange(len(interpolated_signal), dtype=float)
-
-        for [start, end] in boundaries:
-            time[start:end] = np.nan
-            interpolator_in[start:end] = np.nan
-
-        time = time[np.logical_not(np.isnan(time))]
-        interpolator_in = interpolator_in[np.logical_not(np.isnan(interpolator_in))]
-
-        # interpolate the gap where the peak was removed
-        interpolator = interp1d(
-            time,
-            interpolator_in,
-            kind="linear",
-            copy=False,
-            assume_sorted=True,
-            fill_value="extrapolate",
+    def auto_fine_tune(self, dcL: float, dcR: float) -> Tuple[AFEFilterable, AFEFilterable, FMdemod, FMdemod]:
+        left_carrier_dc_offset = self.standard.LCarrierRef - dcL
+        left_carrier_updated = self.standard.LCarrierRef - round(left_carrier_dc_offset)
+        self.standard.LCarrierRef = max(
+            min(left_carrier_updated, self.standard_original.LCarrierRef + 10e3),
+            self.standard_original.LCarrierRef - 10e3,
         )
 
-        for [start, end] in boundaries:
-            smoothing_size = 1 + end - start
+        right_carrier_dc_offset = self.standard.RCarrierRef - dcR
+        right_carrier_updated = self.standard.RCarrierRef - round(
+            right_carrier_dc_offset
+        )
+        self.standard.RCarrierRef = max(
+            min(right_carrier_updated, self.standard_original.RCarrierRef + 10e3),
+            self.standard_original.RCarrierRef - 10e3,
+        )
 
-            # sample and hold inteerpolation if boundaries are beyond this chunk
-            if start < 0:
-                interpolated_signal[0:end] = interpolated_signal[end]
-            elif end > len(audio):
-                interpolated_signal[start : len(audio)] = interpolated_signal[start]
-            else:
-                for i in range(start, end):
-                    interpolated_signal[i] = interpolator(i)
-                # smooth linear interpolation
-                smoothed_out = interpolated_signal[
-                    start - smoothing_size : end + smoothing_size
-                ]
-                smoothed_in = np.empty_like(smoothed_out)
-                DecoderSharedMemory.copy_data_float32(
-                    smoothed_out, smoothed_in, len(smoothed_in)
-                )
-                HiFiDecode.smooth(smoothed_in, smoothed_out, ceil(smoothing_size / 4))
+        # auto fine tune doesn't work with quadrature demodulation since the i/q oscillators are generated once, disabling for now
+        if self.options["demod_type"] == DEMOD_HILBERT:
+            self.afeL, self.afeR, self.fmL, self.fmR = self.get_carrier_filters(
+                self.standard
+            )
 
-        return interpolated_signal
-
+    def filterCarriers(self, data: np.array) -> Tuple[np.array, np.array]:
+        return self.afeL.work(data), self.afeR.work(data)
+    
     @staticmethod
     @njit(
         numba.types.containers.Tuple((numba.types.float32, numba.types.float32))(
@@ -1356,20 +1338,6 @@ class HiFiDecode:
         return peaks, filtered_signal, filtered_signal_abs
 
     @staticmethod
-    def merge_boundaries(boundaries):
-        # merge overlapping or duplicate boundaries
-        boundaries.sort(key=lambda x: x[0])
-        merged = list()
-
-        for boundary in boundaries:
-            if not merged or merged[-1][1] < boundary[0]:
-                merged.append(boundary)
-            else:
-                merged[-1] = [merged[-1][0], max(merged[-1][1], boundary[1])]
-
-        return merged
-
-    @staticmethod
     def headswitch_calc_boundaries(
         peaks: list[tuple[int, int, int, float]],
         audio_process_params: HiFiAudioParams,
@@ -1392,34 +1360,113 @@ class HiFiDecode:
 
         # merge overlapping or duplicate boundaries
         return HiFiDecode.merge_boundaries(peak_boundaries)
+    
+    @staticmethod
+    @njit(
+        numba.types.void(NumbaAudioArray, NumbaAudioArray, numba.types.int32),
+        cache=True,
+        fastmath=True,
+        nogil=True,
+    )
+    def smooth(data_in: np.array, data_out: np.array, half_window: int):
+        data_in_len = len(data_in)
+        for i in range(data_in_len):
+            start = max(0, i - half_window)
+            end = min(data_in_len, i + half_window + 1)
+            data_out[i] = np.mean(data_in[start:end])  # Apply moving average
 
-    def auto_fine_tune(
-        self, dcL: float, dcR: float
-    ) -> Tuple[AFEFilterable, AFEFilterable, FMdemod, FMdemod]:
-        left_carrier_dc_offset = self.standard.LCarrierRef - dcL
-        left_carrier_updated = self.standard.LCarrierRef - round(left_carrier_dc_offset)
-        self.standard.LCarrierRef = max(
-            min(left_carrier_updated, self.standard_original.LCarrierRef + 10e3),
-            self.standard_original.LCarrierRef - 10e3,
+    @staticmethod
+    def merge_boundaries(boundaries):
+        # merge overlapping or duplicate boundaries
+        boundaries.sort(key=lambda x: x[0])
+        merged = list()
+
+        for boundary in boundaries:
+            if not merged or merged[-1][1] < boundary[0]:
+                merged.append(boundary)
+            else:
+                merged[-1] = [merged[-1][0], max(merged[-1][1], boundary[1])]
+
+        return merged
+
+    @staticmethod
+    def headswitch_interpolate_boundaries(
+        audio: np.array, boundaries: list[list[int, int]]
+    ) -> np.array:
+        interpolated_signal = np.empty_like(audio)
+        interpolator_in = np.empty_like(audio)
+        DecoderSharedMemory.copy_data_float32(
+            audio, interpolated_signal, len(interpolated_signal)
+        )
+        DecoderSharedMemory.copy_data_float32(
+            audio, interpolator_in, len(interpolator_in)
         )
 
-        right_carrier_dc_offset = self.standard.RCarrierRef - dcR
-        right_carrier_updated = self.standard.RCarrierRef - round(
-            right_carrier_dc_offset
-        )
-        self.standard.RCarrierRef = max(
-            min(right_carrier_updated, self.standard_original.RCarrierRef + 10e3),
-            self.standard_original.RCarrierRef - 10e3,
+        # setup interpolator input by copying and removing any samples that are peaks
+        time = np.arange(len(interpolated_signal), dtype=float)
+
+        for [start, end] in boundaries:
+            time[start:end] = np.nan
+            interpolator_in[start:end] = np.nan
+
+        time = time[np.logical_not(np.isnan(time))]
+        interpolator_in = interpolator_in[np.logical_not(np.isnan(interpolator_in))]
+
+        # interpolate the gap where the peak was removed
+        interpolator = interp1d(
+            time,
+            interpolator_in,
+            kind="linear",
+            copy=False,
+            assume_sorted=True,
+            fill_value="extrapolate",
         )
 
-        # auto fine tune doesn't work with quadrature demodulation since the i/q oscillators are generated once, disabling for now
-        if self.options["demod_type"] == DEMOD_HILBERT:
-            self.afeL, self.afeR, self.fmL, self.fmR = self.get_carrier_filters(
-                self.standard
+        for [start, end] in boundaries:
+            smoothing_size = 1 + end - start
+
+            # sample and hold inteerpolation if boundaries are beyond this chunk
+            if start < 0:
+                interpolated_signal[0:end] = interpolated_signal[end]
+            elif end > len(audio):
+                interpolated_signal[start : len(audio)] = interpolated_signal[start]
+            else:
+                for i in range(start, end):
+                    interpolated_signal[i] = interpolator(i)
+                # smooth linear interpolation
+                smoothed_out = interpolated_signal[
+                    start - smoothing_size : end + smoothing_size
+                ]
+                smoothed_in = np.empty_like(smoothed_out)
+                DecoderSharedMemory.copy_data_float32(
+                    smoothed_out, smoothed_in, len(smoothed_in)
+                )
+                HiFiDecode.smooth(smoothed_in, smoothed_out, ceil(smoothing_size / 4))
+
+        return interpolated_signal
+    
+    @staticmethod
+    def headswitch_remove_noise(
+        audio: np.array, audio_process_params: HiFiAudioParams
+    ) -> np.array:
+        for _ in range(audio_process_params.headswitch_passes):
+            peaks, filtered_signal, filtered_signal_abs = (
+                HiFiDecode.headswitch_detect_peaks(audio, audio_process_params)
+            )
+            interpolation_boundaries = HiFiDecode.headswitch_calc_boundaries(
+                peaks, audio_process_params
+            )
+            interpolated_audio = HiFiDecode.headswitch_interpolate_boundaries(
+                audio, interpolation_boundaries
             )
 
-    def filterCarriers(self, data: np.array) -> Tuple[np.array, np.array]:
-        return self.afeL.work(data), self.afeR.work(data)
+            # uncomment to debug head switching pulse detection
+            # HiFiDecode.debug_peak_interpolation(audio, filtered_signal, filtered_signal_abs, peaks, interpolation_boundaries, interpolated_audio, audio_process_params.headswitch_signal_rate)
+            # plt.show()
+
+            audio = interpolated_audio
+
+        return interpolated_audio
 
     # size of the raw data block coming in
     @property
@@ -1461,33 +1508,6 @@ class HiFiDecode:
     def notchFreq(self) -> float:
         return self.standard_original.Hfreq
 
-    def guessBiases(self, blocks: list[np.array]) -> Tuple[float, float]:
-        meanL, meanR = StackableMA(window_average=len(blocks)), StackableMA(
-            window_average=len(blocks)
-        )
-        for block in blocks:
-            data = self.bandpassRF.work(block)
-            data = data.astype(REAL_DTYPE, copy=False)
-
-            data = samplerate_resample(
-                data,
-                self.ifresample_numerator,
-                self.ifresample_denominator,
-                converter_type=self.if_resampler_converter,
-            )
-
-            filterL, filterR = self.filterCarriers(data)
-            preL = np.empty_like(filterL)
-            preR = np.empty_like(filterR)
-
-            self.fmL.work(filterL, preL)
-            self.fmR.work(filterR, preR)
-
-            meanL.push(np.mean(preL))
-            meanR.push(np.mean(preR))
-
-        return meanL.pull(), meanR.pull()
-
     @staticmethod
     @njit(
         [numba.types.float32(NumbaAudioArray, numba.types.float32, numba.types.int16)],
@@ -1507,29 +1527,6 @@ class HiFiDecode:
             audio[i] = 0
 
         return dc
-
-    @staticmethod
-    def headswitch_remove_noise(
-        audio: np.array, audio_process_params: HiFiAudioParams
-    ) -> np.array:
-        for _ in range(audio_process_params.headswitch_passes):
-            peaks, filtered_signal, filtered_signal_abs = (
-                HiFiDecode.headswitch_detect_peaks(audio, audio_process_params)
-            )
-            interpolation_boundaries = HiFiDecode.headswitch_calc_boundaries(
-                peaks, audio_process_params
-            )
-            interpolated_audio = HiFiDecode.headswitch_interpolate_boundaries(
-                audio, interpolation_boundaries
-            )
-
-            # uncomment to debug head switching pulse detection
-            # HiFiDecode.debug_peak_interpolation(audio, filtered_signal, filtered_signal_abs, peaks, interpolation_boundaries, interpolated_audio, audio_process_params.headswitch_signal_rate)
-            # plt.show()
-
-            audio = interpolated_audio
-
-        return interpolated_audio
 
     @staticmethod
     def mute(audio: np.array, audio_process_params: HiFiAudioParams) -> np.array:
@@ -1578,6 +1575,8 @@ class HiFiDecode:
 
         # sort and merge any overlapping boundaries
         mute_point_boundaries = HiFiDecode.merge_boundaries(mute_point_ranges)
+
+        print("muting", len(audio), mute_point_boundaries, mute_point_ranges)
 
         for boundary in mute_point_boundaries:
             start = boundary[0]
