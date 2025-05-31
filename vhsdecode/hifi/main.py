@@ -539,7 +539,7 @@ class PostProcessor:
         self,
         decode_options: dict,
         decoder_out_queue,
-        channel_len,
+        channel_size,
         post_processor_shared_memory_idle_queue,
         decoder_shared_memory_idle_queue,
         blocks_enqueued,
@@ -573,7 +573,7 @@ class PostProcessor:
         self.post_processor_num_shared_memory = 16
         for i in range(self.post_processor_num_shared_memory):
             shared_memory = PostProcessorSharedMemory.get_shared_memory(
-                channel_len, f"hifi_post_mem_{i}"
+                channel_size, f"hifi_post_mem_{i}"
             )
             self.post_processor_shared_memory.append(shared_memory)
             self.post_processor_shared_memory_idle_queue.put(shared_memory.name)
@@ -1135,9 +1135,7 @@ async def decode_parallel(
     input_file = decode_options["input_file"]
     output_file = decode_options["output_file"]
 
-    block_size = decoder.blockSize
-    block_audio_size = decoder.blockAudioSize
-    block_audio_overlap = decoder.blockAudioOverlap
+    block_size = decoder.initialBlockSize
 
     blocks_enqueued = Value("d", 0)
     input_position = Value("d", 0)
@@ -1166,7 +1164,10 @@ async def decode_parallel(
     shared_memory_idle_queue = SimpleQueue()
     for i in range(num_shared_memory_instances):
         buffer_instance = DecoderSharedMemory.get_shared_memory(
-            block_size, block_audio_size, block_audio_overlap, f"hifi_decoder_{i}"
+            decoder.initialBlockSize,
+            decoder.blockOverlap,
+            decoder.initialBlockFinalAudioSize,
+            f"hifi_decoder_{i}"
         )
         shared_memory_instances.append(buffer_instance)
         shared_memory_idle_queue.put(buffer_instance.name)
@@ -1202,7 +1203,7 @@ async def decode_parallel(
     post_processor = PostProcessor(
         decode_options,
         decoder_out_queue,
-        decoder.blockFinalAudioSize,
+        decoder.initialBlockFinalAudioSize + decoder.blockAudioFinalOverlap,
         post_processor_shared_memory_idle_queue,
         shared_memory_idle_queue,
         blocks_enqueued,
@@ -1293,7 +1294,7 @@ async def decode_parallel(
 
             # first overlap, read data, first half of last overlap
             new_block_length = (
-                decoder.block_read_overlap + frames_read + decoder.block_overlap
+                decoder_state.block_read_overlap + frames_read + decoder_state.block_overlap
             )
 
             # create a new buffer with the updated offsets, and copy in the read data
@@ -1309,13 +1310,13 @@ async def decode_parallel(
             block = buffer.get_block()
             # copy already read data
             DecoderSharedMemory.copy_data_int16(
-                block_data_read, block, decoder.block_read_overlap + frames_read
+                block_data_read, block, decoder_state.block_read_overlap + frames_read
             )
 
             end_overlap = buffer.get_block_in_end_overlap()
             # copy data to end that will be discarded as overlap
             DecoderSharedMemory.copy_data_dst_offset_int16(
-                end_overlap, end_overlap, decoder.block_overlap, decoder.block_overlap
+                end_overlap, end_overlap, decoder_state.block_overlap, decoder_state.block_overlap
             )
         else:
             # copy the the current overlap to use in the next iteration
@@ -1432,7 +1433,7 @@ async def decode_parallel(
 
         try:
             total_frames_read = 0
-            buffer = np.empty(block_audio_size, dtype=np.float32)
+            buffer = np.empty(decoder.initialBlockAudioSize, dtype=np.float32)
 
             with sf.SoundFile(
                 input_file_post_gain,
