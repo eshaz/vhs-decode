@@ -716,7 +716,7 @@ class PostProcessor:
                 spectral_nr.spectral_nr(pre, spectral_nr_out)
             else:
                 DecoderSharedMemory.copy_data_float32(
-                    pre, spectral_nr_out, decoder_state.block_audio_final_size
+                    pre, spectral_nr_out, decoder_state.block_audio_final_len
                 )
 
             buffer.close()
@@ -755,7 +755,7 @@ class PostProcessor:
                 noise_reduction.noise_reduction(pre, nr_out)
             else:
                 DecoderSharedMemory.copy_data_float32(
-                    pre, nr_out, decoder_state.block_audio_final_size
+                    pre, nr_out, decoder_state.block_audio_final_len
                 )
 
             buffer.close()
@@ -931,12 +931,12 @@ class PostProcessor:
                     DecoderSharedMemory.copy_data_float32(
                         preL,
                         buffer.get_pre_left(),
-                        decoder_state.block_audio_final_size,
+                        decoder_state.block_audio_final_len,
                     )
                     DecoderSharedMemory.copy_data_float32(
                         preR,
                         buffer.get_pre_right(),
-                        decoder_state.block_audio_final_size,
+                        decoder_state.block_audio_final_len,
                     )
 
                     nr_worker_l_in_conn.send((decoder_state, 0))
@@ -1203,7 +1203,7 @@ async def decode_parallel(
     post_processor = PostProcessor(
         decode_options,
         decoder_out_queue,
-        decoder.initialBlockFinalAudioSize + decoder.blockAudioFinalOverlap,
+        decoder.initialBlockFinalAudioSize + decoder.blockAudioFinalOverlap * 2,
         post_processor_shared_memory_idle_queue,
         shared_memory_idle_queue,
         blocks_enqueued,
