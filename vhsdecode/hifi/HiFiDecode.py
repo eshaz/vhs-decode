@@ -1513,16 +1513,17 @@ class HiFiDecode:
         fastmath=True,
     )
     def cancelDC_clip_trim(audio: np.array, clip: float, trim: int) -> float:
-        dc = REAL_DTYPE(np.mean(audio))
-
         for i in range(trim):
             audio[i] = 0
 
-        for i in range(trim, len(audio) - trim):
-            audio[i] = (audio[i] - dc) / REAL_DTYPE(clip)
-
         for i in range(len(audio) - trim, len(audio)):
             audio[i] = 0
+
+        # TODO: change this to roll off at a low frequency rather than just the mean
+        dc = REAL_DTYPE(np.mean(audio))
+
+        for i in range(trim, len(audio) - trim):
+            audio[i] = (audio[i] - dc) / REAL_DTYPE(clip)
 
         return dc
 

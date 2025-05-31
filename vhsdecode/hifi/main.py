@@ -787,7 +787,7 @@ class PostProcessor:
 
             assert (
                 l_decoder_state.block_num == r_decoder_state.block_num
-            ), "Noise reduction processes are out of sync! Channels will be out od sync."
+            ), "Noise reduction processes are out of sync! Channels will be out of sync."
 
             decoder_state = l_decoder_state
             buffer = PostProcessorSharedMemory(decoder_state)
@@ -1244,6 +1244,7 @@ async def decode_parallel(
         # read input data into the shared memory buffer
         block_in = buffer.get_block_in()
         frames_read = f.buffer_read_into(block_in, "int16")
+        print("bytes read", frames_read)
 
         with input_position.get_lock():
             input_position.value += frames_read * 2
@@ -1288,35 +1289,29 @@ async def decode_parallel(
             )
 
         if is_last_block:
-            # save the read data
-            block_data_read = buffer.get_block().copy()
-            buffer.close()
+            # save read data (previous overlap + last block data)
+            block_in = buffer.get_block()
 
-            # first overlap, read data, first half of last overlap
             new_block_length = (
-                decoder_state.block_read_overlap + frames_read + decoder_state.block_overlap
+                len(previous_overlap) + # previous overlap
+                frames_read + # data read
+                decoder_state.block_overlap # overlap data
             )
 
-            # create a new buffer with the updated offsets, and copy in the read data
+            # duplicate data at the end that will discarded as overlap
+            for i in range(decoder_state.block_overlap):
+                src_offset = len(previous_overlap) + frames_read - decoder_state.block_overlap + i
+                dst_offset = src_offset + decoder_state.block_overlap
+
+                block_in[dst_offset] = block_in[src_offset]
+
+            # create a new decoder state with the updated offsets
             decoder_state = DecoderState(
                 decoder,
                 buffer.name,
                 new_block_length,
                 decoder_state.block_num,
                 is_last_block,
-            )
-            buffer = DecoderSharedMemory(decoder_state)
-
-            block = buffer.get_block()
-            # copy already read data
-            DecoderSharedMemory.copy_data_int16(
-                block_data_read, block, decoder_state.block_read_overlap + frames_read
-            )
-
-            end_overlap = buffer.get_block_in_end_overlap()
-            # copy data to end that will be discarded as overlap
-            DecoderSharedMemory.copy_data_dst_offset_int16(
-                end_overlap, end_overlap, decoder_state.block_overlap, decoder_state.block_overlap
             )
         else:
             # copy the the current overlap to use in the next iteration
@@ -1331,7 +1326,7 @@ async def decode_parallel(
         # blocks should complete roughly in the order that they are submitted
         decoder_in_queue.put(decoder_state)
 
-        return decoder_state, is_last_block
+        return is_last_block
 
     print(f"Starting decode...")
 
@@ -1377,7 +1372,7 @@ async def decode_parallel(
                 )
 
             stop_requested = await handle_ui_events()
-            decoder_state, is_last_block = await loop.run_in_executor(
+            is_last_block = await loop.run_in_executor(
                 None,
                 read_and_send_to_decoder,
                 f,
