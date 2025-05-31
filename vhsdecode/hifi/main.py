@@ -1244,7 +1244,6 @@ async def decode_parallel(
         # read input data into the shared memory buffer
         block_in = buffer.get_block_in()
         frames_read = f.buffer_read_into(block_in, "int16")
-        print("bytes read", frames_read)
 
         with input_position.get_lock():
             input_position.value += frames_read * 2
