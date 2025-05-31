@@ -1427,7 +1427,7 @@ async def decode_parallel(
 
         try:
             total_frames_read = 0
-            buffer = np.empty(decoder.initialBlockAudioSize, dtype=np.float32)
+            buffer = np.empty(2**20, dtype=np.float32)
 
             with sf.SoundFile(
                 input_file_post_gain,
