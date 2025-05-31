@@ -1304,7 +1304,7 @@ class HiFiDecode:
                     peak_start,
                     peak_end,
                     # limit peak prominence from balooning too high in empty audio or broadband noise causing an entire chunk to be interpolated
-                    min(max(peak_center_props["prominences"][i], audio_process_params.headswitch_peak_prominence_limit), 0)
+                    max(min(peak_center_props["prominences"][i], audio_process_params.headswitch_peak_prominence_limit), 0)
                 )
             )
 
@@ -1329,7 +1329,7 @@ class HiFiDecode:
                         neighbor_peak_props["left_ips"][peak_log_neighbor_idx] + start_neighbor,
                         neighbor_peak_props["right_ips"][peak_log_neighbor_idx] + start_neighbor,
                         # limit peak prominence from balooning too high in empty audio or broadband noise causing an entire chunk to be interpolated
-                        min(max(neighbor_peak_props["prominences"][peak_log_neighbor_idx], audio_process_params.headswitch_peak_prominence_limit), 0),
+                        max(min(neighbor_peak_props["prominences"][peak_log_neighbor_idx], audio_process_params.headswitch_peak_prominence_limit), 0),
                     )
                 )
 
