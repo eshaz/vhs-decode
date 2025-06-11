@@ -4,6 +4,8 @@ import numpy as np
 import traceback
 import scipy.signal as sps
 from collections import namedtuple
+import matplotlib.pyplot as plt
+from vhsdecode.hifi.HiFiDecode import FMdemod
 
 import lddecode.core as ldd
 
@@ -503,6 +505,16 @@ class VHSRFDecode(ldd.RFDecode):
             has_analog_audio=False,
             extra_options=extra_options,
         )
+
+        freq_hz = 40000000
+        luma_carrier = 3700000 #455.0 * ((525 * (30 / 1.001)) / 2.0)
+        luma_dev = 2500000
+        self.fm_demod = FMdemod(freq_hz, luma_carrier, luma_dev, "pll")
+        chroma_cutoff = 2000000
+
+        numtaps = 101  # Filter length (more taps = sharper filter)
+        self.luma_hp_filter = sps.firwin(numtaps, cutoff=chroma_cutoff, fs=freq_hz, pass_zero=False)
+
 
         # Store a separate setting for *color* system as opposed to 525/625 line here.
         # TODO: Fix upstream so we don't have to fake tell ld-decode code that we are using ntsc for
@@ -1110,22 +1122,43 @@ class VHSRFDecode(ldd.RFDecode):
         # Set these to 0 for now, the metrics calculations look for them.
         self.delays = {}
         self.delays["video_sync"] = 0
-        self.delays["video_white"] = 0
+        self.delays["video_white"] = 0        
 
     def demodblock(
         self, data=None, mtf_level=0, fftdata=None, cut=False, thread_benchmark=False
     ):
         rv = {}
         demod_start_time = time.time()
+
+        def notch_filter(signal, f0, fs=40000000, Q=30):
+            b, a = sps.iirnotch(w0=f0/(fs/2), Q=Q)
+            return sps.lfilter(b, a, signal)
+        
+        # Apply notch at chroma subcarrier
+        chroma_data = data.copy()
+        ##data = notch_filter(data, f0=629000, Q=30)
+        ##data = notch_filter(data, f0=2*629000, Q=30)
+        ##data = notch_filter(data, f0=3*629000, Q=30)
+        ##data = notch_filter(data, f0=4*629000, Q=30)
+        ##data = notch_filter(data, f0=5*629000, Q=30)
+        ##data = notch_filter(data, f0=6*629000, Q=30)
+        #data = notch_filter(data, f0=7*629000, Q=30)
+        ##data = notch_filter(data, f0=8*629000, Q=30)
+        ##data = notch_filter(data, f0=9*629000, Q=30)
+        ##data = notch_filter(data, f0=10*629000, Q=30)
+        ##data = notch_filter(data, f0=11*629000, Q=30)
+        ##data = notch_filter(data, f0=12*629000, Q=30)
+
         if fftdata is not None:
             indata_fft = fftdata
         elif data is not None:
+            #data = sps.lfilter(self.luma_hp_filter, 1.0, data)
             indata_fft = npfft.fft(data[: self.blocklen])
         else:
             raise Exception("demodblock called without raw or FFT data")
 
-        if data is None:
-            data = npfft.ifft(indata_fft).real
+        #if data is None:
+        #    data = npfft.ifft(indata_fft).real
 
         if self.debug_plot and self.debug_plot.is_plot_requested("demodblock"):
             # If we're doing a plot make a copy of the input to be able to plot it since we
@@ -1164,15 +1197,16 @@ class VHSRFDecode(ldd.RFDecode):
         else:
             ldd.logger.warning("RF signal is weak. Is your deck tracking properly?")
 
+        # FM demodulator
+
         hilbert = npfft.ifft(indata_fft * self.Filters["hilbert"])
 
         # FM demodulator
-        # test1 = np.angle(hilbert)
-        # from vhsd_rust import complex_angle_py
-        # test2 = hilbert
-        # print(test1 - test2)
-        # np.savez_compressed("hilbert_data", data=hilbert)
-        demod = unwrap_hilbert(hilbert, self.freq_hz)
+        #demod = unwrap_hilbert(hilbert, self.freq_hz).real
+
+        demod = np.empty(len(data), np.float64)
+        self.fm_demod.work(data.astype(np.float64), demod)
+        demod += 7.5e6
 
         # If there are obviously out of bounds values, do an extra demod on a diffed waveform and
         # replace the spikes with data from the diffed demod. (Which in practice is an extra EQed signal)
@@ -1207,6 +1241,21 @@ class VHSRFDecode(ldd.RFDecode):
         demod_fft = npfft.rfft(demod)
         out_video_fft = demod_fft * self.Filters["FVideo"]
         out_video = npfft.irfft(out_video_fft).real
+
+        #t = np.arange(len(demod)) / 40000000
+        #plt.figure()
+        #plt.plot(t, demod_h)
+        #plt.title("Hilbert Luma Signal")
+        #plt.xlabel("Time [s]")
+        #plt.ylabel("Luma Level")
+        #plt.grid(True)
+        #plt.figure()
+        #plt.plot(t, demod)
+        #plt.title("PLL Luma Signal")
+        #plt.xlabel("Time [s]")
+        #plt.ylabel("Luma Level")
+        #plt.grid(True)
+        #plt.show()
 
         if self.options.nldeemp:
             # Extract the high frequency part of the signal
@@ -1247,7 +1296,7 @@ class VHSRFDecode(ldd.RFDecode):
         out_video05 = np.roll(out_video05, -self.Filters["F05_offset"])
 
         # Filter out the color-under signal from the raw data.
-        chroma_source = data if self.options.color_under else out_video
+        chroma_source = chroma_data if self.options.color_under else out_video
         out_chroma = (
             demod_chroma_filt(
                 chroma_source,

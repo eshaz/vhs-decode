@@ -75,6 +75,7 @@ DEMOD_DTYPE_NB = numba.types.float64
 
 DEMOD_QUADRATURE = "quadrature"
 DEMOD_HILBERT = "hilbert"
+DEMOD_PLL = "pll"
 DEFAULT_DEMOD = DEMOD_QUADRATURE
 
 BLOCKS_PER_SECOND = 2
@@ -243,10 +244,11 @@ class AFEFilterable:
 
 
 class FMdemod:
-    def __init__(self, sample_rate, carrier_center, type, i_osc=None, q_osc=None):
+    def __init__(self, sample_rate, carrier_center, frequency_deviation, type, i_osc=None, q_osc=None):
         self.samp_rate = np.int32(sample_rate)
         self.type = type
         self.carrier = np.int32(carrier_center)
+        self.deviation = np.float64(frequency_deviation)
 
         quadrature_lp_b, quadrature_lp_a = butter(5, self.carrier / self.samp_rate / 2)
         self.quadrature_lp_b = quadrature_lp_b.astype(DEMOD_DTYPE_NP)
@@ -497,12 +499,147 @@ class FMdemod:
             prev_angle = current_angle
             prev_unwrapped = unwrapped
 
+    @staticmethod
+    @njit(
+        [(
+            numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
+            numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
+            numba.types.int32,
+            numba.types.int32,
+            numba.types.float64
+        )],
+        cache=True, fastmath=True, nogil=True
+    )
+    def demod_pll_1(in_rf, out_demod, sample_rate, carrier, deviation):
+        # PLL parameters
+        kvco = 2 * np.pi * deviation  # VCO gain
+        loop_filter_coeff = 0.1
+        
+        # State variables
+        vco_phase = 0.0
+        vco_freq = 2 * np.pi * carrier
+        filtered_error = 0.0
+        
+        # PLL loop
+        for i in range(len(in_rf)):
+            # VCO output (complex exponential)
+            vco_sample = np.exp(-1j * vco_phase)  # negative sign to downconvert
+        
+            # Phase detector: angle between FM signal and VCO
+            error = np.angle(in_rf[i] * np.conj(vco_sample))
+        
+            # Loop filter (IIR)
+            filtered_error += loop_filter_coeff * (error - filtered_error)
+        
+            # Frequency control (VCO input)
+            vco_freq = 2 * np.pi * carrier + kvco * filtered_error
+        
+            # Integrate to get phase
+            vco_phase += vco_freq / sample_rate
+            vco_phase = np.mod(vco_phase, 2 * np.pi)
+        
+            # Demodulated signal: use filtered_error as the FM output
+            out_demod[i] = filtered_error * kvco / (2 * np.pi)
+
+    @staticmethod
+    @njit(
+        [(
+            numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
+            numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
+            numba.types.int32,
+            numba.types.int32,
+            numba.types.float64
+        )],
+        cache=True, fastmath=True, nogil=True
+    )
+    def demod_pll_2(in_rf, out_demod, sample_rate, carrier, deviation):
+        # ----------------------------------------------------------
+        # PLL Demodulation: Role of Kp, Ki, and Kvco in PI Controller
+        # ----------------------------------------------------------
+        
+        # The control signal driving the VCO is:
+        #   u[n] = Kp * e[n] + Ki * sum(e[k]) * Ts
+        # where:
+        #   e[n] = phase error at time step n
+        #   Ts   = 1 / sample_rate
+        
+        # Kp (Proportional Gain):
+        #   - Reacts to the current phase error.
+        #   - Low Kp: slow response, under-reacts to frequency changes.
+        #   - High Kp: fast response, but can overshoot or amplify noise.
+        #   - Controls high-frequency responsiveness.
+        
+        # Ki (Integral Gain):
+        #   - Reacts to accumulated phase error over time.
+        #   - Low Ki: leaves steady-state errors (DC offset in demodulated output).
+        #   - High Ki: can cause overshoot, low-frequency ringing, or wind-up.
+        #   - Helps remove long-term drift in output frequency.
+        
+        # Kvco (VCO Gain):
+        #   - Defines how much the VCO frequency shifts per unit of control signal.
+        #     Units: radians/second per volt (or per unit control signal).
+        #   - Acts as a gain factor: frequency = 2π * f_c + Kvco * u[n]
+        #   - Low Kvco: makes the VCO sluggish and unresponsive.
+        #   - High Kvco: makes the loop aggressive and sensitive to noise or overshoot.
+        #   - Kvco should roughly match the expected frequency deviation range (e.g., 2π * Δf).
+        
+        # Summary:
+        #   Kp    = "reaction speed" (to phase error)
+        #   Ki    = "long-term memory" (to eliminate bias)
+        #   Kvco  = "sensitivity" of VCO (Hz shift per control unit)
+        kvco = 2 * np.pi * deviation         # VCO gain (rad/s per volt)
+        Kp = 1.0                             # Proportional gain
+        Ki = 50.0                            # Integral gain
+
+        # VHS
+        Kp = 1                               # Proportional gain
+        Ki = 5.0                           # Integral gain
+        
+        # State variables
+        vco_phase = 0.0
+        vco_freq = 2 * np.pi * carrier
+        integrator_state = 0.0
+        
+        # PLL with PI controller
+        for i in range(len(in_rf)):
+            # Generate VCO output (complex)
+            vco = np.exp(-1j * vco_phase)
+        
+            # Phase detector: error signal (angle between FM input and VCO output)
+            #phase_error = in_rf[i] * np.imag(vco)
+            phase_error = np.angle(in_rf[i] * np.conj(vco))
+        
+            # PI Controller
+            integrator_state += phase_error 
+            # clamp integrator state to reduce wind-up
+            # integrator_state = min(max(integrator_state, -1.0), 1.0)
+
+            control_signal = Kp * phase_error + Ki * integrator_state / sample_rate
+        
+            # Update VCO frequency and phase
+            vco_freq = 2 * np.pi * carrier + kvco * control_signal
+
+            vco_phase += vco_freq / sample_rate
+            vco_phase = np.mod(vco_phase, 2 * np.pi)
+        
+            # Demodulated signal (proportional to frequency deviation)
+            out_demod[i] = control_signal * kvco / (2 * np.pi)
+
+
     def work(self, input: np.array, output: np.array):
         if self.type == DEMOD_HILBERT:
             if ROCKET_FFT_AVAILABLE:
                 FMdemod.demod_hilbert_numba(np.float32(self.samp_rate), input, output)
             else:
                 FMdemod.demod_hilbert_python(np.float32(self.samp_rate), input, output)
+        elif self.type == DEMOD_PLL:
+            FMdemod.demod_pll_2(
+                input,
+                output,
+                self.samp_rate,
+                self.carrier,
+                self.deviation
+            )
         elif self.type == DEMOD_QUADRATURE:
             FMdemod.demod_quadrature(
                 input,
@@ -1353,17 +1490,17 @@ class HiFiDecode:
 
         return i_osc_left, q_osc_left, i_osc_right, q_osc_right
         
-    def _get_carrier_filters(self, if_rate, demod_type, generate_iq_oscillators):
-        afeL = AFEFilterable(self.standard, if_rate, 0)
-        afeR = AFEFilterable(self.standard, if_rate, 1)
+    def _get_carrier_filters(self, standard, if_rate, demod_type, generate_iq_oscillators):
+        afeL = AFEFilterable(standard, if_rate, 0)
+        afeR = AFEFilterable(standard, if_rate, 1)
         
         if self.options["demod_type"] == DEMOD_QUADRATURE:
             i_osc_left, q_osc_left, i_osc_right, q_osc_right = self.get_iq_oscillators(generate_iq_oscillators)
-            fmL = FMdemod(if_rate, self.standard.LCarrierRef, demod_type, i_osc=i_osc_left, q_osc=q_osc_left)
-            fmR = FMdemod(if_rate, self.standard.RCarrierRef, demod_type, i_osc=i_osc_right, q_osc=q_osc_right)
+            fmL = FMdemod(self.if_rate, standard.LCarrierRef, standard.maxVCODeviation, demod_type, i_osc=i_osc_left, q_osc=q_osc_left)
+            fmR = FMdemod(self.if_rate, standard.RCarrierRef, standard.maxVCODeviation, demod_type, i_osc=i_osc_right, q_osc=q_osc_right)
         else:
-            fmL = FMdemod(if_rate, self.standard.LCarrierRef, demod_type)
-            fmR = FMdemod(if_rate, self.standard.RCarrierRef, demod_type)
+            fmL = FMdemod(self.if_rate, standard.LCarrierRef, standard.maxVCODeviation, demod_type)
+            fmR = FMdemod(self.if_rate, standard.RCarrierRef, standard.maxVCODeviation, demod_type)
 
         return afeL, afeR, fmL, fmR
 
