@@ -8,8 +8,8 @@
 		"getopt",
 		{
 			"name": "ffmpeg",
+			"default-features": false,
 			"features": [
-				"core",
 				"avcodec",
 				"avformat"
 			]
