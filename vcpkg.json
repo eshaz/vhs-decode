@@ -9,6 +9,7 @@
 		{
 			"name": "ffmpeg",
 			"features": [
+				"core",
 				"avcodec",
 				"avformat"
 			]
