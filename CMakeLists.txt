@@ -36,13 +36,10 @@ set(USE_QT_VERSION "" CACHE STRING
     "Version of Qt to use, 5 or 6 (Which is used by default can vary due to how cmake find functions work, but will often default to Qt6)"
 )
 
-# Not working on Windows as of yet. The decoders are able to use ffmpeg binaries instead if needed.
-if(NOT WIN32)
-    option(BUILD_LDF_READER
-        "build ld_ldf_reader"
-        ON
-    )
-endif()
+option(BUILD_LDF_READER
+    "build ld_ldf_reader"
+    ON
+)
 
 option(BUILD_PYTHON
     "Build and install ld-decode's Python library and tools"
