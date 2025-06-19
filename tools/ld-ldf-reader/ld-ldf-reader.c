@@ -171,11 +171,13 @@ int main (int argc, char **argv)
     }
 
     #ifdef _WIN32
-      if (setmode(fileno(stdout), O_BINARY)) {
+      if (_setmode(_fileno(stdout), _O_BINARY) == -1) {
         fprintf(stderr, "Could not set stdout to binary mode\n");
+        exit(1);
       }
-      if (setmode(fileno(stdin), O_BINARY)) {
+      if (_setmode(_fileno(stdin), _O_BINARY) == -1) {
         fprintf(stderr, "Could not set stdin to binary mode\n");
+        exit(1);
       }
     #endif
 
