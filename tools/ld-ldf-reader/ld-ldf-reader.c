@@ -34,6 +34,11 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 
+#ifdef _WIN32
+  #include <io.h>
+  #include <fcntl.h>
+#endif
+
 static AVFormatContext *fmt_ctx = NULL;
 static AVCodecContext *audio_dec_ctx;
 static AVStream *audio_stream = NULL;
@@ -164,6 +169,15 @@ int main (int argc, char **argv)
     if (argc >= 3) {
         seekto = atoll(argv[2]);
     }
+
+    #ifdef _WIN32
+      if (setmode(fileno(stdout), O_BINARY)) {
+        fprintf(stderr, "Could not set stdout to binary mode\n");
+      }
+      if (setmode(fileno(stdin), O_BINARY)) {
+        fprintf(stderr, "Could not set stdin to binary mode\n");
+      }
+    #endif
 
 #if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(58, 7, 100)
     av_register_all();
