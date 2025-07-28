@@ -8,8 +8,7 @@ import subprocess
 import sys
 import traceback
 
-from multiprocessing import JoinableQueue
-import threading
+from multiprocessing import JoinableQueue, Process, Manager
 
 from numba import jit, njit
 import numba
@@ -1280,51 +1279,49 @@ def init_opencl(cl, name = None):
     #queue = cl.CommandQueue(ctx)
     return ctx
 
+class JSONDumper:
+    def __init__(self, ldd, outname):
+        self._queue = JoinableQueue()
+        self._outname = outname
+        self._dumper = Process(target=JSONDumper._consume, args=(self._queue, self._outname, ldd.verboseVITS,), name="lddecode-json-dumper")
+        self._dumper.start()
+    
+    def put(self, dict):
+        self._queue.put(dict)
 
-# Write the .tbc.json file (used by lddecode and notebooks)
-def write_json(ldd, jsondict, outname):
+    def close(self):
+        self._queue.put(None)
+        self._dumper.join()
 
-    fp = open(outname + ".tbc.json.tmp", "w")
-    json.dump(
-        jsondict,
-        fp,
-        allow_nan=False,
-        indent=4 if ldd.verboseVITS else None,
-        separators=(",", ":") if not ldd.verboseVITS else None,
-    )
-    fp.write("\n")
-    fp.close()
+    @staticmethod
+    def write_json(jsondict, outname, verboseVITS):
+        fp = open(outname + ".tbc.json.tmp", "w")
+        json.dump(
+            jsondict,
+            fp,
+            allow_nan=False,
+            indent=4 if verboseVITS else None,
+            separators=(",", ":") if not verboseVITS else None,
+        )
+        fp.write("\n")
+        fp.close()
+    
+        os.replace(outname + ".tbc.json.tmp", outname + ".tbc.json")
 
-    os.replace(outname + ".tbc.json.tmp", outname + ".tbc.json")
-
-
-def jsondump_thread(ldd, outname):
-    """
-    This creates a background thread to write a json dict to a file.
-
-    Probably had a bit too much fun here - this returns a queue that is
-    fed into a thread created by the function itself.  Feed it json
-    dictionaries during runtime and None when done.
-    """
-
-    def consume(q):
+    @staticmethod
+    def _consume(q: JoinableQueue, outname, verboseVITS):
         while True:
-            jsondict = q.get()
+            try:
+                jsondict = q.get()
+            except (InterruptedError, KeyboardInterrupt, EOFError):
+                break
+        
             if jsondict is None:
-                q.task_done()
-                return
+                break
+    
+            JSONDumper.write_json(jsondict, outname, verboseVITS)
 
-            write_json(ldd, jsondict, outname)
-
-            q.task_done()
-
-    q = JoinableQueue()
-
-    # Start the self-contained thread
-    t = threading.Thread(target=consume, args=(q,))
-    t.start()
-
-    return q
+        q.task_done()  
 
 
 class StridedCollector:
