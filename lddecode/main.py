@@ -389,10 +389,9 @@ def main(args=None):
     jsondumper = JSONDumper(ldd, outname)
 
     def cleanup():
-        jsondumper.put(ldd.build_json())
         # logger.flush()
-        ldd.close()
         jsondumper.close()
+        ldd.close()
         if audio_pipe is not None:
             audio_pipe.close()
 
@@ -419,7 +418,7 @@ def main(args=None):
             done = True
 
         if ldd.fields_written < 100 or ((ldd.fields_written % 500) == 0):
-            jsondumper.put(ldd.build_json())
+            jsondumper.write()
 
     if ldd.fields_written:
         print(f"\nCompleted: saving JSON and exiting.", file=sys.stderr)

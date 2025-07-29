@@ -185,8 +185,8 @@ def main(args=None):
 
     def cleanup(outname):
         jsondumper.put(vhsd.build_json())
-        vhsd.close()
         jsondumper.close()
+        vhsd.close()
 
     while not done and vhsd.fields_written < (req_frames * 2):
         try:
@@ -214,7 +214,7 @@ def main(args=None):
             f.prevfield = None
 
         if vhsd.fields_written < 100 or ((vhsd.fields_written % 500) == 0):
-            jsondumper.put(vhsd.build_json())
+            jsondumper.write()
 
     if "lowest_agc_gain" in vhsd.rf.DecoderParams:
         print("Automatic gain control statistics:", file=sys.stderr)

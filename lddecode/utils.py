@@ -7,8 +7,9 @@ import os
 import subprocess
 import sys
 import traceback
+import signal
 
-from multiprocessing import JoinableQueue, Process, Manager
+from multiprocessing import Event, Pipe, Process
 
 from numba import jit, njit
 import numba
@@ -1281,16 +1282,21 @@ def init_opencl(cl, name = None):
 
 class JSONDumper:
     def __init__(self, ldd, outname):
-        self._queue = JoinableQueue()
+        self._rx, self._tx = Pipe(False)
+        self._writing = Event()
+        self._build_json = ldd.build_json
+
         self._outname = outname
-        self._dumper = Process(target=JSONDumper._consume, args=(self._queue, self._outname, ldd.verboseVITS,), name="lddecode-json-dumper")
+        self._dumper = Process(target=JSONDumper._consume, args=(self._rx, self._writing, self._outname, ldd.verboseVITS,), name="lddecode-json-dumper")
         self._dumper.start()
     
-    def put(self, dict):
-        self._queue.put(dict)
+    def write(self):
+        if not self._writing.is_set():
+            self._tx.send(self._build_json())
 
     def close(self):
-        self._queue.put(None)
+        self._tx.send(self._build_json())
+        self._tx.send(None)
         self._dumper.join()
 
     @staticmethod
@@ -1309,10 +1315,13 @@ class JSONDumper:
         os.replace(outname + ".tbc.json.tmp", outname + ".tbc.json")
 
     @staticmethod
-    def _consume(q: JoinableQueue, outname, verboseVITS):
+    def _consume(conn, ready, outname, verboseVITS):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
         while True:
             try:
-                jsondict = q.get()
+                jsondict = conn.recv()
+                ready.set()
             except (InterruptedError, KeyboardInterrupt, EOFError):
                 break
         
@@ -1320,9 +1329,7 @@ class JSONDumper:
                 break
     
             JSONDumper.write_json(jsondict, outname, verboseVITS)
-
-        q.task_done()  
-
+            ready.clear()
 
 class StridedCollector:
     # This keeps a numpy buffer and outputs an fft block and keeps the overlap

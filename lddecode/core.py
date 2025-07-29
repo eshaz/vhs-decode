@@ -4362,6 +4362,6 @@ class LDdecode:
 
         jout["videoParameters"] = vp
 
-        jout["fields"] = self.fieldinfo.copy()
+        jout["fields"] = self.fieldinfo
 
         return jout
