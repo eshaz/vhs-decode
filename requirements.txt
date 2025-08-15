@@ -10,3 +10,4 @@ sounddevice
 noisereduce>=2.0.0
 pyzmq
 setproctitle
+soxr

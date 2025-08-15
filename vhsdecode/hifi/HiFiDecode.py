@@ -32,6 +32,7 @@ from scipy.signal import (
     find_peaks,
 )
 from scipy.interpolate import interp1d
+from soxr import ResampleStream
 
 from noisereduce.spectralgate.nonstationary import SpectralGateNonStationary
 
@@ -1011,6 +1012,25 @@ class HiFiDecode:
             self.input_rate, self.if_rate, self.audio_rate, self.audio_final_rate
         )
 
+        if self.options["resampler_quality"] == "high":
+            self.if_resampler_converter = "VHQ"
+            self.audio_resampler_converter = "VHQ"
+            self.audio_final_resampler_converter = "VHQ"
+        elif self.options["resampler_quality"] == "medium":
+            self.if_resampler_converter = "LQ"
+            self.audio_resampler_converter = "MQ"
+            self.audio_final_resampler_converter = "HQ"
+        else:  # low
+            self.if_resampler_converter = "LQ"
+            self.audio_resampler_converter = "LQ"
+            self.audio_final_resampler_converter = "LQ"
+
+        self.if_resampler = ResampleStream(self.ifresample_denominator, self.ifresample_numerator, 1, np.float32, self.if_resampler_converter)
+        self.audio_resampler_l = ResampleStream(self.audioRes_denominator, self.audioRes_numerator, 1, REAL_DTYPE, self.audio_resampler_converter)
+        self.audio_resampler_r = ResampleStream(self.audioRes_denominator, self.audioRes_numerator, 1, REAL_DTYPE, self.audio_resampler_converter)
+        self.audio_final_resampler_l = ResampleStream(self.audioFinal_denominator, self.audioFinal_numerator, 1, REAL_DTYPE, self.audio_final_resampler_converter)
+        self.audio_final_resampler_r = ResampleStream(self.audioFinal_denominator, self.audioFinal_numerator, 1, REAL_DTYPE, self.audio_final_resampler_converter)
+
         self.set_block_sizes()
         self._set_block_overlap()
 
@@ -1027,19 +1047,6 @@ class HiFiDecode:
         self.dcCancelR = StackableMA(
             min_watermark=0, window_average=self._blocks_per_second_ratio
         )
-
-        if self.options["resampler_quality"] == "high":
-            self.if_resampler_converter = "sinc_medium"
-            self.audio_resampler_converter = "sinc_medium"
-            self.audio_final_resampler_converter = "sinc_best"
-        elif self.options["resampler_quality"] == "medium":
-            self.if_resampler_converter = "sinc_fastest"
-            self.audio_resampler_converter = "sinc_fastest"
-            self.audio_final_resampler_converter = "sinc_medium"
-        else:  # low
-            self.if_resampler_converter = "sinc_fastest"
-            self.audio_resampler_converter = "sinc_fastest"
-            self.audio_final_resampler_converter = "sinc_fastest"
 
         self.standard, self.field_rate = HiFiDecode.get_standard(
             options["format"],
@@ -2031,7 +2038,7 @@ class HiFiDecode:
 
     @staticmethod
     def demod_process_audio(
-        filtered: np.array, fm: FMdemod, audio_process_params: dict, measure_perf: bool
+        filtered: np.array, fm: FMdemod, audio_process_params: dict, audio_resampler, audio_final_resampler, measure_perf: bool
     ) -> Tuple[np.array, float, dict]:
         perf_measurements = {
             "start_demod": 0,
@@ -2057,12 +2064,8 @@ class HiFiDecode:
         # resample if sample rate to audio sample rate
         if measure_perf:
             perf_measurements["start_audio_resample"] = perf_counter()
-        audio: np.array = samplerate_resample(
-            audio,
-            audio_process_params.audioRes_numerator,
-            audio_process_params.audioRes_denominator,
-            audio_process_params.audio_resampler_converter,
-        )
+        audio: np.array = audio_resampler.resample_chunk(audio, True)
+        audio_resampler.clear()
         if measure_perf:
             perf_measurements["end_audio_resample"] = perf_counter()
 
@@ -2093,12 +2096,8 @@ class HiFiDecode:
         if measure_perf:
             perf_measurements["start_audio_final_resample"] = perf_counter()
         if audio_process_params.audio_rate != audio_process_params.audio_final_rate:
-            audio: np.array = samplerate_resample(
-                audio,
-                audio_process_params.audioFinal_numerator,
-                audio_process_params.audioFinal_denominator,
-                audio_process_params.audio_final_resampler_converter,
-            )
+            audio: np.array = audio_final_resampler.resample_chunk(audio, True)
+            audio_final_resampler.clear()
         if measure_perf:
             perf_measurements["end_audio_final_resample"] = perf_counter()
 
@@ -2123,12 +2122,8 @@ class HiFiDecode:
 
         if self.options["demod_type"] == DEMOD_HILBERT:
             rf_data = rf_data.astype(np.float32, copy=False)
-            rf_data_resampled = samplerate_resample(
-                rf_data,
-                self.ifresample_numerator,
-                self.ifresample_denominator,
-                converter_type=self.if_resampler_converter,
-            )
+            rf_data_resampled = self.if_resampler.resample_chunk(rf_data, True)
+            self.if_resampler.clear()
         else:
             rf_data_resampled = rf_data
 
@@ -2159,10 +2154,10 @@ class HiFiDecode:
             self.grc.send(filterL + filterR)
 
         preL, dcL, perf_measurements_l = HiFiDecode.demod_process_audio(
-            filterL, self.fmL, self.audio_process_params, measure_perf
+            filterL, self.fmL, self.audio_process_params, self.audio_resampler_l, self.audio_final_resampler_l, measure_perf
         )
         preR, dcR, perf_measurements_r = HiFiDecode.demod_process_audio(
-            filterR, self.fmR, self.audio_process_params, measure_perf
+            filterR, self.fmR, self.audio_process_params, self.audio_resampler_r, self.audio_final_resampler_r, measure_perf
         )
 
         # fine tune carrier frequency
