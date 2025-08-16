@@ -80,23 +80,20 @@ def scale_line(args):
     scale_factor = line_len / outwidth# * wow_factor
 
     if line_end > line_start:
-        # upsample to be able to shift the start of the line on the sub-sample level
-        # calculate the least common 
-        upsample_start = math.floor(line_start)
-        upsample_diff = line_start - upsample_start
-        upsample_end = math.ceil(line_end + upsample_diff)
+        # shift the line phase so that it starts where the line start was detected
+        line_shifted_start = math.floor(line_start)
+        line_shifted_diff = -(line_start - line_shifted_start)
+        line_shifted_end = math.ceil(line_end + line_shifted_diff)
 
-        upsample_ratio = Fraction(upsample_diff).limit_denominator(upsample_limit)
-
-        if upsample_ratio.numerator != 0:
-            upsampled = soxr.resample(buf[upsample_start:upsample_end], 1, upsample_ratio.denominator, quality='LQ')
-        else:
-            # offset is not enough, so no need to upscale
-            upsampled = buf[upsample_start:upsample_end]
-
-        downsample_start = upsample_ratio.numerator
-        downsample_ratio = Fraction(scale_factor * upsample_ratio.denominator)
-        downsampled = soxr.resample(upsampled[downsample_start:], downsample_ratio.numerator, downsample_ratio.denominator, quality='LQ')
+        line = buf[line_shifted_start:line_shifted_end]
+        N = len(line)
+        X = np.fft.fft(line)
+        f = np.fft.fftfreq(N)
+        shift_factor = np.exp(-2j * np.pi * f * line_shifted_diff)
+        line_shifted = np.fft.ifft(X * shift_factor).real
+        
+        downsample_ratio = Fraction(scale_factor)
+        downsampled = soxr.resample(line_shifted, downsample_ratio.numerator, downsample_ratio.denominator, quality='LQ')
 
         dsout[dsout_start:dsout_end] = downsampled[:outwidth]
     else:
