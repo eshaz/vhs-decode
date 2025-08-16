@@ -8,6 +8,8 @@ import subprocess
 import sys
 import traceback
 import signal
+import soxr
+from fractions import Fraction 
 
 from multiprocessing import Event, Pipe, Process
 
@@ -66,54 +68,74 @@ def scale(buf, begin, end, tgtlen, mult=1):
 
     return output
 
-@njit(nogil=True, cache=True, fastmath=True)
-def scale_field(buf, dsout, lineinfo, lineoffset, linesout, outwidth, wowfactors, ire0):
+import concurrent.futures
+
+def scale_line(args):
+    buf, dsout, line_number, line_start, line_end, wow_factor, lineoffset, upsample_limit, outwidth, ire0 = args
+    tbc_error = False
+
+    dsout_start = round((line_number - lineoffset) * outwidth)
+    dsout_end = round((line_number + 1 - lineoffset) * outwidth)
+    line_len = line_end - line_start
+    scale_factor = line_len / outwidth# * wow_factor
+
+    if line_end > line_start:
+        # upsample to be able to shift the start of the line on the sub-sample level
+        # calculate the least common 
+        upsample_start = math.floor(line_start)
+        upsample_diff = line_start - upsample_start
+        upsample_end = math.ceil(line_end + upsample_diff)
+
+        upsample_ratio = Fraction(upsample_diff).limit_denominator(upsample_limit)
+
+        if upsample_ratio.numerator != 0:
+            upsampled = soxr.resample(buf[upsample_start:upsample_end], 1, upsample_ratio.denominator, quality='LQ')
+        else:
+            # offset is not enough, so no need to upscale
+            upsampled = buf[upsample_start:upsample_end]
+
+        downsample_start = upsample_ratio.numerator
+        downsample_ratio = Fraction(scale_factor * upsample_ratio.denominator)
+        downsampled = soxr.resample(upsampled[downsample_start:], downsample_ratio.numerator, downsample_ratio.denominator, quality='LQ')
+
+        dsout[dsout_start:dsout_end] = downsampled[:outwidth]
+    else:
+        # Massive TBC error detected
+        tbc_error = True
+        dsout[dsout_start:dsout_end] = ire0
+
+    return tbc_error
+
+#@njit(nogil=True, cache=True, fastmath=True)
+def scale_field(buf, dsout, lineinfo, lineoffset, linesout, outwidth, wow_factors, ire0):
     # self.lineoffset is an adjustment for 0-based lines *before* downscaling so add 1 here
     tbc_error = False
     lineoffset += 1
+    upsample_limit = 16
 
+    tasks = []
     for l in range(lineoffset, linesout + lineoffset):
-        dsout_start = round((l - lineoffset) * outwidth)
-        dsout_end = round((l + 1 - lineoffset) * outwidth)
-        wowfactor = 1 if wowfactors[l] is None else wowfactors[l]
+        wow_factor = 1 if wow_factors[l] is None else wow_factors[l]
         line_start = lineinfo[l]
         line_end = lineinfo[l+1]
 
-        if line_end > line_start:
-            linelen = line_end - line_start
-            sfactor = linelen / outwidth
+        tasks.append((
+            buf,
+            dsout,
+            l,
+            line_start,
+            line_end,
+            wow_factor,
+            lineoffset,
+            upsample_limit,
+            outwidth,
+            ire0
+        ))
 
-            for i in range(outwidth):
-                # This runs a cubic scaler on a line.
-                # originally from https://www.paulinternet.nl/?page=bicubic
-                coord = (i * sfactor) + line_start
-                start = int(coord) - 1
-                p = buf[start : start + 4]
-                x = coord - int(coord)
-        
-                dsout[dsout_start + i] = wowfactor * (
-                    p[1]
-                    + 0.5
-                    * x
-                    * (
-                        p[2]
-                        - p[0]
-                        + x
-                        * (
-                            2.0 * p[0]
-                            - 5.0 * p[1]
-                            + 4.0 * p[2]
-                            - p[3]
-                            + x * (3.0 * (p[1] - p[2]) + p[3] - p[0])
-                        )
-                    )
-                )
-        else:
-            # Massive TBC error detected
-            tbc_error = True
-            dsout[dsout_start:dsout_end] = ire0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        tbc_errors = executor.map(scale_line, tasks)
 
-    return tbc_error
+    return any(tbc_errors)
 
 
 frequency_suffixes = [
