@@ -2520,7 +2520,7 @@ class Field:
                 # return values will still be in audio_rv later
                 downscale_audio(*dsa_args)
 
-        dsout = np.zeros((linesout * outwidth), dtype=np.double)
+        dsout = np.zeros((linesout * outwidth), dtype=np.float32)
         tbc_error = scale_field(self.data["video"][channel].astype(np.float32),
             dsout,
             lineinfo,

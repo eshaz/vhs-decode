@@ -93,7 +93,7 @@ def scale_line(args):
         line_shifted = np.fft.ifft(X * shift_factor).real
         
         downsample_ratio = Fraction(scale_factor)
-        downsampled = soxr.resample(line_shifted, downsample_ratio.numerator, downsample_ratio.denominator, quality='LQ')
+        downsampled = soxr.resample(line_shifted, downsample_ratio.numerator, downsample_ratio.denominator, quality='QQ')
 
         dsout[dsout_start:dsout_end] = downsampled[:outwidth]
     else:
@@ -129,7 +129,7 @@ def scale_field(buf, dsout, lineinfo, lineoffset, linesout, outwidth, wow_factor
             ire0
         ))
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         tbc_errors = executor.map(scale_line, tasks)
 
     return any(tbc_errors)
