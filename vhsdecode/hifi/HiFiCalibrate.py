@@ -8,6 +8,7 @@ from random import SystemRandom
 import csv
 
 from numba import njit
+import numba
 
 from multiprocessing import (
     cpu_count,
@@ -264,7 +265,17 @@ def limited_xcorr_best(x, y, max_lag):
     return corr[idx], idx - max_lag
 
 
-@njit(nogil=True,fastmath=True,cache=True)
+@njit(
+    [
+        (
+            numba.types.Array(numba.types.float32, 1, "C"),
+            numba.types.Array(numba.types.float32, 1, "C")
+        )
+    ],
+    cache=True,
+    fastmath=False,
+    nogil=True,
+)
 def correlate(decoded_processed_channel, decoded_reference_channel):
     return np.corrcoef(decoded_processed_channel, decoded_reference_channel)[0, 1]
 
@@ -274,7 +285,7 @@ def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateDecodedFil
     decoded_raw_shm = CalibrateSharedMemory(decoded_raw)
     decoded_reference_shm = CalibrateSharedMemory(decoded_reference)
 
-    for channel in range(decoded_raw.channels):
+    for channel in range(1):
         decoded_raw_channel = decoded_raw_shm.audio[channel]
         decoded_reference_channel = decoded_reference_shm.audio[channel]
 
@@ -486,7 +497,7 @@ def main() -> int:
         with open(args.in_reference + "_results.csv", mode='w', newline='') as csv_file:
             try:
                 writer = csv.writer(csv_file)
-                writer.writerow([*CalibrateResult.keys, "correlation_0", "correlation_1"])
+                writer.writerow([*CalibrateResult.keys, "correlation"])
 
                 for params in generator:
                     # Submit new task
@@ -507,7 +518,7 @@ def main() -> int:
                                 result.deemphasis_tau_1, result.deemphasis_tau_2,
                                 result.deemphasis_db_per_octave, result.deemphasis_bandwidth,
                                 result.correlation_results[0],
-                                result.correlation_results[1]
+                                #result.correlation_results[1]
                             ]
                             writer.writerow(row)
                             print(row)
@@ -523,7 +534,7 @@ def main() -> int:
                         result.deemphasis_tau_1, result.deemphasis_tau_2,
                         result.deemphasis_db_per_octave, result.deemphasis_bandwidth,
                         result.correlation_results[0],
-                        result.correlation_results[1]
+                        #result.correlation_results[1]
                     ]
                     writer.writerow(row)
                     print(row)
