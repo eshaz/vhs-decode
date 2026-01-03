@@ -5,10 +5,10 @@ from dataclasses import dataclass
 
 import string
 from random import SystemRandom
-from functools import partial
 import csv
 
-from itertools import product, islice, repeat
+from numba import njit
+
 from multiprocessing import (
     cpu_count,
     Pipe,
@@ -17,7 +17,8 @@ from multiprocessing import (
     freeze_support,
     current_process,
     Event,
-    resource_tracker
+    resource_tracker,
+    set_start_method
 )
 from multiprocessing.shared_memory import SharedMemory
 from concurrent.futures import ProcessPoolExecutor, as_completed, wait
@@ -262,6 +263,11 @@ def limited_xcorr_best(x, y, max_lag):
     idx = np.argmax(corr)
     return corr[idx], idx - max_lag
 
+
+@njit(nogil=True,fastmath=True,cache=True)
+def correlate(decoded_processed_channel, decoded_reference_channel):
+    return np.corrcoef(decoded_processed_channel, decoded_reference_channel)[0, 1]
+
 def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateDecodedFile, decoded_reference: CalibrateDecodedFile, lag, get_lag = False):
     results = []
     lags = []
@@ -322,7 +328,7 @@ def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateDecodedFil
             lags.append(lag)
         else:
             # compare the two values
-            results.append(np.corrcoef(decoded_processed_channel, decoded_reference_channel)[0, 1])
+            results.append(correlate(decoded_processed_channel, decoded_reference_channel))
             # results.append(np.dot(decoded_processed_channel, decoded_reference_channel) / len(decoded_processed_channel))
 
     decoded_raw_shm.close()
@@ -531,5 +537,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    freeze_support()
+    set_start_method('fork')
     main()
