@@ -9,6 +9,7 @@ import csv
 
 from numba import njit
 import numba
+import time
 
 from multiprocessing import (
     cpu_count,
@@ -467,6 +468,8 @@ def main() -> int:
     )
     results = test_decode_params(params, decoded_raw, decoded_reference, 0, True)
     lag = results.correlation_lags[0]
+    print("using correlation", results, "with lag", lag)
+    time.sleep(5)
 
     # Example usage
     param_dict = {
@@ -475,15 +478,15 @@ def main() -> int:
         'expander_gain': {'min':DEFAULT_EXPANDER_GAIN,'max':DEFAULT_EXPANDER_GAIN,'step':1},
         'expander_ratio': {'min':DEFAULT_EXPANDER_RATIO,'max':DEFAULT_EXPANDER_RATIO,'step':1},
         
-        'expander_weighting_tau_1': {'min':0.000150,'max':0.000300,'step':0.000001},
-        'expander_weighting_tau_2': {'min':0.000010,'max':0.000100,'step':0.000001},
+        'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1 - 15e-6,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1 + 15e-6,'step':0.000001},
+        'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 - 15e-6,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 + 15e-6,'step':0.000001},
         'expander_weighting_db_per_octave': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,'step':1},
-        'expander_weighting_bandwidth': {'min':1.5,'max':3.5,'step':0.02},
+        'expander_weighting_bandwidth': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH - 1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH + 0.5,'step':0.05},
         
-        'deemphasis_tau_1': {'min':0.000150,'max':0.000300,'step':0.000001},
-        'deemphasis_tau_2': {'min':0.000010,'max':0.000100,'step':0.000001},
+        'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1 - 15e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1 + 15e-6,'step':0.000001},
+        'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2 - 15e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2 + 15e-6,'step':0.000001},
         'deemphasis_db_per_octave': {'min':DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE,'max':DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE,'step':1},
-        'deemphasis_bandwidth': {'min':1.5,'max':3.5,'step':0.02},
+        'deemphasis_bandwidth': {'min':DEFAULT_VHS_DEEMPHASIS_BANDWIDTH - 1,'max':DEFAULT_VHS_DEEMPHASIS_BANDWIDTH + 0.5,'step':0.05},
     }
     
     # Generate results lazily
