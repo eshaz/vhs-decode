@@ -280,6 +280,14 @@ def limited_xcorr_best(x, y, max_lag):
 def correlate(decoded_processed_channel, decoded_reference_channel):
     return np.corrcoef(decoded_processed_channel, decoded_reference_channel)[0, 1]
 
+def normalized_fft(audio):
+    window = np.hanning(len(audio))
+    fft = np.abs(np.fft.rfft(audio * window))
+    fft_norm = fft / np.max(fft)
+
+    return fft_norm
+
+
 def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateDecodedFile, decoded_reference: CalibrateDecodedFile, lag, get_lag = False):
     results = []
     lags = []
@@ -340,7 +348,13 @@ def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateDecodedFil
             lags.append(lag)
         else:
             # compare the two values
-            results.append(correlate(decoded_processed_channel, decoded_reference_channel))
+            fft1 = normalized_fft(decoded_processed_channel)
+            fft2 = normalized_fft(decoded_reference_channel)
+            similarity = np.dot(fft1, fft2)
+
+            results.append(similarity)
+
+            # results.append(correlate(decoded_processed_channel, decoded_reference_channel))
             # results.append(np.dot(decoded_processed_channel, decoded_reference_channel) / len(decoded_processed_channel))
 
     decoded_raw_shm.close()
@@ -478,15 +492,15 @@ def main() -> int:
         'expander_gain': {'min':DEFAULT_EXPANDER_GAIN,'max':DEFAULT_EXPANDER_GAIN,'step':1},
         'expander_ratio': {'min':DEFAULT_EXPANDER_RATIO,'max':DEFAULT_EXPANDER_RATIO,'step':1},
         
-        'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1 - 15e-6,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1 + 15e-6,'step':0.000001},
-        'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 - 15e-6,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 + 15e-6,'step':0.000001},
-        'expander_weighting_db_per_octave': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,'step':1},
-        'expander_weighting_bandwidth': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH - 1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH + 0.5,'step':0.05},
+        'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'step':1},
+        'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1},
+        'expander_weighting_db_per_octave': {'min':1,'max':12,'step':0.5},
+        'expander_weighting_bandwidth': {'min':1,'max':4,'step':0.5},
         
-        'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1 - 15e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1 + 15e-6,'step':0.000001},
-        'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2 - 15e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2 + 15e-6,'step':0.000001},
-        'deemphasis_db_per_octave': {'min':DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE,'max':DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE,'step':1},
-        'deemphasis_bandwidth': {'min':DEFAULT_VHS_DEEMPHASIS_BANDWIDTH - 1,'max':DEFAULT_VHS_DEEMPHASIS_BANDWIDTH + 0.5,'step':0.05},
+        'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1,'step':1},
+        'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1},
+        'deemphasis_db_per_octave': {'min':1,'max':12,'step':0.5},
+        'deemphasis_bandwidth': {'min':1,'max':4,'step':0.5},
     }
     
     # Generate results lazily
