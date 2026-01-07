@@ -100,8 +100,7 @@ class CalibrateResult():
     deemphasis_tau_2: float
     deemphasis_db_per_octave: float
     deemphasis_bandwidth: float
-
-    correlation_results: float
+    correlation: float
 
     keys = [
         'expander_attack_tau',
@@ -318,10 +317,10 @@ def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData,
     )
 
     processed_fft_data = normalized_fft(decoded_processed_channel)
-    similarity = correlate(processed_fft_data, reference_fft_data)
-    # similarity = np.corrcoef(processed_fft_data, reference_fft_data)[0, 1]
+    # similarity = correlate(processed_fft_data, reference_fft_data)
+    similarity = np.corrcoef(processed_fft_data, reference_fft_data)[0, 1]
 
-    params.correlation_results = similarity
+    params.correlation = similarity
 
     decoded_raw_shm.close()
     reference_fft_shm.close()
@@ -434,22 +433,22 @@ def main() -> int:
         'expander_gain': {'min':DEFAULT_EXPANDER_GAIN,'max':DEFAULT_EXPANDER_GAIN,'step':1},
         'expander_ratio': {'min':DEFAULT_EXPANDER_RATIO,'max':DEFAULT_EXPANDER_RATIO,'step':1},
         
-        'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'step':1},
-        'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1},
-        'expander_weighting_db_per_octave': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,'step':1},
-        'expander_weighting_bandwidth': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,'step':1},
+        'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1-150e-6,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1+150e-6,'step':1e-5},
+        'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2-50e-6,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2+50e-6,'step':1e-5},
+        'expander_weighting_db_per_octave': {'min':1,'max':12,'step':1},
+        'expander_weighting_bandwidth': {'min':0.5,'max':3.5,'step':0.2},
         
-        'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1-10e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1+10e-6,'step':1e-6},
-        'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2-50e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2+50e-6,'step':1e-6},
-        'deemphasis_db_per_octave': {'min':DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE,'max':DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE,'step':1},
-        'deemphasis_bandwidth': {'min':0.5,'max':4,'step':0.1},
+        'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1-150e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1+150e-6,'step':1e-5},
+        'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2-50e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2+50e-6,'step':1e-5},
+        'deemphasis_db_per_octave': {'min':1,'max':12,'step':1},
+        'deemphasis_bandwidth': {'min':0.5,'max':3.5,'step':0.2},
     }
     
     # Generate results lazily
     ranges = get_ranges(param_dict)
     generator = recursive_generate(ranges)
-    #generator = list(islice(generator, 30))
     max_workers = args.threads
+    best_correlation = -1
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = set()  # keep track of running futures
@@ -468,7 +467,7 @@ def main() -> int:
                         # Wait for at least one to complete
                         done, futures = wait(futures, return_when="FIRST_COMPLETED")
                         for f in done:
-                            result = f.result()
+                            result = f.result()                            
                             row = [
                                 result.expander_attack_tau, result.expander_release_tau,
                                 result.expander_gain, result.expander_ratio,
@@ -476,10 +475,15 @@ def main() -> int:
                                 result.expander_weighting_db_per_octave, result.expander_weighting_bandwidth,
                                 result.deemphasis_tau_1, result.deemphasis_tau_2,
                                 result.deemphasis_db_per_octave, result.deemphasis_bandwidth,
-                                result.correlation_results
+                                result.correlation
                             ]
                             writer.writerow(row)
-                            print(row)
+
+                            if result.correlation > best_correlation:
+                                print("new best result", row)
+                                best_correlation = result.correlation
+                            else:
+                                print(row, end="\r")
 
                 # Wait for any remaining futures to complete
                 for f in as_completed(futures):
@@ -491,10 +495,15 @@ def main() -> int:
                         result.expander_weighting_db_per_octave, result.expander_weighting_bandwidth,
                         result.deemphasis_tau_1, result.deemphasis_tau_2,
                         result.deemphasis_db_per_octave, result.deemphasis_bandwidth,
-                        result.correlation_results
+                        result.correlation
                     ]
                     writer.writerow(row)
-                    print(row)
+
+                    if result.correlation > best_correlation:
+                        print("new best result", row)
+                        best_correlation = result.correlation
+                    else:
+                        print(row, end="\r")
             finally:
                 csv_file.close()
 
