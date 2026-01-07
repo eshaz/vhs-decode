@@ -9,16 +9,11 @@ import csv
 
 from numba import njit
 import numba
-import time
 
 from multiprocessing import (
     cpu_count,
     Pipe,
-    SimpleQueue,
     Process,
-    freeze_support,
-    current_process,
-    Event,
     resource_tracker,
     set_start_method
 )
@@ -27,6 +22,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed, wait
 
 import numpy as np
 import soundfile as sf
+import scipy
 
 from vhsdecode.hifi.HiFiDecode import (
     Deemphasis,
@@ -76,16 +72,14 @@ parser.add_argument(
 
 
 @dataclass
-class CalibrateDecodedFile():
+class CalibrateAudioData():
     name: str
-    channels: int
     length: int
     sample_rate: int
     dtype: np.dtype
 
-    def __init__(self, buffer_name, length, channels, sample_rate, dtype):
+    def __init__(self, buffer_name, length, sample_rate, dtype):
         self.name = buffer_name
-        self.channels = channels
         self.length = length
         self.sample_rate = sample_rate
         self.dtype = dtype
@@ -105,8 +99,7 @@ class CalibrateResult():
     deemphasis_db_per_octave: float
     deemphasis_bandwidth: float
 
-    correlation_results = ()
-    correlation_lags = ()
+    correlation_results: float
 
     keys = [
         'expander_attack_tau',
@@ -154,7 +147,7 @@ class CalibrateResult():
         
 
 class CalibrateSharedMemory():
-    def __init__(self, decoded_file: CalibrateDecodedFile):
+    def __init__(self, decoded_file: CalibrateAudioData):
         self.shared_memory = SharedMemory(name=decoded_file.name)
         resource_tracker.unregister(
             self.shared_memory._name,
@@ -167,19 +160,18 @@ class CalibrateSharedMemory():
         self.close = self.shared_memory.close
         self.unlink = self.shared_memory.unlink
 
-        self.channels = decoded_file.channels
         self.length = decoded_file.length
         self.dtype = decoded_file.dtype
 
         self.audio = np.ndarray(
-            (self.channels, self.length),
+            self.length,
             dtype=self.dtype,
             buffer=self.buf
         )
 
     @staticmethod
-    def create_shared_memory(name, channels, length, dtype):
-        byte_size = channels * length * np.dtype(dtype).itemsize
+    def create_shared_memory(name, length, item_size):
+        byte_size = length * item_size
 
         # allow more than one instance to run at a time
         system_random = SystemRandom()
@@ -199,7 +191,6 @@ class CalibrateSharedMemory():
 
         return shm, name
 
-
 def decode_worker(in_file, conn):
     decoded_dtype = np.float32
 
@@ -208,14 +199,14 @@ def decode_worker(in_file, conn):
     channels = data.shape[1]
 
     # create and manage the shared memory from the parent process
-    conn.send((channels, length, decoded_dtype))
+    conn.send((length, decoded_dtype))
     shared_memory_name = conn.recv()
 
-    calibrate_decoded_file = CalibrateDecodedFile(shared_memory_name, length, channels, sample_rate, decoded_dtype)
+    calibrate_decoded_file = CalibrateAudioData(shared_memory_name, length, sample_rate, decoded_dtype)
     calibrate_shared_memory = CalibrateSharedMemory(calibrate_decoded_file)
 
-    for i in range(channels):
-        np.copyto(calibrate_shared_memory.audio[i], data[:, i])
+    # only use the left channel
+    np.copyto(calibrate_shared_memory.audio, data[:, 0])
 
     calibrate_shared_memory.close()
 
@@ -230,12 +221,12 @@ def decode_input_files(in_raw, in_reference):
     in_reference_process = Process(None, decode_worker, args=(in_reference, in_reference_child))
     in_reference_process.start()
 
-    in_raw_channels, in_raw_length, in_raw_dtype = in_raw_parent.recv()
-    in_raw_shm, in_raw_shm_name = CalibrateSharedMemory.create_shared_memory("hifi-raw", in_raw_channels, in_raw_length, in_raw_dtype)
+    in_raw_length, in_raw_dtype = in_raw_parent.recv()
+    in_raw_shm, in_raw_shm_name = CalibrateSharedMemory.create_shared_memory("hifi-raw", in_raw_length, np.dtype(in_raw_dtype).itemsize)
     in_raw_parent.send(in_raw_shm_name)
 
-    in_reference_channels, in_reference_length, in_reference_dtype = in_reference_parent.recv()
-    in_reference_shm, in_reference_shm_name = CalibrateSharedMemory.create_shared_memory("hifi-ref", in_reference_channels, in_reference_length, in_reference_dtype)
+    in_reference_length, in_reference_dtype = in_reference_parent.recv()
+    in_reference_shm, in_reference_shm_name = CalibrateSharedMemory.create_shared_memory("hifi-ref", in_reference_length, np.dtype(in_reference_dtype).itemsize)
     in_reference_parent.send(in_reference_shm_name)
 
     decoded_raw = in_raw_parent.recv()
@@ -244,32 +235,28 @@ def decode_input_files(in_raw, in_reference):
     in_raw_process.join()
     in_reference_process.join()
 
-    return in_raw_shm, in_reference_shm, decoded_raw, decoded_reference
+    # get the fft for the reference data
+    decoded_reference_shm = CalibrateSharedMemory(decoded_reference)
+    reference_fft_data = normalized_fft(decoded_reference_shm.audio)
+    decoded_reference_shm.close()
 
-def limited_xcorr_best(x, y, max_lag):
-    x = np.asarray(x) - np.mean(x)
-    y = np.asarray(y) - np.mean(y)
+    reference_fft_shm, reference_fft_shm_name = CalibrateSharedMemory.create_shared_memory("hifi-ref-fft", len(reference_fft_data), np.dtype(reference_fft_data.dtype).itemsize)
+    reference_fft = CalibrateAudioData(reference_fft_shm_name, len(reference_fft_data), decoded_reference.sample_rate, np.dtype(reference_fft_data.dtype))
 
-    corr = []
-    for lag in range(-max_lag, max_lag + 1):
-        if lag < 0:
-            corr.append(np.dot(x[:lag], y[-lag:]))
-        elif lag > 0:
-            corr.append(np.dot(x[lag:], y[:-lag]))
-        else:
-            corr.append(np.dot(x, y))
+    # copy to shared memory
+    reference_fft_instance = CalibrateSharedMemory(reference_fft)
+    np.copyto(reference_fft_instance.audio, reference_fft_data)
+    reference_fft_instance.close()
 
-    corr = np.array(corr)
-    corr /= (np.std(x) * np.std(y) * len(x))
-
-    idx = np.argmax(corr)
-    return corr[idx], idx - max_lag
-
+    return (
+        in_raw_shm, in_reference_shm, reference_fft_shm,
+        decoded_raw, decoded_reference, reference_fft
+    )
 
 @njit(
     [
         (
-            numba.types.Array(numba.types.float32, 1, "C"),
+            numba.types.Array(numba.types.float32, 1, "A"),
             numba.types.Array(numba.types.float32, 1, "C")
         )
     ],
@@ -281,87 +268,63 @@ def correlate(decoded_processed_channel, decoded_reference_channel):
     return np.corrcoef(decoded_processed_channel, decoded_reference_channel)[0, 1]
 
 def normalized_fft(audio):
-    window = np.hanning(len(audio))
-    fft = np.abs(np.fft.rfft(audio * window))
-    fft_norm = fft / np.max(fft)
+    window = np.hanning(len(audio)).astype(np.float32, copy=False)
+    fft = scipy.fft.rfft(audio * window).real
+    # fft_abs = np.abs(fft)
+    # fft_norm = fft / np.max(fft_abs)
 
-    return fft_norm
+    return fft
 
 
-def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateDecodedFile, decoded_reference: CalibrateDecodedFile, lag, get_lag = False):
-    results = []
-    lags = []
+def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData, reference_fft: CalibrateAudioData):
     decoded_raw_shm = CalibrateSharedMemory(decoded_raw)
-    decoded_reference_shm = CalibrateSharedMemory(decoded_reference)
+    reference_fft_shm = CalibrateSharedMemory(reference_fft)
 
-    for channel in range(1):
-        decoded_raw_channel = decoded_raw_shm.audio[channel]
-        decoded_reference_channel = decoded_reference_shm.audio[channel]
+    decoded_raw_channel = decoded_raw_shm.audio
+    reference_fft_data = reference_fft_shm.audio
 
-        if lag != 0:
-            x = decoded_raw_channel
-            y = decoded_reference_channel
-            x_start = max(lag, 0)
-            y_start = max(-lag, 0)
+    decoded_processed_channel = decoded_raw_channel.copy()
 
-            # length of overlap
-            n = min(len(x) - x_start, len(y) - y_start)
-            decoded_raw_channel = x[x_start : x_start + n]
-            decoded_reference_channel = y[y_start : y_start + n]
+    deemphasis = Deemphasis(
+        decoded_raw.sample_rate,
+        params.deemphasis_tau_1,
+        params.deemphasis_tau_2,
+        params.deemphasis_db_per_octave,
+        params.deemphasis_bandwidth
+    )
 
-        decoded_processed_channel = decoded_raw_channel.copy()
+    expander = Expander(
+        decoded_raw.sample_rate,
+        params.expander_gain,
+        params.expander_ratio,
+        params.expander_attack_tau,
+        params.expander_release_tau,
+        params.expander_weighting_tau_1,
+        params.expander_weighting_tau_2,
+        params.expander_weighting_db_per_octave,
+        params.expander_weighting_bandwidth
+    )
 
-        deemphasis = Deemphasis(
-            decoded_raw.sample_rate,
-            params.deemphasis_tau_1,
-            params.deemphasis_tau_2,
-            params.deemphasis_db_per_octave,
-            params.deemphasis_bandwidth
-        )
+    deemphasis.process(decoded_processed_channel)
+    # prime expander
+    expander.process(
+        decoded_raw_channel[:decoded_raw.sample_rate],
+        np.copy(decoded_processed_channel[:decoded_raw.sample_rate])
+    )
+    expander.process(
+        decoded_raw_channel,
+        decoded_processed_channel
+    )
 
-        expander = Expander(
-            decoded_raw.sample_rate,
-            params.expander_gain,
-            params.expander_ratio,
-            params.expander_attack_tau,
-            params.expander_release_tau,
-            params.expander_weighting_tau_1,
-            params.expander_weighting_tau_2,
-            params.expander_weighting_db_per_octave,
-            params.expander_weighting_bandwidth
-        )
+    processed_fft_data = normalized_fft(decoded_processed_channel)
+    similarity = correlate(processed_fft_data, reference_fft_data)
+    # similarity = np.corrcoef(processed_fft_data, reference_fft_data)[0, 1]
 
-        deemphasis.process(decoded_processed_channel)
-        # prime expander
-        expander.process(
-            decoded_raw_channel[:decoded_raw.sample_rate],
-            np.copy(decoded_processed_channel[:decoded_raw.sample_rate])
-        )
-        expander.process(
-            decoded_raw_channel,
-            decoded_processed_channel
-        )
-
-        if get_lag:
-            result, lag = limited_xcorr_best(decoded_processed_channel, decoded_reference_channel, 1000)
-            results.append(result)
-            lags.append(lag)
-        else:
-            # compare the two values
-            fft1 = normalized_fft(decoded_processed_channel)
-            fft2 = normalized_fft(decoded_reference_channel)
-            similarity = np.dot(fft1, fft2)
-
-            results.append(similarity)
-
-            # results.append(correlate(decoded_processed_channel, decoded_reference_channel))
-            # results.append(np.dot(decoded_processed_channel, decoded_reference_channel) / len(decoded_processed_channel))
+    params.correlation_results = similarity
 
     decoded_raw_shm.close()
-    decoded_reference_shm.close()
+    reference_fft_shm.close()
 
-    params.correlation_results = tuple(results)
-    params.correlation_lags = tuple(lags)
     return params
 
 def float_range(min_val, max_val, step):
@@ -460,32 +423,10 @@ def main() -> int:
     * Possibly export to cli parameters for hifi-decode
     
     """
-
     args = parser.parse_args()
 
-    in_raw_shm, in_reference_shm, decoded_raw, decoded_reference = decode_input_files(args.in_decoded, args.in_reference)
+    in_raw_shm, in_reference_shm, reference_fft_shm, decoded_raw, decoded_reference, reference_fft = decode_input_files(args.in_decoded, args.in_reference)
 
-    # get the result with the existing defaults, use this to determine any delay in the filtering
-    params = CalibrateResult(
-        DEFAULT_EXPANDER_ATTACK_TAU,
-        DEFAULT_EXPANDER_RELEASE_TAU,
-        DEFAULT_EXPANDER_GAIN,
-        DEFAULT_EXPANDER_RATIO,
-        DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,
-        DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,
-        DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,
-        DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,
-        DEFAULT_VHS_DEEMPHASIS_TAU_1,
-        DEFAULT_VHS_DEEMPHASIS_TAU_2,
-        DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE,
-        DEFAULT_VHS_DEEMPHASIS_BANDWIDTH,
-    )
-    results = test_decode_params(params, decoded_raw, decoded_reference, 0, True)
-    lag = results.correlation_lags[0]
-    print("using correlation", results, "with lag", lag)
-    time.sleep(5)
-
-    # Example usage
     param_dict = {
         'expander_attack_tau': {'min':DEFAULT_EXPANDER_ATTACK_TAU,'max':DEFAULT_EXPANDER_ATTACK_TAU,'step':1},
         'expander_release_tau': {'min':DEFAULT_EXPANDER_RELEASE_TAU,'max':DEFAULT_EXPANDER_RELEASE_TAU,'step':1},
@@ -518,7 +459,7 @@ def main() -> int:
 
                 for params in generator:
                     # Submit new task
-                    future = executor.submit(test_decode_params, params, decoded_raw, decoded_reference, lag)
+                    future = executor.submit(test_decode_params, params, decoded_raw, reference_fft)
                     futures.add(future)
 
                     # Keep the number of running futures under max_workers
@@ -534,8 +475,7 @@ def main() -> int:
                                 result.expander_weighting_db_per_octave, result.expander_weighting_bandwidth,
                                 result.deemphasis_tau_1, result.deemphasis_tau_2,
                                 result.deemphasis_db_per_octave, result.deemphasis_bandwidth,
-                                result.correlation_results[0],
-                                #result.correlation_results[1]
+                                result.correlation_results
                             ]
                             writer.writerow(row)
                             print(row)
@@ -550,8 +490,7 @@ def main() -> int:
                         result.expander_weighting_db_per_octave, result.expander_weighting_bandwidth,
                         result.deemphasis_tau_1, result.deemphasis_tau_2,
                         result.deemphasis_db_per_octave, result.deemphasis_bandwidth,
-                        result.correlation_results[0],
-                        #result.correlation_results[1]
+                        result.correlation_results
                     ]
                     writer.writerow(row)
                     print(row)
@@ -562,6 +501,8 @@ def main() -> int:
     in_raw_shm.unlink()
     in_reference_shm.close()
     in_reference_shm.unlink()
+    reference_fft_shm.close()
+    reference_fft_shm.unlink()
 
 
 if __name__ == "__main__":
