@@ -46,19 +46,21 @@ parser = argparse.ArgumentParser(
     description="Derives De-Emphasis and Expander settings for hifi-decode"
 )
 parser.add_argument(
-    "in_decoded",
-    metavar="in_decoded",
+    "-i",
     type=str,
     help="source decoded file",
-    nargs="?",
     default="",
 )
 parser.add_argument(
-    "in_reference",
-    metavar="in_reference",
+    "-r",
     type=str,
     help="source reference file",
-    nargs="?",
+    default="",
+)
+parser.add_argument(
+    "-o",
+    type=str,
+    help="output csv",
     default="",
 )
 parser.add_argument(
@@ -196,7 +198,6 @@ def decode_worker(in_file, conn):
 
     data, sample_rate = sf.read(in_file, dtype=decoded_dtype, always_2d=True)
     length = data.shape[0]
-    channels = data.shape[1]
 
     # create and manage the shared memory from the parent process
     conn.send((length, decoded_dtype))
@@ -425,7 +426,7 @@ def main() -> int:
     """
     args = parser.parse_args()
 
-    in_raw_shm, in_reference_shm, reference_fft_shm, decoded_raw, decoded_reference, reference_fft = decode_input_files(args.in_decoded, args.in_reference)
+    in_raw_shm, in_reference_shm, reference_fft_shm, decoded_raw, decoded_reference, reference_fft = decode_input_files(args.i, args.r)
 
     param_dict = {
         'expander_attack_tau': {'min':DEFAULT_EXPANDER_ATTACK_TAU,'max':DEFAULT_EXPANDER_ATTACK_TAU,'step':1},
@@ -435,13 +436,13 @@ def main() -> int:
         
         'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'step':1},
         'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1},
-        'expander_weighting_db_per_octave': {'min':1,'max':12,'step':0.5},
-        'expander_weighting_bandwidth': {'min':1,'max':4,'step':0.5},
+        'expander_weighting_db_per_octave': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,'step':1},
+        'expander_weighting_bandwidth': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,'step':1},
         
-        'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1,'step':1},
-        'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1},
-        'deemphasis_db_per_octave': {'min':1,'max':12,'step':0.5},
-        'deemphasis_bandwidth': {'min':1,'max':4,'step':0.5},
+        'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1-10e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1+10e-6,'step':1e-6},
+        'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2-50e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2+50e-6,'step':1e-6},
+        'deemphasis_db_per_octave': {'min':DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE,'max':DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE,'step':1},
+        'deemphasis_bandwidth': {'min':0.5,'max':4,'step':0.1},
     }
     
     # Generate results lazily
@@ -452,7 +453,7 @@ def main() -> int:
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = set()  # keep track of running futures
-        with open(args.in_reference + "_results.csv", mode='w', newline='') as csv_file:
+        with open(args.o, mode='w', newline='') as csv_file:
             try:
                 writer = csv.writer(csv_file)
                 writer.writerow([*CalibrateResult.keys, "correlation"])
