@@ -16,7 +16,6 @@ from multiprocessing import (
     resource_tracker,
     set_start_method
 )
-resource_tracker._resource_tracker._fd = None
 
 from multiprocessing.shared_memory import SharedMemory
 from concurrent.futures import ProcessPoolExecutor, as_completed, wait
@@ -194,7 +193,6 @@ class CalibrateSharedMemory():
         return shm, name
 
 def decode_worker(in_file, conn):
-    resource_tracker._resource_tracker._fd = None
     decoded_dtype = np.float32
 
     data, sample_rate = sf.read(in_file, dtype=decoded_dtype, always_2d=True)
@@ -279,7 +277,6 @@ def normalized_fft(audio):
 
 
 def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData, reference_fft: CalibrateAudioData):
-    resource_tracker._resource_tracker._fd = None
     decoded_raw_shm = CalibrateSharedMemory(decoded_raw)
     reference_fft_shm = CalibrateSharedMemory(reference_fft)
 
@@ -470,7 +467,7 @@ def main() -> int:
                         # Wait for at least one to complete
                         done, futures = wait(futures, return_when="FIRST_COMPLETED")
                         for f in done:
-                            result = f.result()                            
+                            result = f.result()
                             row = [
                                 result.expander_attack_tau, result.expander_release_tau,
                                 result.expander_gain, result.expander_ratio,
