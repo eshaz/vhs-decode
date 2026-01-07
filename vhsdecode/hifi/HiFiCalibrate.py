@@ -1,4 +1,3 @@
-
 import argparse
 
 from dataclasses import dataclass
@@ -17,6 +16,8 @@ from multiprocessing import (
     resource_tracker,
     set_start_method
 )
+resource_tracker._resource_tracker._fd = None
+
 from multiprocessing.shared_memory import SharedMemory
 from concurrent.futures import ProcessPoolExecutor, as_completed, wait
 
@@ -193,6 +194,7 @@ class CalibrateSharedMemory():
         return shm, name
 
 def decode_worker(in_file, conn):
+    resource_tracker._resource_tracker._fd = None
     decoded_dtype = np.float32
 
     data, sample_rate = sf.read(in_file, dtype=decoded_dtype, always_2d=True)
@@ -277,6 +279,7 @@ def normalized_fft(audio):
 
 
 def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData, reference_fft: CalibrateAudioData):
+    resource_tracker._resource_tracker._fd = None
     decoded_raw_shm = CalibrateSharedMemory(decoded_raw)
     reference_fft_shm = CalibrateSharedMemory(reference_fft)
 
@@ -425,8 +428,6 @@ def main() -> int:
     """
     args = parser.parse_args()
 
-    in_raw_shm, in_reference_shm, reference_fft_shm, decoded_raw, decoded_reference, reference_fft = decode_input_files(args.i, args.r)
-
     param_dict = {
         'expander_attack_tau': {'min':DEFAULT_EXPANDER_ATTACK_TAU,'max':DEFAULT_EXPANDER_ATTACK_TAU,'step':1},
         'expander_release_tau': {'min':DEFAULT_EXPANDER_RELEASE_TAU,'max':DEFAULT_EXPANDER_RELEASE_TAU,'step':1},
@@ -434,12 +435,12 @@ def main() -> int:
         'expander_ratio': {'min':DEFAULT_EXPANDER_RATIO,'max':DEFAULT_EXPANDER_RATIO,'step':1},
         
         'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1-150e-6,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1+150e-6,'step':1e-5},
-        'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2-50e-6,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2+50e-6,'step':1e-5},
+        'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2-50e-6,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2+50e-6,'step':1e-6},
         'expander_weighting_db_per_octave': {'min':1,'max':12,'step':1},
         'expander_weighting_bandwidth': {'min':0.5,'max':3.5,'step':0.2},
         
         'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1-150e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1+150e-6,'step':1e-5},
-        'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2-50e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2+50e-6,'step':1e-5},
+        'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2-50e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2+50e-6,'step':1e-6},
         'deemphasis_db_per_octave': {'min':1,'max':12,'step':1},
         'deemphasis_bandwidth': {'min':0.5,'max':3.5,'step':0.2},
     }
@@ -454,6 +455,8 @@ def main() -> int:
         futures = set()  # keep track of running futures
         with open(args.o, mode='w', newline='') as csv_file:
             try:
+                in_raw_shm, in_reference_shm, reference_fft_shm, decoded_raw, decoded_reference, reference_fft = decode_input_files(args.i, args.r)
+
                 writer = csv.writer(csv_file)
                 writer.writerow([*CalibrateResult.keys, "correlation"])
 
@@ -507,12 +510,12 @@ def main() -> int:
             finally:
                 csv_file.close()
 
-    in_raw_shm.close()
-    in_raw_shm.unlink()
-    in_reference_shm.close()
-    in_reference_shm.unlink()
-    reference_fft_shm.close()
-    reference_fft_shm.unlink()
+                in_raw_shm.close()
+                in_raw_shm.unlink()
+                in_reference_shm.close()
+                in_reference_shm.unlink()
+                reference_fft_shm.close()
+                reference_fft_shm.unlink()
 
 
 if __name__ == "__main__":
