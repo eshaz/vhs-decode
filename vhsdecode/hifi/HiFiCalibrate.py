@@ -242,12 +242,16 @@ def decode_input_files(in_raw, in_reference):
     reference_fft_data = normalized_fft(decoded_reference_shm.audio)
     decoded_reference_shm.close()
 
+    eps = 1e-12
+    H_ref_mag = np.abs(reference_fft_data)
+    H_ref_db  = 20 * np.log10(H_ref_mag + eps)
+
     reference_fft_shm, reference_fft_shm_name = CalibrateSharedMemory.create_shared_memory("hifi-ref-fft", len(reference_fft_data), np.dtype(reference_fft_data.dtype).itemsize)
     reference_fft = CalibrateAudioData(reference_fft_shm_name, len(reference_fft_data), decoded_reference.sample_rate, np.dtype(reference_fft_data.dtype))
 
     # copy to shared memory
     reference_fft_instance = CalibrateSharedMemory(reference_fft)
-    np.copyto(reference_fft_instance.audio, reference_fft_data)
+    np.copyto(reference_fft_instance.audio, H_ref_db)
     reference_fft_instance.close()
 
     return (
@@ -322,23 +326,32 @@ def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData,
     # similarity = correlate(processed_fft_data, reference_fft_data)
     # similarity = scipy.stats.spearmanr(processed_fft_data, reference_fft_data).statistic
     # similarity = np.corrcoef(processed_fft_data, reference_fft_data)
-    
+
     # take magnitudes
     H_test_mag = np.abs(processed_fft_data)
-    H_ref_mag  = np.abs(reference_fft_data)
-
     # convert to dB
     eps = 1e-12
     H_test_db = 20 * np.log10(H_test_mag + eps)
-    H_ref_db  = 20 * np.log10(H_ref_mag + eps)
+
+
+    H_ref_db  = reference_fft_data
 
     # frequency response error
     delta_db = H_test_db - H_ref_db
+    # delta_db -= np.mean(delta_db)
+
     rms_err_db = np.sqrt(np.mean(delta_db**2))
     max_err_db = np.max(np.abs(delta_db))
 
-    # optional shape similarity (cosine of magnitudes)
-    cos_sim = np.dot(H_test_mag, H_ref_mag) / (np.linalg.norm(H_test_mag) * np.linalg.norm(H_ref_mag))
+    # remove constant gain offset
+    a = H_ref_db - np.mean(H_ref_db)
+    b = H_test_db - np.mean(H_test_db)
+
+    # normalize energy (L2 norm)
+    a /= np.linalg.norm(a) + 1e-12
+    b /= np.linalg.norm(b) + 1e-12
+
+    cos_sim = np.dot(a, b)
 
     # store metrics
     params.similarity = cos_sim
@@ -446,13 +459,13 @@ def main() -> int:
         
         'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'step':1},
         'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1},
-        'expander_weighting_db_per_octave': {'min':3,'max':16,'step':0.01},
-        'expander_weighting_bandwidth': {'min':1,'max':10,'step':0.01},
+        'expander_weighting_db_per_octave': {'min':1,'max':24,'step':0.25},
+        'expander_weighting_bandwidth': {'min':1,'max':8,'step':0.25},
         
         'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1,'step':1},
         'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1},
-        'deemphasis_db_per_octave': {'min':14,'max':15.8,'step':0.01},
-        'deemphasis_bandwidth': {'min':2.1,'max':3,'step':0.01},
+        'deemphasis_db_per_octave': {'min':1,'max':24,'step':0.25},
+        'deemphasis_bandwidth': {'min':1,'max':8,'step':0.25},
     }
 
     """
@@ -461,6 +474,26 @@ def main() -> int:
     new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 32, 2.68, 0.00024, 5.6e-05, 14.49, 2.34, 0.7167661, 94.8412, 15.258411]
     new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 32, 2.68, 0.00024, 5.6e-05, 15.4, 2.67, 0.7885715, 100.04376, 14.311878]
     new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 32, 2.68, 0.00024, 5.6e-05, 20.55, 3.09, 0.75515014, 103.46473, 14.833586]
+
+    deemphasis and expander:
+    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 29.9, 6.0, 0.00024, 5.6e-05, 15.4, 2.6, 0.78755075, 100.44622, 23.149506]
+    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 30.0, 6.0, 0.00024, 5.6e-05, 15.3, 2.6, 0.7875623, 98.64277, 23.194862]
+    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 30.0, 6.0, 0.00024, 5.6e-05, 15.4, 2.6, 0.7875679, 136.85533, 23.212336]
+
+new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 24.0, 7.9, 0.00024, 5.6e-05, 15.8, 2.8, 0.73466116, 100.15155, 19.298277]
+new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 24.0, 7.9, 0.00024, 5.6e-05, 15.8, 2.9, 0.7347299, 146.36797, 19.27369]
+new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 24.0, 8.0, 0.00024, 5.6e-05, 15.8, 2.9, 0.7349093, 117.08368, 19.24919]
+
+new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 24.1, 6.99, 0.00024, 5.6e-05, 15.6, 2.6, 0.7234483, 103.76543, 18.310453]
+new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 24.1, 6.99, 0.00024, 5.6e-05, 15.7, 2.6, 0.72344977, 102.61793, 18.341627]
+new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 24.1, 6.99, 0.00024, 5.6e-05, 15.8, 2.6, 0.7234518, 102.2462, 18.38228]
+
+
+new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 29.2, 7.34, 0.00024, 5.6e-05, 15.7, 2.6, 0.723926, 102.550026, 20.264286]
+new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 29.2, 7.34, 0.00024, 5.6e-05, 15.8, 2.6, 0.7239294, 108.4939, 20.278065]
+new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 29.3, 7.35, 0.00024, 5.6e-05, 15.8, 2.6, 0.72393125, 106.816055, 20.32768]
+
+
 """
     
     # Generate results lazily
