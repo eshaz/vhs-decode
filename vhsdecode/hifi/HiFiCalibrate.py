@@ -100,7 +100,9 @@ class CalibrateResult():
     deemphasis_tau_2: float
     deemphasis_db_per_octave: float
     deemphasis_bandwidth: float
-    correlation: float
+    similarity: float
+    max_gain_error: float
+    rms_error: float
 
     keys = [
         'expander_attack_tau',
@@ -114,7 +116,7 @@ class CalibrateResult():
         'deemphasis_tau_1',
         'deemphasis_tau_2',
         'deemphasis_db_per_octave',
-        'deemphasis_bandwidth'
+        'deemphasis_bandwidth',
     ]
 
     def __init__(self,
@@ -268,10 +270,10 @@ def correlate(decoded_processed_channel, decoded_reference_channel):
     return np.corrcoef(decoded_processed_channel, decoded_reference_channel)[0, 1]
 
 def normalized_fft(audio):
-    window = np.hanning(len(audio)).astype(np.float32, copy=False)
-    fft = scipy.fft.rfft(audio * window).real
-    # fft_abs = np.abs(fft)
-    # fft_norm = fft / np.max(fft_abs)
+    # window = np.hanning(len(audio)).astype(np.float32, copy=False)
+    fft = scipy.fft.rfft(audio).real
+    #fft_abs = np.abs(fft)
+    #fft_norm = fft / np.max(fft_abs)
 
     return fft
 
@@ -307,20 +309,41 @@ def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData,
 
     deemphasis.process(decoded_processed_channel)
     # prime expander
-    expander.process(
-        decoded_raw_channel[:decoded_raw.sample_rate],
-        np.copy(decoded_processed_channel[:decoded_raw.sample_rate])
-    )
-    expander.process(
-        decoded_raw_channel,
-        decoded_processed_channel
-    )
+    #expander.process(
+    #    decoded_raw_channel[:decoded_raw.sample_rate],
+    #    np.copy(decoded_processed_channel[:decoded_raw.sample_rate])
+    #)
+    #expander.process(
+    #    decoded_raw_channel,
+    #    decoded_processed_channel
+    #)
 
     processed_fft_data = normalized_fft(decoded_processed_channel)
     # similarity = correlate(processed_fft_data, reference_fft_data)
-    similarity = np.corrcoef(processed_fft_data, reference_fft_data)[0, 1]
+    # similarity = scipy.stats.spearmanr(processed_fft_data, reference_fft_data).statistic
+    # similarity = np.corrcoef(processed_fft_data, reference_fft_data)
+    
+    # take magnitudes
+    H_test_mag = np.abs(processed_fft_data)
+    H_ref_mag  = np.abs(reference_fft_data)
 
-    params.correlation = similarity
+    # convert to dB
+    eps = 1e-12
+    H_test_db = 20 * np.log10(H_test_mag + eps)
+    H_ref_db  = 20 * np.log10(H_ref_mag + eps)
+
+    # frequency response error
+    delta_db = H_test_db - H_ref_db
+    rms_err_db = np.sqrt(np.mean(delta_db**2))
+    max_err_db = np.max(np.abs(delta_db))
+
+    # optional shape similarity (cosine of magnitudes)
+    cos_sim = np.dot(H_test_mag, H_ref_mag) / (np.linalg.norm(H_test_mag) * np.linalg.norm(H_ref_mag))
+
+    # store metrics
+    params.similarity = cos_sim
+    params.max_gain_error = max_err_db
+    params.rms_error = rms_err_db
 
     decoded_raw_shm.close()
     reference_fft_shm.close()
@@ -338,22 +361,12 @@ def partial_filter(combo):
     combo: list of floats for the first N parameters
     Returns True if this partial combination could still be valid
     """
-    # combo[0]: ea_tau, combo[1]: er_tau
-    if len(combo) >= 2 and combo[0] >= combo[1]:
-        return False
-    
     # combo[4]: ew_tau1, combo[5]: ew_tau2
     if len(combo) >= 6 and combo[4] <= combo[5]:
         return False
     
     # combo[8]: d_tau1, combo[9]: d_tau2
     if len(combo) >= 10 and combo[8] <= combo[9]:
-        return False
-    
-    # combo[7]: ew_bw, combo[11]: d_bw
-    if len(combo) >= 8 and combo[7] <= 0:
-        return False
-    if len(combo) >= 12 and combo[11] <= 0:
         return False
     return True
 
@@ -432,21 +445,21 @@ def main() -> int:
         'expander_ratio': {'min':DEFAULT_EXPANDER_RATIO,'max':DEFAULT_EXPANDER_RATIO,'step':1},
         
         'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'step':1},
-        'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1e-7},
-        'expander_weighting_db_per_octave': {'min':6,'max':6,'step':1},
-        'expander_weighting_bandwidth': {'min':1,'max':1,'step':1},
+        'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1},
+        'expander_weighting_db_per_octave': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,'step':1},
+        'expander_weighting_bandwidth': {'min':DEFAULT_VHS_DEEMPHASIS_BANDWIDTH,'max':DEFAULT_VHS_DEEMPHASIS_BANDWIDTH,'step':1},
         
         'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1,'step':1},
-        'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1e-7},
-        'deemphasis_db_per_octave': {'min':6,'max':6,'step':1},
-        'deemphasis_bandwidth': {'min':1,'max':1,'step':1},
+        'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1},
+        'deemphasis_db_per_octave': {'min':3,'max':32,'step':0.01},
+        'deemphasis_bandwidth': {'min':1,'max':16,'step':0.01},
     }
     
     # Generate results lazily
     ranges = get_ranges(param_dict)
     generator = recursive_generate(ranges)
     max_workers = args.threads
-    best_correlation = -1
+    best_similarity = -1
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = set()  # keep track of running futures
@@ -455,7 +468,9 @@ def main() -> int:
                 in_raw_shm, in_reference_shm, reference_fft_shm, decoded_raw, decoded_reference, reference_fft = decode_input_files(args.i, args.r)
 
                 writer = csv.writer(csv_file)
-                writer.writerow([*CalibrateResult.keys, "correlation"])
+                writer.writerow([*CalibrateResult.keys, "similarity"])
+                writer.writerow([*CalibrateResult.keys, "max_gain_error"])
+                writer.writerow([*CalibrateResult.keys, "rms_error"])
 
                 for params in generator:
                     # Submit new task
@@ -475,13 +490,13 @@ def main() -> int:
                                 result.expander_weighting_db_per_octave, result.expander_weighting_bandwidth,
                                 result.deemphasis_tau_1, result.deemphasis_tau_2,
                                 result.deemphasis_db_per_octave, result.deemphasis_bandwidth,
-                                result.correlation
+                                result.similarity, result.max_gain_error, result.rms_error
                             ]
                             writer.writerow(row)
 
-                            if result.correlation > best_correlation:
+                            if result.similarity > best_similarity:
                                 print("new best result", row)
-                                best_correlation = result.correlation
+                                best_similarity = result.similarity
                             else:
                                 print(row, end="\r")
 
@@ -495,13 +510,13 @@ def main() -> int:
                         result.expander_weighting_db_per_octave, result.expander_weighting_bandwidth,
                         result.deemphasis_tau_1, result.deemphasis_tau_2,
                         result.deemphasis_db_per_octave, result.deemphasis_bandwidth,
-                        result.correlation
+                        result.similarity, result.max_gain_error, result.rms_error
                     ]
                     writer.writerow(row)
 
-                    if result.correlation > best_correlation:
+                    if result.similarity > best_similarity:
                         print("new best result", row)
-                        best_correlation = result.correlation
+                        best_similarity = result.similarity
                     else:
                         print(row, end="\r")
             finally:
