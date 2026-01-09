@@ -309,14 +309,14 @@ def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData,
 
     deemphasis.process(decoded_processed_channel)
     # prime expander
-    #expander.process(
-    #    decoded_raw_channel[:decoded_raw.sample_rate],
-    #    np.copy(decoded_processed_channel[:decoded_raw.sample_rate])
-    #)
-    #expander.process(
-    #    decoded_raw_channel,
-    #    decoded_processed_channel
-    #)
+    expander.process(
+        decoded_raw_channel[:decoded_raw.sample_rate],
+        np.copy(decoded_processed_channel[:decoded_raw.sample_rate])
+    )
+    expander.process(
+        decoded_raw_channel,
+        decoded_processed_channel
+    )
 
     processed_fft_data = normalized_fft(decoded_processed_channel)
     # similarity = correlate(processed_fft_data, reference_fft_data)
@@ -446,14 +446,22 @@ def main() -> int:
         
         'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'step':1},
         'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1},
-        'expander_weighting_db_per_octave': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,'step':1},
-        'expander_weighting_bandwidth': {'min':DEFAULT_VHS_DEEMPHASIS_BANDWIDTH,'max':DEFAULT_VHS_DEEMPHASIS_BANDWIDTH,'step':1},
+        'expander_weighting_db_per_octave': {'min':3,'max':24,'step':0.01},
+        'expander_weighting_bandwidth': {'min':1,'max':8,'step':0.01},
         
         'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1,'step':1},
         'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1},
-        'deemphasis_db_per_octave': {'min':3,'max':32,'step':0.01},
-        'deemphasis_bandwidth': {'min':1,'max':16,'step':0.01},
+        'deemphasis_db_per_octave': {'min':14,'max':16,'step':0.01},
+        'deemphasis_bandwidth': {'min':2.1,'max':3.5,'step':0.01},
     }
+
+    """
+    deemphasis only:
+    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 32, 0.46, 0.00024, 5.6e-05, 15.38, 2.68, 0.7885714, 89.23813, 14.305316]
+    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 32, 2.68, 0.00024, 5.6e-05, 14.49, 2.34, 0.7167661, 94.8412, 15.258411]
+    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 32, 2.68, 0.00024, 5.6e-05, 15.4, 2.67, 0.7885715, 100.04376, 14.311878]
+    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 32, 2.68, 0.00024, 5.6e-05, 20.55, 3.09, 0.75515014, 103.46473, 14.833586]
+"""
     
     # Generate results lazily
     ranges = get_ranges(param_dict)
