@@ -58,13 +58,13 @@ DEFAULT_EXPANDER_RELEASE_TAU = 70e-3
 
 # High shelf filter filter for weighted input to expander
 DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1 = 240e-6
-DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 = 64e-6
-DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE = 6
+DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 = 24e-6
+DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE = 12
 DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH = 2.58
 
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1 = 5.5e-5
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2 = 2.35e-5
-DEFAULT_8MM_EXPANDER_WEIGHTING_DB_PER_OCTAVE = 6
+DEFAULT_8MM_EXPANDER_WEIGHTING_DB_PER_OCTAVE = 12
 DEFAULT_8MM_EXPANDER_WEIGHTING_BANDWIDTH = 2.4
 
 # Low shelf filter for deemphasis
@@ -834,7 +834,54 @@ class DCBlocker:
 
     def process(self, audio):
         self.prev_x, self.prev_y = DCBlocker.dc_block(audio, self.prev_x, self.prev_y, self.R)
-        
+
+def inverting_shelving_biquad(
+    fs,
+    f0,
+    gain_db,
+    shelf_type="low",
+    S=1.0
+):
+    """
+    Two-pole inverting shelving filter (RBJ analog-equivalent)
+
+    shelf_type: "low" or "high"
+    """
+
+    A = 10**(gain_db / 40.0)
+    w0 = 2 * np.pi * f0 / fs
+    sin_w0 = np.sin(w0)
+    cos_w0 = np.cos(w0)
+
+    alpha = sin_w0 / 2 * np.sqrt((A + 1/A) * (1/S - 1) + 2)
+
+    if shelf_type == "low":
+        b0 =    A*((A+1) - (A-1)*cos_w0 + 2*np.sqrt(A)*alpha)
+        b1 =  2*A*((A-1) - (A+1)*cos_w0)
+        b2 =    A*((A+1) - (A-1)*cos_w0 - 2*np.sqrt(A)*alpha)
+        a0 =        (A+1) + (A-1)*cos_w0 + 2*np.sqrt(A)*alpha
+        a1 =   -2*((A-1) + (A+1)*cos_w0)
+        a2 =        (A+1) + (A-1)*cos_w0 - 2*np.sqrt(A)*alpha
+
+    elif shelf_type == "high":
+        b0 =    A*((A+1) + (A-1)*cos_w0 + 2*np.sqrt(A)*alpha)
+        b1 = -2*A*((A-1) + (A+1)*cos_w0)
+        b2 =    A*((A+1) + (A-1)*cos_w0 - 2*np.sqrt(A)*alpha)
+        a0 =        (A+1) - (A-1)*cos_w0 + 2*np.sqrt(A)*alpha
+        a1 =    2*((A-1) - (A+1)*cos_w0)
+        a2 =        (A+1) - (A-1)*cos_w0 - 2*np.sqrt(A)*alpha
+
+    else:
+        raise ValueError("shelf_type must be 'low' or 'high'")
+
+    # Normalize
+    b = np.array([b0, b1, b2]) / a0
+    a = np.array([1.0, a1/a0, a2/a0])
+
+    # Inverting op-amp behavior
+    b *= -1.0
+
+    return b, a
 
 class Deemphasis:
     def __init__(
@@ -853,13 +900,11 @@ class Deemphasis:
         self.deemphasis_db_per_octave = deemphasis_db_per_octave
         self.deemphasis_bandwidth = deemphasis_bandwidth
 
-        self.deemph_b, self.deemph_a = build_shelf_filter(
-            "low",
+        self.deemph_b, self.deemph_a = inverting_shelving_biquad(
             self.deemphasis_T1,
             self.deemphasis_T2,
             self.deemphasis_db_per_octave,
-            self.deemphasis_bandwidth,
-            self.audio_rate,
+            "low",
         )
 
         self.DeemphasisLowpass = FiltersClass(np.array(self.deemph_b), np.array(self.deemph_a))
@@ -943,13 +988,11 @@ class Expander:
         self.weighting_db_per_octave = weighting_db_per_octave
         self.weighting_bandwidth = weighting_bandwidth
 
-        self.env_iirb, self.env_iira = build_shelf_filter(
-            "high",
+        self.env_iirb, self.env_iira = inverting_shelving_biquad(
             self.weighting_T1,
             self.weighting_T2,
             self.weighting_db_per_octave,
-            self.weighting_bandwidth,
-            self.audio_rate,
+            "high"
         )
 
         self.WeightedHighpass = FiltersClass(np.array(self.env_iirb), np.array(self.env_iira), dtype=np.float32)

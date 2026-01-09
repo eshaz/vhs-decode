@@ -431,15 +431,15 @@ def main() -> int:
         'expander_gain': {'min':DEFAULT_EXPANDER_GAIN,'max':DEFAULT_EXPANDER_GAIN,'step':1},
         'expander_ratio': {'min':DEFAULT_EXPANDER_RATIO,'max':DEFAULT_EXPANDER_RATIO,'step':1},
         
-        'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1-150e-6,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1+150e-6,'step':5e-5},
-        'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2-50e-6,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2+50e-6,'step':5e-6},
+        'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'step':1},
+        'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1e-7},
         'expander_weighting_db_per_octave': {'min':6,'max':6,'step':1},
-        'expander_weighting_bandwidth': {'min':0.5,'max':3.5,'step':0.2},
+        'expander_weighting_bandwidth': {'min':1,'max':1,'step':1},
         
-        'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1-150e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1+150e-6,'step':5e-5},
-        'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2-50e-6,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2+50e-6,'step':5e-6},
+        'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1,'step':1},
+        'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1e-7},
         'deemphasis_db_per_octave': {'min':6,'max':6,'step':1},
-        'deemphasis_bandwidth': {'min':0.5,'max':3.5,'step':0.2},
+        'deemphasis_bandwidth': {'min':1,'max':1,'step':1},
     }
     
     # Generate results lazily
