@@ -473,7 +473,7 @@ def main() -> int:
         
         'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1,'step':1},
         'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1},
-        'deemphasis_db_per_octave': {'min':12,'max':32,'step':0.25},
+        'deemphasis_db_per_octave': {'min':12,'max':40,'step':0.25},
         'deemphasis_bandwidth': {'min':1,'max':8,'step':0.25},
     }
 
