@@ -523,9 +523,7 @@ new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 29.3, 7.35, 0.00024, 5.6e
                 in_raw_shm, in_reference_shm, reference_fft_shm, decoded_raw, decoded_reference, reference_fft = decode_input_files(args.i, args.r)
 
                 writer = csv.writer(csv_file)
-                writer.writerow([*CalibrateResult.keys, "similarity"])
-                writer.writerow([*CalibrateResult.keys, "max_gain_error"])
-                writer.writerow([*CalibrateResult.keys, "rms_error"])
+                writer.writerow([*CalibrateResult.keys, "similarity", "max_gain_error", "rms_error"])
 
                 for params in generator:
                     # Submit new task
