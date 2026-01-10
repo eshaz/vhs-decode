@@ -238,20 +238,24 @@ def decode_input_files(in_raw, in_reference):
     in_reference_process.join()
 
     # get the fft for the reference data
+    decoded_raw_shm = CalibrateSharedMemory(decoded_raw)
     decoded_reference_shm = CalibrateSharedMemory(decoded_reference)
-    reference_fft_data = normalized_fft(decoded_reference_shm.audio)
+
+    _, H_ref = estimate_transfer_function(
+        decoded_raw_shm.audio,
+        decoded_reference_shm.audio,
+        fs=decoded_raw.sample_rate,
+    )
+
+    decoded_raw_shm.close()
     decoded_reference_shm.close()
 
-    eps = 1e-12
-    H_ref_mag = np.abs(reference_fft_data)
-    H_ref_db  = 20 * np.log10(H_ref_mag + eps)
-
-    reference_fft_shm, reference_fft_shm_name = CalibrateSharedMemory.create_shared_memory("hifi-ref-fft", len(reference_fft_data), np.dtype(reference_fft_data.dtype).itemsize)
-    reference_fft = CalibrateAudioData(reference_fft_shm_name, len(reference_fft_data), decoded_reference.sample_rate, np.dtype(reference_fft_data.dtype))
+    reference_fft_shm, reference_fft_shm_name = CalibrateSharedMemory.create_shared_memory("hifi-ref-fft", len(H_ref), np.dtype(H_ref.dtype).itemsize)
+    reference_fft = CalibrateAudioData(reference_fft_shm_name, len(H_ref), decoded_reference.sample_rate, np.dtype(H_ref.dtype))
 
     # copy to shared memory
     reference_fft_instance = CalibrateSharedMemory(reference_fft)
-    np.copyto(reference_fft_instance.audio, H_ref_db)
+    np.copyto(reference_fft_instance.audio, H_ref)
     reference_fft_instance.close()
 
     return (
@@ -281,13 +285,21 @@ def normalized_fft(audio):
 
     return fft
 
+def estimate_transfer_function(x, y, fs, nperseg=2048):
+    eps = 1e-12
+
+    f, Pxy = scipy.signal.csd(y, x, fs=fs, nperseg=nperseg)
+    _, Pxx = scipy.signal.csd(x, x, fs=fs, nperseg=nperseg)
+
+    H = Pxy / (Pxx + eps)
+    return f, H
+
 
 def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData, reference_fft: CalibrateAudioData):
     decoded_raw_shm = CalibrateSharedMemory(decoded_raw)
     reference_fft_shm = CalibrateSharedMemory(reference_fft)
 
     decoded_raw_channel = decoded_raw_shm.audio
-    reference_fft_data = reference_fft_shm.audio
 
     decoded_processed_channel = decoded_raw_channel.copy()
 
@@ -322,19 +334,16 @@ def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData,
         decoded_processed_channel
     )
 
-    processed_fft_data = normalized_fft(decoded_processed_channel)
-    # similarity = correlate(processed_fft_data, reference_fft_data)
-    # similarity = scipy.stats.spearmanr(processed_fft_data, reference_fft_data).statistic
-    # similarity = np.corrcoef(processed_fft_data, reference_fft_data)
+    H_ref = reference_fft_shm.audio
+    f, H_test = estimate_transfer_function(
+        decoded_raw_channel,
+        decoded_processed_channel,
+        fs=decoded_raw.sample_rate,
+    )
 
-    # take magnitudes
-    H_test_mag = np.abs(processed_fft_data)
-    # convert to dB
     eps = 1e-12
-    H_test_db = 20 * np.log10(H_test_mag + eps)
-
-
-    H_ref_db  = reference_fft_data
+    H_ref_db  = 20 * np.log10(np.abs(H_ref)  + eps)
+    H_test_db = 20 * np.log10(np.abs(H_test) + eps)
 
     # frequency response error
     delta_db = H_test_db - H_ref_db
@@ -459,16 +468,21 @@ def main() -> int:
         
         'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'step':1},
         'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1},
-        'expander_weighting_db_per_octave': {'min':1,'max':24,'step':0.25},
-        'expander_weighting_bandwidth': {'min':1,'max':8,'step':0.25},
+        'expander_weighting_db_per_octave': {'min':8,'max':24,'step':0.25},
+        'expander_weighting_bandwidth': {'min':0.25,'max':8,'step':0.25},
         
         'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1,'step':1},
         'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1},
-        'deemphasis_db_per_octave': {'min':1,'max':24,'step':0.25},
+        'deemphasis_db_per_octave': {'min':12,'max':32,'step':0.25},
         'deemphasis_bandwidth': {'min':1,'max':8,'step':0.25},
     }
 
     """
+    new results (partial):
+    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 11.0, 6.0, 0.00024, 5.6e-05, 10.0, 3.0, 0.63313395, 88.29607, 13.457938]
+
+    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 18.25, 1.25, 0.00024, 5.6e-05, 2.0, 2.75, 0.6674597, 96.63332, 15.742964]
+
     deemphasis only:
     new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 32, 0.46, 0.00024, 5.6e-05, 15.38, 2.68, 0.7885714, 89.23813, 14.305316]
     new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 32, 2.68, 0.00024, 5.6e-05, 14.49, 2.34, 0.7167661, 94.8412, 15.258411]
