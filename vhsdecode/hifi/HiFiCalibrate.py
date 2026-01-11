@@ -345,6 +345,10 @@ def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData,
     H_ref_db  = 20 * np.log10(np.abs(H_ref)  + eps)
     H_test_db = 20 * np.log10(np.abs(H_test) + eps)
 
+    band = (f >= 30) & (f <= 18_000)
+    H_ref_db  = H_ref_db[band]
+    H_test_db = H_test_db[band]
+
     # frequency response error
     delta_db = H_test_db - H_ref_db
     # delta_db -= np.mean(delta_db)
@@ -468,44 +472,22 @@ def main() -> int:
         
         'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'step':1},
         'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1},
-        'expander_weighting_db_per_octave': {'min':8,'max':24,'step':0.25},
-        'expander_weighting_bandwidth': {'min':0.25,'max':8,'step':0.25},
+        'expander_weighting_db_per_octave': {'min':18,'max':24,'step':0.1},
+        'expander_weighting_bandwidth': {'min':2,'max':6,'step':0.1},
         
         'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1,'step':1},
         'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1},
-        'deemphasis_db_per_octave': {'min':12,'max':40,'step':0.25},
-        'deemphasis_bandwidth': {'min':1,'max':8,'step':0.25},
+        'deemphasis_db_per_octave': {'min':12,'max':18,'step':0.1},
+        'deemphasis_bandwidth': {'min':2,'max':3,'step':0.1},
     }
 
     """
-    new results (partial):
-    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 11.0, 6.0, 0.00024, 5.6e-05, 10.0, 3.0, 0.63313395, 88.29607, 13.457938]
-
-    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 18.25, 1.25, 0.00024, 5.6e-05, 2.0, 2.75, 0.6674597, 96.63332, 15.742964]
-
-    deemphasis only:
-    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 32, 0.46, 0.00024, 5.6e-05, 15.38, 2.68, 0.7885714, 89.23813, 14.305316]
-    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 32, 2.68, 0.00024, 5.6e-05, 14.49, 2.34, 0.7167661, 94.8412, 15.258411]
-    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 32, 2.68, 0.00024, 5.6e-05, 15.4, 2.67, 0.7885715, 100.04376, 14.311878]
-    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 32, 2.68, 0.00024, 5.6e-05, 20.55, 3.09, 0.75515014, 103.46473, 14.833586]
-
-    deemphasis and expander:
-    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 29.9, 6.0, 0.00024, 5.6e-05, 15.4, 2.6, 0.78755075, 100.44622, 23.149506]
-    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 30.0, 6.0, 0.00024, 5.6e-05, 15.3, 2.6, 0.7875623, 98.64277, 23.194862]
-    new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 30.0, 6.0, 0.00024, 5.6e-05, 15.4, 2.6, 0.7875679, 136.85533, 23.212336]
-
-new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 24.0, 7.9, 0.00024, 5.6e-05, 15.8, 2.8, 0.73466116, 100.15155, 19.298277]
-new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 24.0, 7.9, 0.00024, 5.6e-05, 15.8, 2.9, 0.7347299, 146.36797, 19.27369]
-new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 24.0, 8.0, 0.00024, 5.6e-05, 15.8, 2.9, 0.7349093, 117.08368, 19.24919]
-
-new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 24.1, 6.99, 0.00024, 5.6e-05, 15.6, 2.6, 0.7234483, 103.76543, 18.310453]
-new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 24.1, 6.99, 0.00024, 5.6e-05, 15.7, 2.6, 0.72344977, 102.61793, 18.341627]
-new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 24.1, 6.99, 0.00024, 5.6e-05, 15.8, 2.6, 0.7234518, 102.2462, 18.38228]
+deemphasis only
+new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 1, 1, 0.00024, 5.6e-05, 16.67, 2.83, 0.69214654, 34.870113, 6.066402]
+new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 1, 1, 0.00024, 5.6e-05, 16.615, 2.833, 0.6921458, 34.925102, 6.0662746]
 
 
-new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 29.2, 7.34, 0.00024, 5.6e-05, 15.7, 2.6, 0.723926, 102.550026, 20.264286]
-new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 29.2, 7.34, 0.00024, 5.6e-05, 15.8, 2.6, 0.7239294, 108.4939, 20.278065]
-new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 29.3, 7.35, 0.00024, 5.6e-05, 15.8, 2.6, 0.72393125, 106.816055, 20.32768]
+
 
 
 """
@@ -515,6 +497,7 @@ new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 29.3, 7.35, 0.00024, 5.6e
     generator = recursive_generate(ranges)
     max_workers = args.threads
     best_similarity = -1
+    best_rms_error = np.inf
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = set()  # keep track of running futures
@@ -545,11 +528,15 @@ new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 29.3, 7.35, 0.00024, 5.6e
                                 result.deemphasis_db_per_octave, result.deemphasis_bandwidth,
                                 result.similarity, result.max_gain_error, result.rms_error
                             ]
-                            writer.writerow(row)
 
-                            if result.similarity > best_similarity:
+                            if result.similarity >= best_similarity or result.rms_error <= best_rms_error:
                                 print("new best result", row)
-                                best_similarity = result.similarity
+
+                                writer.writerow(row)
+                                if result.similarity >= best_similarity:
+                                    best_similarity = result.similarity
+                                if result.rms_error <= best_rms_error:
+                                    best_rms_error = result.rms_error
                             else:
                                 print(row, end="\r")
 
@@ -565,11 +552,15 @@ new best result [0.005, 0.07, 20, 2, 0.00024, 2.4e-05, 29.3, 7.35, 0.00024, 5.6e
                         result.deemphasis_db_per_octave, result.deemphasis_bandwidth,
                         result.similarity, result.max_gain_error, result.rms_error
                     ]
-                    writer.writerow(row)
 
-                    if result.similarity > best_similarity:
+                    if result.similarity >= best_similarity or result.rms_error <= best_rms_error:
                         print("new best result", row)
-                        best_similarity = result.similarity
+
+                        writer.writerow(row)
+                        if result.similarity >= best_similarity:
+                            best_similarity = result.similarity
+                        if result.rms_error <= best_rms_error:
+                            best_rms_error = result.rms_error
                     else:
                         print(row, end="\r")
             finally:
