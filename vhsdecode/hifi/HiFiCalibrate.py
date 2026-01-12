@@ -472,13 +472,13 @@ def main() -> int:
         
         'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'step':1},
         'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1},
-        'expander_weighting_db_per_octave': {'min':20,'max':24,'step':0.1},
-        'expander_weighting_bandwidth': {'min':2,'max':6,'step':0.1},
+        'expander_weighting_db_per_octave': {'min':28,'max':28,'step':0.1},
+        'expander_weighting_bandwidth': {'min':4,'max':6,'step':0.1},
         
         'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1,'step':1},
         'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1},
-        'deemphasis_db_per_octave': {'min':15,'max':17,'step':0.1},
-        'deemphasis_bandwidth': {'min':2,'max':3,'step':0.1},
+        'deemphasis_db_per_octave': {'min':15.2,'max':16.8,'step':0.1},
+        'deemphasis_bandwidth': {'min':3,'max':5,'step':0.1},
     }
 
     """
