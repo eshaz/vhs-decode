@@ -29,7 +29,8 @@ from scipy.signal import (
     istft,
     fftconvolve,
     find_peaks,
-    freqz
+    freqz,
+    bilinear
 )
 from scipy.interpolate import interp1d
 from soxr import ResampleStream, resample
@@ -56,11 +57,11 @@ DEFAULT_EXPANDER_RELEASE_TAU = 70e-3
 # TAU_2         high end of shelf curve
 # DB_PER_OCTAVE slope of the filter
 
-# High shelf filter filter for weighted input to expander
+# High shelf filter for weighted input to expander
 DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1 = 240e-6
-DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 = 24e-6
-DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE = 21.97
-DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH = 4.58
+DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 = 56e-6 #24e-6
+DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE = 1
+DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH = 0.89
 
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1 = 5.5e-5
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2 = 2.35e-5
@@ -70,8 +71,8 @@ DEFAULT_8MM_EXPANDER_WEIGHTING_BANDWIDTH = 2.4
 # Low shelf filter for deemphasis
 DEFAULT_VHS_DEEMPHASIS_TAU_1 = 240e-6
 DEFAULT_VHS_DEEMPHASIS_TAU_2 = 56e-6
-DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE = 16.615
-DEFAULT_VHS_DEEMPHASIS_BANDWIDTH = 2.833
+DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE = 1
+DEFAULT_VHS_DEEMPHASIS_BANDWIDTH = 0.393
 
 DEFAULT_8MM_DEEMPHASIS_TAU_1 = 1.1e-4
 DEFAULT_8MM_DEEMPHASIS_TAU_2 = 1.3e-5
@@ -549,11 +550,11 @@ def tau_as_freq(tau):
     return 1 / (2 * pi * tau)
 
 
-# Creates a low or high pass shelving filter from two time constants and a db/octave gain
+# Creates a low or high pass bilinear shelving filter from two time constants and a shelf gain
 # Where:
 #   * T1 is the low shelf frequency
 #   * T2 is the high shelf frequency
-#   * db/octave is the slope of the shelf at db/octave
+#   * shelf gain is the slope of the shelf at db/octave
 #
 #   ------\ T1
 #          \
@@ -562,17 +563,25 @@ def tau_as_freq(tau):
 #          T2 \________
 #
 def build_shelf_filter(
-    direction, t2_high, db_per_octave, bandwidth, audio_rate
+    direction,
+    tau1,
+    tau2,
+    shelf_gain,
+    fs
 ):
-    t2_f = tau_as_freq(t2_high)
+    # set high point of filter to have no gain
+    b_1 = 1 / (shelf_gain * tau1 / tau2)
 
-    b, a = gen_shelf(t2_f, db_per_octave, direction, audio_rate, bandwidth=bandwidth)
+    if direction == "low":
+        b_analog = [tau2 ** 2 / tau1, b_1]
+        a_analog = [tau1, 1]
+    else:
+        b_analog = [tau2, b_1]
+        a_analog = [tau2, 1]
 
-    # scale the filter such that the top of the shelf is at 0db gain
-    scale_factor = 10 ** (-db_per_octave / 20)
-    b = [x * scale_factor for x in b]
+    b_digital, a_digital = bilinear(b_analog, a_analog, fs)
 
-    return b, a
+    return b_digital, a_digital
 
 
 class SpectralNoiseReduction:
@@ -826,54 +835,6 @@ class DCBlocker:
     def process(self, audio):
         self.prev_x, self.prev_y = DCBlocker.dc_block(audio, self.prev_x, self.prev_y, self.R)
 
-def inverting_shelving_biquad(
-    fs,
-    f0,
-    gain_db,
-    shelf_type="low",
-    S=1.0
-):
-    """
-    Two-pole inverting shelving filter (RBJ analog-equivalent)
-
-    shelf_type: "low" or "high"
-    """
-
-    A = 10**(gain_db / 40.0)
-    w0 = 2 * np.pi * f0 / fs
-    sin_w0 = np.sin(w0)
-    cos_w0 = np.cos(w0)
-
-    alpha = sin_w0 / 2 * np.sqrt((A + 1/A) * (1/S - 1) + 2)
-
-    if shelf_type == "low":
-        b0 =    A*((A+1) - (A-1)*cos_w0 + 2*np.sqrt(A)*alpha)
-        b1 =  2*A*((A-1) - (A+1)*cos_w0)
-        b2 =    A*((A+1) - (A-1)*cos_w0 - 2*np.sqrt(A)*alpha)
-        a0 =        (A+1) + (A-1)*cos_w0 + 2*np.sqrt(A)*alpha
-        a1 =   -2*((A-1) + (A+1)*cos_w0)
-        a2 =        (A+1) + (A-1)*cos_w0 - 2*np.sqrt(A)*alpha
-
-    elif shelf_type == "high":
-        b0 =    A*((A+1) + (A-1)*cos_w0 + 2*np.sqrt(A)*alpha)
-        b1 = -2*A*((A-1) + (A+1)*cos_w0)
-        b2 =    A*((A+1) + (A-1)*cos_w0 - 2*np.sqrt(A)*alpha)
-        a0 =        (A+1) - (A-1)*cos_w0 + 2*np.sqrt(A)*alpha
-        a1 =    2*((A-1) - (A+1)*cos_w0)
-        a2 =        (A+1) - (A-1)*cos_w0 - 2*np.sqrt(A)*alpha
-
-    else:
-        raise ValueError("shelf_type must be 'low' or 'high'")
-
-    # Normalize
-    b = np.array([b0, b1, b2]) / a0
-    a = np.array([1.0, a1/a0, a2/a0])
-
-    # Inverting op-amp behavior
-    b *= -1.0
-
-    return b, a
-
 class Deemphasis:
     def __init__(
         self,
@@ -893,21 +854,13 @@ class Deemphasis:
 
         self.deemph_b, self.deemph_a = build_shelf_filter(
             "low",
+            self.deemphasis_T1,
             self.deemphasis_T2,
-            self.deemphasis_db_per_octave,
             self.deemphasis_bandwidth,
             self.audio_rate,
         )
-
-        #self.deemph_b, self.deemph_a = inverting_shelving_biquad(
-        #    self.audio_rate,
-        #    tau_as_freq(self.deemphasis_T2),
-        #    self.deemphasis_db_per_octave,
-        #    "low",
-        #    self.deemphasis_bandwidth
-        #)
-
-        self.DeemphasisLowpass = FiltersClass(np.array(self.deemph_b), np.array(self.deemph_a), dtype=np.float64)
+        self.zi_x = 0.0
+        self.zi_y = 0.0
 
     def get_response(self):
         # compute frequency response
@@ -916,31 +869,51 @@ class Deemphasis:
         magnitude_db = 20 * np.log10(np.abs(h_total))
 
         return w, magnitude_db
-    
+
     @staticmethod
     @njit(
         [
             (
-                numba.types.Array(numba.types.float64, 1, "C"),
-                NumbaAudioArray,
+                numba.types.Array(numba.types.float32, 1, "A"),
+                numba.types.float32,
+                numba.types.float32,
+                numba.types.float32,
+                numba.types.float32,
+                numba.types.float32,
             )
         ],
         cache=True,
         fastmath=True,
         nogil=True,
     )
-    def align_audio(audio_in, audio_out):
-        audio_end = len(audio_out)
-        audio_start = audio_end - len(audio_in)
-        for i in range(0, audio_start):
-            audio_out[i] = 0
+    def lfilt_inplace(x, b0, b1, a1, zi_x, zi_y):
+        """
+        In-place first-order IIR filter (lfilter equivalent).
+    
+        Implements:
+            y[n] = b0*x[n] + b1*x[n-1] - a1*y[n-1]
+        """
 
-        for i in range(audio_start, audio_end):
-            audio_out[i] = audio_in[i-audio_start]
+        for i in range(x.shape[0]):
+            xi = x[i]
+            yi = b0 * xi + b1 * zi_x - a1 * zi_y
+    
+            x[i] = yi
+    
+            zi_x = xi
+            zi_y = yi
+    
+        return zi_x, zi_y
 
     def process(self, audio_out):
-        audio_filtered = self.DeemphasisLowpass.lfilt(audio_out)
-        Deemphasis.align_audio(audio_filtered, audio_out)
+        self.zi_x, self.zi_y = Deemphasis.lfilt_inplace(
+            audio_out,
+            self.deemph_b[0],
+            self.deemph_b[1],
+            self.deemph_a[1],
+            self.zi_x,
+            self.zi_y
+        )
 
 
 class Expander:
@@ -969,8 +942,8 @@ class Expander:
         self.env_db = -120.0
 
         # this is set to avoid high frequency noise to interfere with the NR envelope tracking
-        self.Lo_cut = 19e3
-        self.Lo_transition = 10e3
+        self.Lo_cut = 18.5e3
+        self.Lo_transition = 5e3
 
         self.locut_iirb, self.locut_iira = firdes_lowpass(
             self.audio_rate,
@@ -979,7 +952,7 @@ class Expander:
         )
 
         self.WeightedLowpass = FiltersClass(
-            np.array(self.locut_iirb), np.array(self.locut_iira), dtype=np.float64
+            np.array(self.locut_iirb), np.array(self.locut_iira), dtype=np.float32
         )
 
         # weighted filter for envelope detector
@@ -990,21 +963,13 @@ class Expander:
 
         self.env_iirb, self.env_iira = build_shelf_filter(
             "high",
+            self.weighting_T1,
             self.weighting_T2,
-            self.weighting_db_per_octave,
             self.weighting_bandwidth,
             self.audio_rate
         )
-
-        #self.env_iirb, self.env_iira = inverting_shelving_biquad(
-        #    self.audio_rate,
-        #    tau_as_freq(self.weighting_T2),
-        #    self.weighting_db_per_octave,
-        #    "high",
-        #    self.weighting_bandwidth
-        #)
-
-        self.WeightedHighpass = FiltersClass(np.array(self.env_iirb), np.array(self.env_iira), dtype=np.float64)
+        self.zi_x = 0.0
+        self.zi_y = 0.0
 
     def get_response(self):
         # compute frequency response
@@ -1021,7 +986,7 @@ class Expander:
     @njit(
         [(
             NumbaAudioArray,
-            numba.types.Array(numba.types.float64, 1, "C"),
+            numba.types.Array(numba.types.float32, 1, "A"),
             numba.types.float32,
             numba.types.float32,
             numba.types.float32,
@@ -1063,10 +1028,17 @@ class Expander:
 
     def process(self, pre_in, audio_out):
         # prevent high frequency noise from interfering with envelope detector
-        pre_in_low_pass = self.WeightedLowpass.filtfilt(pre_in)
+        side_chain = self.WeightedLowpass.lfilt(pre_in)
 
         # high pass weighted input to envelope detector
-        side_chain = self.WeightedHighpass.lfilt(pre_in_low_pass)
+        self.zi_x, self.zi_y = Deemphasis.lfilt_inplace(
+            side_chain,
+            self.env_iirb[0],
+            self.env_iirb[1],
+            self.env_iira[1],
+            self.zi_x,
+            self.zi_y
+        )
 
         self.env_db = Expander.expand(
             audio_out,
