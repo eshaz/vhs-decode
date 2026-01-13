@@ -915,6 +915,12 @@ class Deemphasis:
             self.zi_y
         )
 
+def simple_lowpass(fs, tau):
+    b_analog = [1]
+    a_analog = [tau, 1]
+
+    b_digital, a_digital = bilinear(b_analog, a_analog, fs)
+    return b_digital, a_digital
 
 class Expander:
     def __init__(
@@ -928,6 +934,7 @@ class Expander:
         weighting_high_tau: float = DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,
         weighting_db_per_octave: float = DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,
         weighting_bandwidth: float = DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,
+        low_pass: float = 5.9e-6
     ):
         self.audio_rate = audio_rate
         self.linear_to_db = 20 / log(10)
@@ -942,13 +949,12 @@ class Expander:
         self.env_db = -120.0
 
         # this is set to avoid high frequency noise to interfere with the NR envelope tracking
-        self.Lo_cut = 18.5e3
+        self.Lo_cut = 17e3
         self.Lo_transition = 5e3
 
-        self.locut_iirb, self.locut_iira = firdes_lowpass(
+        self.locut_iirb, self.locut_iira = simple_lowpass(
             self.audio_rate,
-            self.Lo_cut,
-            self.Lo_transition,
+            low_pass
         )
 
         self.WeightedLowpass = FiltersClass(
