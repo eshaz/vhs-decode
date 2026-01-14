@@ -54,7 +54,7 @@ from vhsdecode.hifi.HiFiDecode import (
     DEFAULT_EXPANDER_RELEASE_TAU,
     DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,
     DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,
-    DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,
+    DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS,
     DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,
     DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1,
     DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2,
@@ -372,10 +372,10 @@ expander_options_group.add_argument(
     help=f"Sets the expander weighting high-pass shelf filter high point in tau (defaults: [VHS: {DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2}] [8mm: {DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2}]).",
 )
 expander_options_group.add_argument(
-    "--expander_weighting_db_per_octave",
-    dest="expander_weighting_db_per_octave",
+    "--expander_weighting_low_pass",
+    dest="expander_weighting_low_pass",
     type=float,
-    help=f"Sets the expander weighting high-pass shelf filter cutoff rate (defaults: [VHS: {DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE}] [8mm: {DEFAULT_8MM_EXPANDER_WEIGHTING_DB_PER_OCTAVE}]).",
+    help=f"Sets the expander weighting high-pass shelf filter cutoff rate (defaults: [VHS: {DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS}] [8mm: {DEFAULT_8MM_EXPANDER_WEIGHTING_DB_PER_OCTAVE}]).",
 )
 expander_options_group.add_argument(
     "--expander_weighting_bandwidth",
@@ -1029,7 +1029,7 @@ class PostProcessor:
                 decode_options["expander_release_tau"],
                 decode_options["expander_weighting_low_tau"],
                 decode_options["expander_weighting_high_tau"],
-                decode_options["expander_weighting_db_per_octave"],
+                decode_options["expander_weighting_low_pass"],
                 decode_options["expander_weighting_bandwidth"],
                 decode_options["deemphasis_low_tau"],
                 decode_options["deemphasis_high_tau"],
@@ -1057,7 +1057,7 @@ class PostProcessor:
                 decode_options["expander_release_tau"],
                 decode_options["expander_weighting_low_tau"],
                 decode_options["expander_weighting_high_tau"],
-                decode_options["expander_weighting_db_per_octave"],
+                decode_options["expander_weighting_low_pass"],
                 decode_options["expander_weighting_bandwidth"],
                 decode_options["deemphasis_low_tau"],
                 decode_options["deemphasis_high_tau"],
@@ -1183,7 +1183,7 @@ class PostProcessor:
         expander_release_tau,
         expander_weighting_low_tau,
         expander_weighting_high_tau,
-        expander_weighting_db_per_octave,
+        expander_weighting_low_pass,
         expander_weighting_bandwidth,
         deemphasis_low_tau,
         deemphasis_high_tau,
@@ -1207,7 +1207,7 @@ class PostProcessor:
             expander_release_tau,
             expander_weighting_low_tau,
             expander_weighting_high_tau,
-            expander_weighting_db_per_octave,
+            expander_weighting_low_pass,
             expander_weighting_bandwidth
         )
 
@@ -2033,7 +2033,7 @@ def main() -> int:
 
         default_expander_weighting_low_tau = DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1
         default_expander_weighting_high_tau = DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2
-        default_expander_weighting_db_per_octave = DEFAULT_8MM_EXPANDER_WEIGHTING_DB_PER_OCTAVE
+        default_expander_weighting_low_pass = DEFAULT_8MM_EXPANDER_WEIGHTING_DB_PER_OCTAVE
         default_expander_weighting_bandwidth = DEFAULT_8MM_EXPANDER_WEIGHTING_BANDWIDTH
     else:
         print("using vhs")
@@ -2045,7 +2045,7 @@ def main() -> int:
 
         default_expander_weighting_low_tau = DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1
         default_expander_weighting_high_tau = DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2
-        default_expander_weighting_db_per_octave = DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE
+        default_expander_weighting_low_pass = DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS
         default_expander_weighting_bandwidth = DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH
 
     decode_options = {
@@ -2073,7 +2073,7 @@ def main() -> int:
         "expander_release_tau": args.expander_release_tau,
         "expander_weighting_low_tau": args.expander_weighting_low_tau or default_expander_weighting_low_tau,
         "expander_weighting_high_tau": args.expander_weighting_high_tau or default_expander_weighting_high_tau,
-        "expander_weighting_db_per_octave": args.expander_weighting_db_per_octave or default_expander_weighting_db_per_octave,
+        "expander_weighting_low_pass": args.expander_weighting_low_pass or default_expander_weighting_low_pass,
         "expander_weighting_bandwidth": args.expander_weighting_bandwidth or default_expander_weighting_bandwidth,
         "deemphasis_low_tau": args.deemphasis_low_tau or default_deemphasis_low_tau,
         "deemphasis_high_tau": args.deemphasis_high_tau or default_deemphasis_high_tau,

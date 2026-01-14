@@ -2,6 +2,8 @@ import os.path
 import sys
 import math
 
+from scipy.io import wavfile
+from scipy.fft import rfft, rfftfreq
 import numpy as np
 
 import matplotlib
@@ -68,7 +70,7 @@ from vhsdecode.hifi.HiFiDecode import (
     DEFAULT_VHS_DEEMPHASIS_BANDWIDTH,
     DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,
     DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,
-    DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,
+    DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS,
     DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,
 
     DEFAULT_8MM_DEEMPHASIS_TAU_1,
@@ -107,7 +109,7 @@ class MainUIParameters:
         self.expander_release_tau: float = DEFAULT_EXPANDER_RELEASE_TAU
         self.expander_weighting_low_tau: float = DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1
         self.expander_weighting_high_tau: float = DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2
-        self.expander_weighting_db_per_octave: float = DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE
+        self.expander_weighting_low_pass: float = DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS
         self.expander_weighting_bandwidth: float = DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH
         self.deemphasis_low_tau: float = DEFAULT_VHS_DEEMPHASIS_TAU_1
         self.deemphasis_high_tau: float = DEFAULT_VHS_DEEMPHASIS_TAU_2
@@ -147,7 +149,7 @@ def decode_options_to_ui_parameters(decode_options):
     values.expander_release_tau = decode_options["expander_release_tau"]
     values.expander_weighting_low_tau = decode_options["expander_weighting_low_tau"]
     values.expander_weighting_high_tau = decode_options["expander_weighting_high_tau"]
-    values.expander_weighting_db_per_octave = decode_options["expander_weighting_db_per_octave"]
+    values.expander_weighting_low_pass = decode_options["expander_weighting_low_pass"]
     values.expander_weighting_bandwidth = decode_options["expander_weighting_bandwidth"]
     values.deemphasis_low_tau = decode_options["deemphasis_low_tau"]
     values.deemphasis_high_tau = decode_options["deemphasis_high_tau"]
@@ -189,7 +191,7 @@ def ui_parameters_to_decode_options(values: MainUIParameters):
         "expander_release_tau": values.expander_release_tau,
         "expander_weighting_low_tau": values.expander_weighting_low_tau,
         "expander_weighting_high_tau": values.expander_weighting_high_tau,
-        "expander_weighting_db_per_octave": values.expander_weighting_db_per_octave,
+        "expander_weighting_low_pass": values.expander_weighting_low_pass,
         "expander_weighting_bandwidth": values.expander_weighting_bandwidth,
         "deemphasis_low_tau": values.deemphasis_low_tau,
         "deemphasis_high_tau": values.deemphasis_high_tau,
@@ -731,12 +733,12 @@ class HifiUi(QMainWindow):
             DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,
         )
         weighting_layout.addWidget(self.expander_weighting_high_tau_dial_control)
-        self.expander_weighting_db_per_octave_dial_control = DialControl(
-            self, "Slope (db/oct)", QtGui.QDoubleValidator(), 10, 0, 12
+        self.expander_weighting_low_pass_dial_control = DialControl(
+            self, "Low Pass (𝜏)", QtGui.QDoubleValidator(), 10e6, 10e-8, 10e-6
         )
-        weighting_layout.addWidget(self.expander_weighting_db_per_octave_dial_control)
+        weighting_layout.addWidget(self.expander_weighting_low_pass_dial_control)
         self.expander_weighting_bandwidth_dial_control = DialControl(
-            self, "Bandwidth", QtGui.QDoubleValidator(), 50, 0, 12
+            self, "Bandwidth", QtGui.QDoubleValidator(), 1000, 0.01, 2
         )
         weighting_layout.addWidget(self.expander_weighting_bandwidth_dial_control)
         expander_sideband_frame.inner_layout.addLayout(weighting_layout)
@@ -772,11 +774,11 @@ class HifiUi(QMainWindow):
         )
         deemphasis_layout.addWidget(self.deemphasis_high_tau_dial_control)
         self.deemphasis_db_per_octave_dial_control = DialControl(
-            self, "Slope (db/oct)", QtGui.QDoubleValidator(), 10, 0, 12
+            self, "Slope (db/oct)", QtGui.QDoubleValidator(), 10, 0, 0.01
         )
         deemphasis_layout.addWidget(self.deemphasis_db_per_octave_dial_control)
         self.deemphasis_bandwidth_dial_control = DialControl(
-            self, "Bandwidth", QtGui.QDoubleValidator(), 50, 0, 12
+            self, "Bandwidth", QtGui.QDoubleValidator(), 1000, 0.01, 2
         )
         deemphasis_layout.addWidget(self.deemphasis_bandwidth_dial_control)
 
@@ -800,7 +802,7 @@ class HifiUi(QMainWindow):
 
         self.expander_weighting_low_tau_dial_control.valueChanged.connect(self.schedule_plot_update)
         self.expander_weighting_high_tau_dial_control.valueChanged.connect(self.schedule_plot_update)
-        self.expander_weighting_db_per_octave_dial_control.valueChanged.connect(self.schedule_plot_update)
+        self.expander_weighting_low_pass_dial_control.valueChanged.connect(self.schedule_plot_update)
         self.expander_weighting_bandwidth_dial_control.valueChanged.connect(self.schedule_plot_update)
 
         self.deemphasis_low_tau_dial_control.valueChanged.connect(self.schedule_plot_update)
@@ -846,8 +848,8 @@ class HifiUi(QMainWindow):
         self.expander_weighting_high_tau_dial_control.setValue(
             values.expander_weighting_high_tau
         )
-        self.expander_weighting_db_per_octave_dial_control.setValue(
-            values.expander_weighting_db_per_octave
+        self.expander_weighting_low_pass_dial_control.setValue(
+            values.expander_weighting_low_pass
         )
         self.expander_weighting_bandwidth_dial_control.setValue(
             values.expander_weighting_bandwidth
@@ -931,8 +933,8 @@ class HifiUi(QMainWindow):
         values.expander_weighting_high_tau = (
             self.expander_weighting_high_tau_dial_control.value()
         )
-        values.expander_weighting_db_per_octave = (
-            self.expander_weighting_db_per_octave_dial_control.value()
+        values.expander_weighting_low_pass = (
+            self.expander_weighting_low_pass_dial_control.value()
         )
         values.expander_weighting_bandwidth = (
             self.expander_weighting_bandwidth_dial_control.value()
@@ -998,7 +1000,7 @@ class HifiUi(QMainWindow):
             self.deemphasis_bandwidth_dial_control.setValue(DEFAULT_VHS_DEEMPHASIS_BANDWIDTH)
             self.expander_weighting_low_tau_dial_control.setValue(DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1)
             self.expander_weighting_high_tau_dial_control.setValue(DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2)
-            self.expander_weighting_db_per_octave_dial_control.setValue(DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE)
+            self.expander_weighting_low_pass_dial_control.setValue(DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS)
             self.expander_weighting_bandwidth_dial_control.setValue(DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH)
         else:
             self.deemphasis_low_tau_dial_control.setValue(DEFAULT_8MM_DEEMPHASIS_TAU_1)
@@ -1007,7 +1009,7 @@ class HifiUi(QMainWindow):
             self.deemphasis_bandwidth_dial_control.setValue(DEFAULT_8MM_DEEMPHASIS_BANDWIDTH)
             self.expander_weighting_low_tau_dial_control.setValue(DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1)
             self.expander_weighting_high_tau_dial_control.setValue(DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2)
-            self.expander_weighting_db_per_octave_dial_control.setValue(DEFAULT_8MM_EXPANDER_WEIGHTING_DB_PER_OCTAVE)
+            self.expander_weighting_low_pass_dial_control.setValue(DEFAULT_8MM_EXPANDER_WEIGHTING_DB_PER_OCTAVE)
             self.expander_weighting_bandwidth_dial_control.setValue(DEFAULT_8MM_EXPANDER_WEIGHTING_BANDWIDTH)
 
     def on_standard_change(self):
@@ -1488,6 +1490,15 @@ class PlotWindow(QWidget):
         self.setLayout(layout)
         self.getValues = getValues
 
+        self.fs_whitenoise_in, self.data_whitenoise_in = self.load_data("/media/nas/vhs/hifi_test/emphasis/vhs/test_signal_whitenoise.wav")
+        self.fs_sweep_in, self.data_sweep_in = self.load_data("/media/nas/vhs/hifi_test/emphasis/vhs/test_signal_sweep.wav")
+
+        self.fs_vhs_whitenoise, self.data_vhs_whitenoise = self.load_data("/media/nas/vhs/hifi_test/emphasis/vhs/vhs_no_proc_whitenoise.wav")
+        self.fs_vhs_sweep, self.data_vhs_sweep = self.load_data("/media/nas/vhs/hifi_test/emphasis/vhs/vhs_no_proc_sweep.wav")
+
+        self.fs_8mm_whitenoise, self.data_8mm_whitenoise = self.load_data("/media/nas/vhs/hifi_test/emphasis/vhs/8mm_no_proc_whitenoise.wav")
+        self.fs_8mm_sweep, self.data_8mm_sweep = self.load_data("/media/nas/vhs/hifi_test/emphasis/vhs/8mm_no_proc_sweep.wav")
+
     def plot_response(self, label, color, freq, mag_db, t1, t2):
         # Compute the frequency response
         # Convert taus to frequencies
@@ -1515,6 +1526,66 @@ class PlotWindow(QWidget):
                  label=f"({center_f} Hz)")
         self.ax.plot(t2_x, t2_y, marker='|', color=color, markersize=15,
                  label=f"({t2_f} Hz)")
+        
+    def smooth_fft(self, freqs, mags, bins=1000):
+        # Only positive frequencies
+        pos = freqs >= 0
+        freqs = freqs[pos]
+        mags = mags[pos]
+        
+        # Create bin edges
+        freq_min, freq_max = freqs[0], freqs[-1]
+        edges = np.linspace(freq_min, freq_max, bins + 1)
+    
+        smooth_freqs = []
+        smooth_mags = []
+    
+        for i in range(bins):
+            mask = (freqs >= edges[i]) & (freqs < edges[i+1])
+            if np.any(mask):
+                smooth_freqs.append(np.mean(freqs[mask]))
+                smooth_mags.append(np.mean(mags[mask]))
+    
+        return np.array(smooth_freqs), np.array(smooth_mags)
+
+    def load_data(self, path):
+        fs, pcm = wavfile.read(path)
+        # Convert to float32 if needed
+        if pcm.dtype == np.int16:
+            pcm_f = pcm.astype(np.float32) / 32768.0
+        elif pcm.dtype == np.int32:
+            pcm_f = pcm.astype(np.float32) / 2147483648.0
+        else:
+            pcm_f = pcm.astype(np.float32)
+        
+        # Use mono if stereo
+        if pcm_f.ndim > 1:
+            pcm_f = pcm_f[:, 0]
+    
+        return fs, pcm_f
+        
+    def plot_data(self, title, filtered, fs):
+        N = len(filtered)
+        freqs = rfftfreq(N, 1/fs)
+        filtered_fft = np.abs(rfft(filtered))
+        mag = 20*np.log10(filtered_fft + 1e-12)
+
+        # smooth out the FFT
+        smooth_freqs, smooth_mag = self.smooth_fft(freqs, mag, bins=300)
+        
+        self.ax.semilogx(smooth_freqs, smooth_mag, label=title)
+
+    def plot_deemphasis_expander_response(self, title, expander, deemphasis, fs, input_data, no_proc_data):
+        deemphasis_data = no_proc_data.copy()
+        deemphasis.process(deemphasis_data)
+
+        expander_data = deemphasis_data.copy()
+        expander.process(no_proc_data, expander_data)
+
+        self.plot_data(title + " input", input_data*0.5, fs)
+        self.plot_data(title + " raw", no_proc_data, fs)
+        self.plot_data(title + " deemphasis", deemphasis_data, fs)
+        self.plot_data(title + " expander", expander_data, fs)
 
     def update_plot(self):
         self.ax.clear()
@@ -1533,7 +1604,7 @@ class PlotWindow(QWidget):
             ui_values.audio_sample_rate,
             weighting_low_tau = ui_values.expander_weighting_low_tau,
             weighting_high_tau = ui_values.expander_weighting_high_tau,
-            weighting_db_per_octave = ui_values.expander_weighting_db_per_octave,
+            weighting_low_pass = ui_values.expander_weighting_low_pass,
             weighting_bandwidth = ui_values.expander_weighting_bandwidth
         )
         expander_freqs, expander_mag_db = expander.get_response()
@@ -1555,11 +1626,14 @@ class PlotWindow(QWidget):
             ui_values.deemphasis_high_tau,
         )
 
+        self.plot_deemphasis_expander_response("VHS white noise", expander, deemphasis, self.fs_whitenoise_in, self.data_whitenoise_in, self.data_vhs_whitenoise)
+        self.plot_deemphasis_expander_response("VHS sweep", expander, deemphasis, self.fs_sweep_in, self.data_sweep_in, self.data_vhs_sweep)
+
         self.ax.grid(True, which="both")
         self.ax.set_xlabel("Frequency [Hz]")
         self.ax.set_ylabel("Amplitude [dB]")
         self.ax.set_xlim([1, ui_values.audio_sample_rate/2])
-        self.ax.set_ylim([-20, 3])
+        self.ax.set_ylim([-40, 80])
         
         self.ax.legend()
         self.canvas.draw()

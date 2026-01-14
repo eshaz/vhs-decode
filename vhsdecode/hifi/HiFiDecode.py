@@ -60,7 +60,7 @@ DEFAULT_EXPANDER_RELEASE_TAU = 70e-3
 # High shelf filter for weighted input to expander
 DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1 = 240e-6
 DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 = 56e-6 #24e-6
-DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE = 1
+DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS = 3.6e-6
 DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH = 0.89
 
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1 = 5.5e-5
@@ -932,9 +932,8 @@ class Expander:
         release_tau: float = DEFAULT_EXPANDER_RELEASE_TAU,
         weighting_low_tau: float = DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,
         weighting_high_tau: float = DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,
-        weighting_db_per_octave: float = DEFAULT_VHS_EXPANDER_WEIGHTING_DB_PER_OCTAVE,
-        weighting_bandwidth: float = DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,
-        low_pass: float = 5.9e-6
+        weighting_low_pass: float = DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS,
+        weighting_bandwidth: float = DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH
     ):
         self.audio_rate = audio_rate
         self.linear_to_db = 20 / log(10)
@@ -954,7 +953,7 @@ class Expander:
 
         self.locut_iirb, self.locut_iira = simple_lowpass(
             self.audio_rate,
-            low_pass
+            weighting_low_pass
         )
 
         self.WeightedLowpass = FiltersClass(
@@ -964,7 +963,6 @@ class Expander:
         # weighted filter for envelope detector
         self.weighting_T1 = weighting_low_tau
         self.weighting_T2 = weighting_high_tau
-        self.weighting_db_per_octave = weighting_db_per_octave
         self.weighting_bandwidth = weighting_bandwidth
 
         self.env_iirb, self.env_iira = build_shelf_filter(
