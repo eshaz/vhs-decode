@@ -39,6 +39,9 @@ from vhsdecode.hifi.HiFiDecode import (
     DEFAULT_VHS_DEEMPHASIS_TAU_2,
     DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE,
     DEFAULT_VHS_DEEMPHASIS_BANDWIDTH,
+    DEFAULT_VHS_PRE_DEEMPHASIS_TAU_1,
+    DEFAULT_VHS_PRE_DEEMPHASIS_TAU_2,
+    DEFAULT_VHS_PRE_DEEMPHASIS_BANDWIDTH
 )
 
 default_threads = cpu_count()
@@ -303,6 +306,14 @@ def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData,
 
     decoded_processed_channel = decoded_raw_channel.copy()
 
+    pre_deemphasis = Deemphasis(
+        decoded_raw.sample_rate,
+        DEFAULT_VHS_PRE_DEEMPHASIS_TAU_1,
+        DEFAULT_VHS_PRE_DEEMPHASIS_TAU_2,
+        1,
+        DEFAULT_VHS_PRE_DEEMPHASIS_BANDWIDTH
+    )
+
     deemphasis = Deemphasis(
         decoded_raw.sample_rate,
         params.deemphasis_tau_1,
@@ -322,6 +333,8 @@ def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData,
         params.expander_weighting_low_pass_tau,
         params.expander_weighting_bandwidth,
     )
+
+    pre_deemphasis.process(decoded_processed_channel)
 
     deemphasis.process(decoded_processed_channel)
     # prime expander
@@ -345,7 +358,7 @@ def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData,
     H_ref_db  = 20 * np.log10(np.abs(H_ref)  + eps)
     H_test_db = 20 * np.log10(np.abs(H_test) + eps)
 
-    band = (f >= 30) & (f <= 16_000)
+    band = (f >= 100) & (f <= 16_000)
     H_ref_db  = H_ref_db[band]
     H_test_db = H_test_db[band]
 
@@ -465,15 +478,15 @@ def main() -> int:
     args = parser.parse_args()
 
     param_dict = {
-        'expander_attack_tau': {'min':DEFAULT_EXPANDER_ATTACK_TAU,'max':DEFAULT_EXPANDER_ATTACK_TAU,'step':1e-5},
-        'expander_release_tau': {'min':DEFAULT_EXPANDER_RELEASE_TAU,'max':DEFAULT_EXPANDER_RELEASE_TAU,'step':1e-4},
+        'expander_attack_tau': {'min':1e-3,'max':10e-3,'step':1e-3},
+        'expander_release_tau': {'min':DEFAULT_EXPANDER_RELEASE_TAU-.0014,'max':DEFAULT_EXPANDER_RELEASE_TAU+.0014,'step':1e-3},
         'expander_gain': {'min':DEFAULT_EXPANDER_GAIN,'max':DEFAULT_EXPANDER_GAIN,'step':1},
         'expander_ratio': {'min':DEFAULT_EXPANDER_RATIO,'max':DEFAULT_EXPANDER_RATIO,'step':1},
         
         'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'step':1e-7},
         'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1e-6},
-        'expander_weighting_low_pass_tau': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS-6e-5,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS+1e-5,'step':1e-6},
-        'expander_weighting_bandwidth': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,'step':0.01},
+        'expander_weighting_low_pass_tau': {'min':0.6e-5,'max':4e-5,'step':1e-6},
+        'expander_weighting_bandwidth': {'min':1,'max':5,'step':0.01},
         
         'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1,'step':1},
         'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1},

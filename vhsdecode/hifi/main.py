@@ -68,6 +68,9 @@ from vhsdecode.hifi.HiFiDecode import (
     DEFAULT_8MM_DEEMPHASIS_TAU_2,
     DEFAULT_8MM_DEEMPHASIS_DB_PER_OCTAVE,
     DEFAULT_8MM_DEEMPHASIS_BANDWIDTH,
+    DEFAULT_VHS_PRE_DEEMPHASIS_TAU_1,
+    DEFAULT_VHS_PRE_DEEMPHASIS_TAU_2,
+    DEFAULT_VHS_PRE_DEEMPHASIS_BANDWIDTH,
     DEFAULT_SPECTRAL_NR_AMOUNT,
     DEFAULT_RESAMPLER_QUALITY,
     DEFAULT_FINAL_AUDIO_RATE,
@@ -1191,7 +1194,23 @@ class PostProcessor:
         deemphasis_bandwidth
     ):
         setproctitle(current_process().name)
-        deemphasis = Deemphasis(
+        pre_deemphasis = Deemphasis(
+            final_audio_rate,
+            DEFAULT_VHS_PRE_DEEMPHASIS_TAU_1,
+            DEFAULT_VHS_PRE_DEEMPHASIS_TAU_2,
+            1,
+            DEFAULT_VHS_PRE_DEEMPHASIS_BANDWIDTH
+        )
+
+        post_deemphasis = Deemphasis(
+            final_audio_rate,
+            DEFAULT_VHS_PRE_DEEMPHASIS_TAU_1,
+            DEFAULT_VHS_PRE_DEEMPHASIS_TAU_2,
+            1,
+            DEFAULT_VHS_PRE_DEEMPHASIS_BANDWIDTH
+        )
+
+        nr_deemphasis = Deemphasis(
             final_audio_rate,
             deemphasis_low_tau,
             deemphasis_high_tau,
@@ -1230,7 +1249,10 @@ class PostProcessor:
                 post = buffer.get_post_right()
 
             if enable_deemphasis:
-                deemphasis.process(post)
+                pre_deemphasis.process(pre)
+                post_deemphasis.process(post)
+
+                nr_deemphasis.process(post)
 
             if enable_expander:
                 if decoder_state.block_num == 0:

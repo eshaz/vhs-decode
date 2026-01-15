@@ -68,6 +68,9 @@ from vhsdecode.hifi.HiFiDecode import (
     DEFAULT_VHS_DEEMPHASIS_TAU_2,
     DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE,
     DEFAULT_VHS_DEEMPHASIS_BANDWIDTH,
+    DEFAULT_VHS_PRE_DEEMPHASIS_TAU_1,
+    DEFAULT_VHS_PRE_DEEMPHASIS_TAU_2,
+    DEFAULT_VHS_PRE_DEEMPHASIS_BANDWIDTH,
     DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,
     DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,
     DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS,
@@ -734,7 +737,7 @@ class HifiUi(QMainWindow):
         )
         weighting_layout.addWidget(self.expander_weighting_high_tau_dial_control)
         self.expander_weighting_low_pass_dial_control = DialControl(
-            self, "Low Pass (𝜏)", QtGui.QDoubleValidator(), 10e6, 10e-8, 10e-6
+            self, "Low Pass (𝜏)", QtGui.QDoubleValidator(), 10e6, 10e-8, 10e-5
         )
         weighting_layout.addWidget(self.expander_weighting_low_pass_dial_control)
         self.expander_weighting_bandwidth_dial_control = DialControl(
@@ -799,6 +802,11 @@ class HifiUi(QMainWindow):
         self._plot_update_timer = QtCore.QTimer()
         self._plot_update_timer.setSingleShot(True)
         self._plot_update_timer.timeout.connect(self.weighting_deemphasis_plot.update_plot)
+
+        self.expander_gain_dial_control.valueChanged.connect(self.schedule_plot_update)
+        self.expander_attack_tau_dial_control.valueChanged.connect(self.schedule_plot_update)
+        self.expander_release_tau_dial_control.valueChanged.connect(self.schedule_plot_update)
+        self.expander_ratio_dial_control.valueChanged.connect(self.schedule_plot_update)
 
         self.expander_weighting_low_tau_dial_control.valueChanged.connect(self.schedule_plot_update)
         self.expander_weighting_high_tau_dial_control.valueChanged.connect(self.schedule_plot_update)
@@ -1575,21 +1583,34 @@ class PlotWindow(QWidget):
         
         self.ax.semilogx(smooth_freqs, smooth_mag, label=title)
 
-    def plot_deemphasis_expander_response(self, title, expander, deemphasis, fs, input_data, no_proc_data):
-        deemphasis_data = no_proc_data.copy()
+    def plot_deemphasis_expander_response(self, title, expander, deemphasis, pre_deemphasis, fs, input_data, no_proc_data):
+        pre_deemphasis_data = no_proc_data.copy()
+        pre_deemphasis.process(pre_deemphasis_data)
+        deemphasis_data = pre_deemphasis_data.copy()
         deemphasis.process(deemphasis_data)
 
         expander_data = deemphasis_data.copy()
-        expander.process(no_proc_data, expander_data)
+        expander.process(pre_deemphasis_data, expander_data)
+
 
         self.plot_data(title + " input", input_data*0.5, fs)
         self.plot_data(title + " raw", no_proc_data, fs)
+        self.plot_data(title + " pre deemphasis", pre_deemphasis_data, fs)
         self.plot_data(title + " deemphasis", deemphasis_data, fs)
         self.plot_data(title + " expander", expander_data, fs)
 
     def update_plot(self):
         self.ax.clear()
         ui_values = self.getValues()
+
+        pre_deemphasis = Deemphasis(
+            ui_values.audio_sample_rate,
+            DEFAULT_VHS_PRE_DEEMPHASIS_TAU_1,
+            DEFAULT_VHS_PRE_DEEMPHASIS_TAU_2,
+            1,
+            DEFAULT_VHS_PRE_DEEMPHASIS_BANDWIDTH,
+        )
+        pre_deemphasis_freqs, pre_deemphasis_mag_db = pre_deemphasis.get_response()
 
         deemphasis = Deemphasis(
             ui_values.audio_sample_rate,
@@ -1602,10 +1623,14 @@ class PlotWindow(QWidget):
 
         expander = Expander(
             ui_values.audio_sample_rate,
-            weighting_low_tau = ui_values.expander_weighting_low_tau,
-            weighting_high_tau = ui_values.expander_weighting_high_tau,
-            weighting_low_pass = ui_values.expander_weighting_low_pass,
-            weighting_bandwidth = ui_values.expander_weighting_bandwidth
+            ui_values.expander_gain,
+            ui_values.expander_ratio,
+            ui_values.expander_attack_tau,
+            ui_values.expander_release_tau,
+            ui_values.expander_weighting_low_tau,
+            ui_values.expander_weighting_high_tau,
+            ui_values.expander_weighting_low_pass,
+            ui_values.expander_weighting_bandwidth
         )
         expander_freqs, expander_mag_db = expander.get_response()
 
@@ -1625,9 +1650,17 @@ class PlotWindow(QWidget):
             ui_values.deemphasis_low_tau,
             ui_values.deemphasis_high_tau,
         )
+        self.plot_response(
+            "Pre-Deemphasis",
+            "purple",
+            pre_deemphasis_freqs,
+            pre_deemphasis_mag_db,
+            DEFAULT_VHS_PRE_DEEMPHASIS_TAU_1,
+            DEFAULT_VHS_PRE_DEEMPHASIS_TAU_2,
+        )
 
-        self.plot_deemphasis_expander_response("VHS white noise", expander, deemphasis, self.fs_whitenoise_in, self.data_whitenoise_in, self.data_vhs_whitenoise)
-        self.plot_deemphasis_expander_response("VHS sweep", expander, deemphasis, self.fs_sweep_in, self.data_sweep_in, self.data_vhs_sweep)
+        self.plot_deemphasis_expander_response("VHS white noise", expander, deemphasis, pre_deemphasis, self.fs_whitenoise_in, self.data_whitenoise_in, self.data_vhs_whitenoise)
+        self.plot_deemphasis_expander_response("VHS sweep", expander, deemphasis, pre_deemphasis, self.fs_sweep_in, self.data_sweep_in, self.data_vhs_sweep)
 
         self.ax.grid(True, which="both")
         self.ax.set_xlabel("Frequency [Hz]")

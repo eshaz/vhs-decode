@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from fractions import Fraction
-from math import log, pi, sqrt, ceil, floor, atan2, log1p, cos, sin, lcm, exp
+from math import log, pi, sqrt, ceil, floor, atan2, log1p, cos, sin, lcm, exp, tanh
 from typing import Tuple
 from time import perf_counter
 from setproctitle import setproctitle
@@ -47,10 +47,9 @@ from vhsdecode.hifi.utils import DecoderSharedMemory, NumbaAudioArray
 import matplotlib.pyplot as plt
 
 
-# lower increases expander strength and decreases overall gain
-DEFAULT_EXPANDER_GAIN = 20
+DEFAULT_EXPANDER_GAIN = 40
 DEFAULT_EXPANDER_RATIO = 2
-DEFAULT_EXPANDER_ATTACK_TAU = 5e-3
+DEFAULT_EXPANDER_ATTACK_TAU = 6e-3 # 3e-3 to 10e-3
 DEFAULT_EXPANDER_RELEASE_TAU = 70e-3
 
 # TAU_1         low end of shelf curve
@@ -59,20 +58,24 @@ DEFAULT_EXPANDER_RELEASE_TAU = 70e-3
 
 # High shelf filter for weighted input to expander
 DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1 = 240e-6
-DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 = 56e-6 #24e-6
-DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS = 3.6e-6
-DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH = 0.89
+DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 = 24e-6 # 56e-6
+DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS = 1.74e-5 #1.58e-5, 1.45e-5
+DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH = 1
 
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1 = 5.5e-5
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2 = 2.35e-5
 DEFAULT_8MM_EXPANDER_WEIGHTING_DB_PER_OCTAVE = 6
-DEFAULT_8MM_EXPANDER_WEIGHTING_BANDWIDTH = 2.4
+DEFAULT_8MM_EXPANDER_WEIGHTING_BANDWIDTH = 2.393
+
+DEFAULT_VHS_PRE_DEEMPHASIS_TAU_1 = 56e-6
+DEFAULT_VHS_PRE_DEEMPHASIS_TAU_2 = 20e-6
+DEFAULT_VHS_PRE_DEEMPHASIS_BANDWIDTH = 1
 
 # Low shelf filter for deemphasis
 DEFAULT_VHS_DEEMPHASIS_TAU_1 = 240e-6
 DEFAULT_VHS_DEEMPHASIS_TAU_2 = 56e-6
 DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE = 1
-DEFAULT_VHS_DEEMPHASIS_BANDWIDTH = 0.393
+DEFAULT_VHS_DEEMPHASIS_BANDWIDTH = 1
 
 DEFAULT_8MM_DEEMPHASIS_TAU_1 = 1.1e-4
 DEFAULT_8MM_DEEMPHASIS_TAU_2 = 1.3e-5
@@ -575,9 +578,13 @@ def build_shelf_filter(
     if direction == "low":
         b_analog = [tau2 ** 2 / tau1, b_1]
         a_analog = [tau1, 1]
+        gain = b_analog[1] / a_analog[1]
     else:
         b_analog = [tau2, b_1]
         a_analog = [tau2, 1]
+        gain = b_analog[0] / a_analog[0]
+
+    b_analog = [b / gain for b in b_analog]
 
     b_digital, a_digital = bilinear(b_analog, a_analog, fs)
 
@@ -938,14 +945,21 @@ class Expander:
         self.audio_rate = audio_rate
         self.linear_to_db = 20 / log(10)
         self.db_to_linear = log(10) / 20
+        envelope_detection_smoothing_tau = 0.001
 
         # makeup gain to apply after expansion
         self.gain = 10 ** (gain / 20)
         self.ratio = float(ratio)
-        self.atkCoeff = np.exp(-1.0 / (attack_tau * self.audio_rate))
-        self.relCoeff = np.exp(-1.0 / (release_tau * self.audio_rate))
+
+        error_db = 10
+        target_db = 2
+        K = np.log(error_db / target_db)
+        self.atkCoeff = np.exp(-K / (attack_tau * self.audio_rate))
+        self.relCoeff = np.exp(-K / (release_tau * self.audio_rate))
+        self.detCoeff = np.exp(-1 / (envelope_detection_smoothing_tau * self.audio_rate))
 
         self.env_db = -120.0
+        self.det_db = 0
 
         # this is set to avoid high frequency noise to interfere with the NR envelope tracking
         self.Lo_cut = 17e3
@@ -991,13 +1005,15 @@ class Expander:
         [(
             NumbaAudioArray,
             numba.types.Array(numba.types.float32, 1, "A"),
-            numba.types.float32,
-            numba.types.float32,
-            numba.types.float32,
-            numba.types.float32,
-            numba.types.float32,
-            numba.types.float32,
-            numba.types.float32
+            numba.types.float64,
+            numba.types.float64,
+            numba.types.float64,
+            numba.types.float64,
+            numba.types.float64,
+            numba.types.float64,
+            numba.types.float64,
+            numba.types.float64,
+            numba.types.float64
         )],
         cache=True,
         fastmath=True,
@@ -1006,29 +1022,37 @@ class Expander:
     def expand(
         audio,
         side_chain,
-        env_db,
+        env_db,          # persistent GAIN state (dB)
+        det_db,
         linear_to_db,
         db_to_linear,
         atkCoeff,
         relCoeff,
+        detCoeff,
         gain,
         ratio,
     ):
         audio_len = audio.shape[0]
-        ratio_m1 = ratio - 1
-
+        ratio_m1 = ratio - 1.0  # downward expander ratio
+    
         for i in range(audio_len):
-            # envelope in db
+            # ---- 1. Peak detector ----
             sc_db = log(abs(side_chain[i]) + 1e-20) * linear_to_db
 
-            coeff = relCoeff + (atkCoeff - relCoeff) * (sc_db > env_db)
-            env_db = coeff * env_db + (1.0 - coeff) * sc_db
+            # ---- 2. Detector smoothing (1–3 ms typical) ----
+            det_db = det_db + (sc_db - det_db) * detCoeff
 
-            gain_db = ratio_m1 * env_db
+            # ---- 3. Ideal expander gain ----
+            target_gain_db = ratio_m1 * det_db  # only below threshold (0 dB)
 
-            audio[i] *= exp(gain_db * db_to_linear) * gain
+            # ---- 5. Attack/release smoothing ----
+            coeff = relCoeff + (atkCoeff - relCoeff) * (target_gain_db < env_db)
+            env_db = coeff * env_db + (1.0 - coeff) * target_gain_db
+
+            # ---- 6. Apply gain ----
+            audio[i] *= exp(env_db * db_to_linear) * gain
     
-        return env_db
+        return env_db, det_db
 
     def process(self, pre_in, audio_out):
         # prevent high frequency noise from interfering with envelope detector
@@ -1044,14 +1068,16 @@ class Expander:
             self.zi_y
         )
 
-        self.env_db = Expander.expand(
+        self.env_db, self.det_db = Expander.expand(
             audio_out,
             side_chain,
             self.env_db,
+            self.det_db,
             self.linear_to_db,
             self.db_to_linear,
             self.atkCoeff,
             self.relCoeff,
+            self.detCoeff,
             self.gain,
             self.ratio
         )
