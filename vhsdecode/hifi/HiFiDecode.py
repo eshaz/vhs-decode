@@ -962,7 +962,7 @@ class Expander:
         self.det_db = 0
 
         # this is set to avoid high frequency noise to interfere with the NR envelope tracking
-        self.Lo_cut = 21e3
+        self.Lo_cut = 18e3
         self.Lo_transition = 10e3
 
         self.lowcut_iirb, self.lowcut_iira = firdes_lowpass(
