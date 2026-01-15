@@ -953,9 +953,9 @@ class Expander:
 
         error_db = 10
         target_db = 2
-        K = np.log(error_db / target_db)
-        self.atkCoeff = np.exp(-K / (attack_tau * self.audio_rate))
-        self.relCoeff = np.exp(-K / (release_tau * self.audio_rate))
+        K = np.log(target_db / error_db)
+        self.atkCoeff = np.exp(K / (attack_tau * self.audio_rate))
+        self.relCoeff = np.exp(K / (release_tau * self.audio_rate))
         self.detCoeff = np.exp(-1 / (envelope_detection_smoothing_tau * self.audio_rate))
 
         self.env_db = -120.0
@@ -963,7 +963,7 @@ class Expander:
 
         # this is set to avoid high frequency noise to interfere with the NR envelope tracking
         self.Lo_cut = 18e3
-        self.Lo_transition = 5e3
+        self.Lo_transition = 8e3
 
         self.lowcut_iirb, self.lowcut_iira = firdes_lowpass(
             self.audio_rate,
@@ -971,7 +971,7 @@ class Expander:
             self.Lo_transition,
         )
         self.WeightedLowcut = FiltersClass(
-            np.array(self.lowcut_iirb), np.array(self.lowcut_iira), dtype=np.float32
+            np.array(self.lowcut_iirb), np.array(self.lowcut_iira), dtype=np.float64
         )
 
         # first low pass
@@ -1065,7 +1065,7 @@ class Expander:
 
     def process(self, pre_in, audio_out):
         # prevent high frequency noise from interfering with envelope detector
-        side_chain = self.WeightedLowcut.filtfilt(pre_in)
+        side_chain = self.WeightedLowcut.filtfilt(pre_in).astype(np.float32)
         
         # apply the low pass filter
         self.zi_lp_x, self.zi_lp_y = Deemphasis.lfilt_inplace(
