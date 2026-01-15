@@ -881,12 +881,20 @@ class Deemphasis:
     @njit(
         [
             (
-                numba.types.Array(numba.types.float32, 1, "A"),
+                numba.types.Array(numba.types.float32, 1, "C"),
                 numba.types.float32,
                 numba.types.float32,
                 numba.types.float32,
                 numba.types.float32,
                 numba.types.float32,
+            ),
+            (
+                numba.types.Array(numba.types.float64, 1, "A"),
+                numba.types.float64,
+                numba.types.float64,
+                numba.types.float64,
+                numba.types.float64,
+                numba.types.float64,
             )
         ],
         cache=True,
@@ -1013,7 +1021,7 @@ class Expander:
     @njit(
         [(
             NumbaAudioArray,
-            numba.types.Array(numba.types.float32, 1, "A"),
+            numba.types.Array(numba.types.float64, 1, "A"),
             numba.types.float64,
             numba.types.float64,
             numba.types.float64,
@@ -1065,7 +1073,7 @@ class Expander:
 
     def process(self, pre_in, audio_out):
         # prevent high frequency noise from interfering with envelope detector
-        side_chain = self.WeightedLowcut.filtfilt(pre_in).astype(np.float32)
+        side_chain = self.WeightedLowcut.filtfilt(pre_in)
         
         # apply the low pass filter
         self.zi_lp_x, self.zi_lp_y = Deemphasis.lfilt_inplace(
