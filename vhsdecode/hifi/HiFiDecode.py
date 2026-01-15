@@ -962,17 +962,25 @@ class Expander:
         self.det_db = 0
 
         # this is set to avoid high frequency noise to interfere with the NR envelope tracking
-        self.Lo_cut = 17e3
-        self.Lo_transition = 5e3
+        self.Lo_cut = 21e3
+        self.Lo_transition = 10e3
 
-        self.locut_iirb, self.locut_iira = simple_lowpass(
+        self.lowcut_iirb, self.lowcut_iira = firdes_lowpass(
+            self.audio_rate,
+            self.Lo_cut,
+            self.Lo_transition,
+        )
+        self.WeightedLowcut = FiltersClass(
+            np.array(self.lowcut_iirb), np.array(self.lowcut_iira), dtype=np.float32
+        )
+
+        # first low pass
+        self.lowpass_iirb, self.lowpass_iira = simple_lowpass(
             self.audio_rate,
             weighting_low_pass
         )
-
-        self.WeightedLowpass = FiltersClass(
-            np.array(self.locut_iirb), np.array(self.locut_iira), dtype=np.float32
-        )
+        self.zi_lp_x = 0.0
+        self.zi_lp_y = 0.0
 
         # weighted filter for envelope detector
         self.weighting_T1 = weighting_low_tau
@@ -991,10 +999,11 @@ class Expander:
 
     def get_response(self):
         # compute frequency response
-        w, h_low = freqz(self.locut_iirb, self.locut_iira, worN=4096, fs=self.audio_rate)
+        w, h_cut = freqz(self.lowcut_iirb, self.lowcut_iira, worN=4096, fs=self.audio_rate)
+        _, h_low = freqz(self.lowpass_iirb, self.lowpass_iira, worN=4096, fs=self.audio_rate)
         _, h_high = freqz(self.env_iirb, self.env_iira, worN=4096, fs=self.audio_rate)
     
-        h_total = h_low * h_high
+        h_total = h_cut * h_low * h_high
     
         magnitude_db = 20 * np.log10(np.abs(h_total))
 
@@ -1056,7 +1065,17 @@ class Expander:
 
     def process(self, pre_in, audio_out):
         # prevent high frequency noise from interfering with envelope detector
-        side_chain = self.WeightedLowpass.lfilt(pre_in)
+        side_chain = self.WeightedLowcut.filtfilt(pre_in)
+        
+        # apply the low pass filter
+        self.zi_lp_x, self.zi_lp_y = Deemphasis.lfilt_inplace(
+            side_chain,
+            self.lowpass_iirb[0],
+            self.lowpass_iirb[1],
+            self.lowpass_iira[1],
+            self.zi_lp_x,
+            self.zi_lp_y
+        )
 
         # high pass weighted input to envelope detector
         self.zi_x, self.zi_y = Deemphasis.lfilt_inplace(

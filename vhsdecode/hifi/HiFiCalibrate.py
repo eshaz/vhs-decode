@@ -478,15 +478,15 @@ def main() -> int:
     args = parser.parse_args()
 
     param_dict = {
-        'expander_attack_tau': {'min':1e-3,'max':10e-3,'step':1e-3},
+        'expander_attack_tau': {'min':3e-3,'max':10e-3,'step':1e-3},
         'expander_release_tau': {'min':DEFAULT_EXPANDER_RELEASE_TAU-.0014,'max':DEFAULT_EXPANDER_RELEASE_TAU+.0014,'step':1e-3},
         'expander_gain': {'min':DEFAULT_EXPANDER_GAIN,'max':DEFAULT_EXPANDER_GAIN,'step':1},
         'expander_ratio': {'min':DEFAULT_EXPANDER_RATIO,'max':DEFAULT_EXPANDER_RATIO,'step':1},
         
         'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'step':1e-7},
         'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1e-6},
-        'expander_weighting_low_pass_tau': {'min':0.6e-5,'max':4e-5,'step':1e-6},
-        'expander_weighting_bandwidth': {'min':1,'max':5,'step':0.01},
+        'expander_weighting_low_pass_tau': {'min':8e-6,'max':4e-5,'step':1e-6},
+        'expander_weighting_bandwidth': {'min':0.8,'max':3,'step':0.01},
         
         'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1,'step':1},
         'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1},
