@@ -47,7 +47,7 @@ from vhsdecode.hifi.utils import DecoderSharedMemory, NumbaAudioArray
 
 import matplotlib.pyplot as plt
 
-DEFAULT_EXPANDER_GAIN = 40
+DEFAULT_EXPANDER_GAIN = 20
 DEFAULT_EXPANDER_RATIO = 2 #           2:1 logarithmic
 DEFAULT_EXPANDER_ATTACK_TAU = 5e-3 #   3us to 10us
 DEFAULT_EXPANDER_RELEASE_TAU = 70e-3 # 70us +-20%
@@ -60,7 +60,7 @@ DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1 = 240e-6 # 240us
 DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 = 24e-6 #  24us
 DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH = 1
 DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS = 20000
-DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION = 3200
+DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION = 153600
 
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1 = 5.5e-5
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2 = 2.35e-5
@@ -993,6 +993,7 @@ class Expander:
         error_db = 20
         target_db = 2
         K = np.log(target_db / error_db)
+        #K = -np.log(9)
         self.atkCoeff = np.exp(K / (attack_tau * self.audio_rate))
         self.relCoeff = np.exp(K / (release_tau * self.audio_rate))
 
@@ -1042,7 +1043,7 @@ class Expander:
         self.zi_x = 0.0
         self.zi_y = 0.0
 
-        # calculate group delay for all filters to pick the right envelope look ahead
+        # sum group delay for all filters to determine the correct envelope look ahead
         total_group_delay = ceil(
             # self.max_group_delay(self.lowpass_iirb, self.lowpass_iira) + 
             self.max_group_delay(self.deemphasis_iirb, self.deemphasis_iira) + 
@@ -1115,8 +1116,8 @@ class Expander:
         ratio,
     ):
         n = audio.shape[0]
-        ratio_m1 = ratio - 1.0
         buf_len = delay_buf.shape[0]
+        rel_minus_atk = relCoeff - atkCoeff
 
         for i in range(n):
             # delay peak detection to do lookahead attack / release
@@ -1126,11 +1127,19 @@ class Expander:
             sc_db = log(abs(side_chain[i]) + 1e-20) * linear_to_db
             
             # apply ratio
-            target_gain_db = ratio_m1 * sc_db
+            target_gain_db = sc_db * ratio - sc_db
 
-            # attack or release
-            coeff = relCoeff + (atkCoeff - relCoeff) * (target_gain_db < env_db)
-            env_db = coeff * env_db + (1.0 - coeff) * target_gain_db
+            # attack or release coefficient
+            is_release = env_db > target_gain_db
+            coeff = atkCoeff + rel_minus_atk * is_release
+
+            # apply attack / release
+            env_db = coeff * env_db + (1 - coeff) * target_gain_db
+
+            #if env_db < target_gain_db:
+            #    env_db = atkCoeff * env_db + (1 - atkCoeff) * target_gain_db
+            #else:
+            #    env_db = relCoeff * env_db + (1 - relCoeff) * target_gain_db
 
             read_idx = (delay_idx + 1) % buf_len
             delayed_sample = delay_buf[read_idx]
