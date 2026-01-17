@@ -563,13 +563,13 @@ def main() -> int:
                                 result.rms_error
                             ]
 
-                            if result.similarity >= best_similarity or result.rms_error <= best_rms_error:
+                            if result.similarity > best_similarity or result.rms_error < best_rms_error:
                                 print("new best result", row)
 
                                 writer.writerow(row)
-                                if result.similarity >= best_similarity:
+                                if result.similarity > best_similarity:
                                     best_similarity = result.similarity
-                                if result.rms_error <= best_rms_error:
+                                if result.rms_error < best_rms_error:
                                     best_rms_error = result.rms_error
                             else:
                                 print(row, end="\r")
@@ -598,13 +598,13 @@ def main() -> int:
                         result.rms_error
                     ]
 
-                    if result.similarity >= best_similarity or result.rms_error <= best_rms_error:
+                    if result.similarity > best_similarity or result.rms_error < best_rms_error:
                         print("new best result", row)
 
                         writer.writerow(row)
-                        if result.similarity >= best_similarity:
+                        if result.similarity > best_similarity:
                             best_similarity = result.similarity
-                        if result.rms_error <= best_rms_error:
+                        if result.rms_error < best_rms_error:
                             best_rms_error = result.rms_error
                     else:
                         print(row, end="\r")
