@@ -504,8 +504,8 @@ def main() -> int:
         'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'step':1e-7},
         'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1e-6},
         'expander_weighting_bandwidth': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,'step':0.01},
-        'expander_weighting_low_pass': {'min':1000,'max':500000,'step':500},
-        'expander_weighting_low_pass_transition': {'min':1000,'max':25000,'step':200},
+        'expander_weighting_low_pass': {'min':4000,'max':22000,'step':500},
+        'expander_weighting_low_pass_transition': {'min':1000,'max':200000,'step':200},
         
         'deemphasis_tau_1': {'min':DEFAULT_VHS_NR_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_NR_DEEMPHASIS_TAU_1,'step':1},
         'deemphasis_tau_2': {'min':DEFAULT_VHS_NR_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_NR_DEEMPHASIS_TAU_2,'step':1},
