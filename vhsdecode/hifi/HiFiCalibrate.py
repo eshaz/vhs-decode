@@ -35,13 +35,13 @@ from vhsdecode.hifi.HiFiDecode import (
     DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,
     DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,
     DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS,
+    DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION,
     DEFAULT_VHS_DEEMPHASIS_TAU_1,
     DEFAULT_VHS_DEEMPHASIS_TAU_2,
-    DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE,
     DEFAULT_VHS_DEEMPHASIS_BANDWIDTH,
-    DEFAULT_VHS_PRE_DEEMPHASIS_TAU_1,
-    DEFAULT_VHS_PRE_DEEMPHASIS_TAU_2,
-    DEFAULT_VHS_PRE_DEEMPHASIS_BANDWIDTH
+    DEFAULT_VHS_NR_DEEMPHASIS_TAU_1,
+    DEFAULT_VHS_NR_DEEMPHASIS_TAU_2,
+    DEFAULT_VHS_NR_DEEMPHASIS_BANDWIDTH
 )
 
 default_threads = cpu_count()
@@ -97,12 +97,15 @@ class CalibrateResult():
     expander_ratio: float
     expander_weighting_tau_1: float
     expander_weighting_tau_2: float
-    expander_weighting_low_pass_tau: float
     expander_weighting_bandwidth: float
+    expander_weighting_low_pass: float
+    expander_weighting_low_pass_transition: float
     deemphasis_tau_1: float
     deemphasis_tau_2: float
-    deemphasis_db_per_octave: float
     deemphasis_bandwidth: float
+    nr_deemphasis_tau_1: float
+    nr_deemphasis_tau_2: float
+    nr_deemphasis_bandwidth: float
     similarity: float
     max_gain_error: float
     rms_error: float
@@ -114,12 +117,15 @@ class CalibrateResult():
         'expander_ratio',
         'expander_weighting_tau_1',
         'expander_weighting_tau_2',
-        'expander_weighting_low_pass_tau',
         'expander_weighting_bandwidth',
+        'expander_weighting_low_pass',
+        'expander_weighting_low_pass_transition',
         'deemphasis_tau_1',
         'deemphasis_tau_2',
-        'deemphasis_db_per_octave',
         'deemphasis_bandwidth',
+        'nr_deemphasis_tau_1',
+        'nr_deemphasis_tau_2',
+        'nr_deemphasis_bandwidth',
     ]
 
     def __init__(self,
@@ -129,12 +135,15 @@ class CalibrateResult():
         expander_ratio,
         expander_weighting_tau_1,
         expander_weighting_tau_2,
-        expander_weighting_low_pass_tau,
         expander_weighting_bandwidth,
+        expander_weighting_low_pass,
+        expander_weighting_low_pass_transition,
         deemphasis_tau_1,
         deemphasis_tau_2,
-        deemphasis_db_per_octave,
-        deemphasis_bandwidth
+        deemphasis_bandwidth,
+        nr_deemphasis_tau_1,
+        nr_deemphasis_tau_2,
+        nr_deemphasis_bandwidth,
     ):
         self.expander_attack_tau = expander_attack_tau
         self.expander_release_tau = expander_release_tau
@@ -143,13 +152,17 @@ class CalibrateResult():
 
         self.expander_weighting_tau_1 = expander_weighting_tau_1
         self.expander_weighting_tau_2 = expander_weighting_tau_2
-        self.expander_weighting_low_pass_tau = expander_weighting_low_pass_tau
         self.expander_weighting_bandwidth = expander_weighting_bandwidth
+        self.expander_weighting_low_pass = expander_weighting_low_pass
+        self.expander_weighting_low_pass_transition = expander_weighting_low_pass_transition
 
         self.deemphasis_tau_1 = deemphasis_tau_1
         self.deemphasis_tau_2 = deemphasis_tau_2
-        self.deemphasis_db_per_octave = deemphasis_db_per_octave
         self.deemphasis_bandwidth = deemphasis_bandwidth
+
+        self.nr_deemphasis_tau_1 = nr_deemphasis_tau_1
+        self.nr_deemphasis_tau_2 = nr_deemphasis_tau_2
+        self.nr_deemphasis_bandwidth = nr_deemphasis_bandwidth
         
 
 class CalibrateSharedMemory():
@@ -306,20 +319,14 @@ def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData,
 
     decoded_processed_channel = decoded_raw_channel.copy()
 
-    pre_deemphasis = Deemphasis(
-        decoded_raw.sample_rate,
-        DEFAULT_VHS_PRE_DEEMPHASIS_TAU_1,
-        DEFAULT_VHS_PRE_DEEMPHASIS_TAU_2,
-        1,
-        DEFAULT_VHS_PRE_DEEMPHASIS_BANDWIDTH
-    )
-
     deemphasis = Deemphasis(
         decoded_raw.sample_rate,
         params.deemphasis_tau_1,
         params.deemphasis_tau_2,
-        params.deemphasis_db_per_octave,
-        params.deemphasis_bandwidth
+        params.deemphasis_bandwidth,
+        params.nr_deemphasis_tau_1,
+        params.nr_deemphasis_tau_2,
+        params.nr_deemphasis_bandwidth
     )
 
     expander = Expander(
@@ -328,13 +335,15 @@ def test_decode_params(params: CalibrateResult, decoded_raw: CalibrateAudioData,
         params.expander_ratio,
         params.expander_attack_tau,
         params.expander_release_tau,
+        params.deemphasis_tau_1,
+        params.deemphasis_tau_2,
+        params.deemphasis_bandwidth,
         params.expander_weighting_tau_1,
         params.expander_weighting_tau_2,
-        params.expander_weighting_low_pass_tau,
         params.expander_weighting_bandwidth,
+        params.expander_weighting_low_pass,
+        params.expander_weighting_low_pass_transition,
     )
-
-    pre_deemphasis.process(decoded_processed_channel)
 
     deemphasis.process(decoded_processed_channel)
     # prime expander
@@ -400,13 +409,22 @@ def partial_filter(combo):
     combo: list of floats for the first N parameters
     Returns True if this partial combination could still be valid
     """
-    # combo[4]: ew_tau1, combo[5]: ew_tau2
-    if len(combo) >= 6 and combo[4] <= combo[5]:
+    # attack < release
+    if len(combo) >= 2 and combo[0] >= combo[1]:
         return False
     
-    # combo[8]: d_tau1, combo[9]: d_tau2
-    if len(combo) >= 10 and combo[8] <= combo[9]:
+    # expander_weighting_tau_1 > expander_weighting_tau_2
+    if len(combo) >= 6 and combo[4] <= combo[5]:
         return False
+
+    # deemphasis_tau_1 > deemphasis_tau_2
+    if len(combo) >= 11 and combo[9] <= combo[10]:
+        return False
+
+    # nr_deemphasis_tau_1 > nr_deemphasis_tau_2
+    if len(combo) >= 14 and combo[12] <= combo[13]:
+        return False
+
     return True
 
 def recursive_generate(ranges, combo=None, depth=0):
@@ -478,20 +496,24 @@ def main() -> int:
     args = parser.parse_args()
 
     param_dict = {
-        'expander_attack_tau': {'min':3e-3,'max':10e-3,'step':1e-3},
-        'expander_release_tau': {'min':DEFAULT_EXPANDER_RELEASE_TAU-.0014,'max':DEFAULT_EXPANDER_RELEASE_TAU+.0014,'step':1e-3},
+        'expander_attack_tau': {'min':DEFAULT_EXPANDER_ATTACK_TAU,'max':DEFAULT_EXPANDER_ATTACK_TAU,'step':1e-4},
+        'expander_release_tau': {'min':DEFAULT_EXPANDER_RELEASE_TAU,'max':DEFAULT_EXPANDER_RELEASE_TAU,'step':1e-4},
         'expander_gain': {'min':DEFAULT_EXPANDER_GAIN,'max':DEFAULT_EXPANDER_GAIN,'step':1},
         'expander_ratio': {'min':DEFAULT_EXPANDER_RATIO,'max':DEFAULT_EXPANDER_RATIO,'step':1},
         
         'expander_weighting_tau_1': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,'step':1e-7},
         'expander_weighting_tau_2': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,'step':1e-6},
-        'expander_weighting_low_pass_tau': {'min':8e-6,'max':4e-5,'step':1e-6},
-        'expander_weighting_bandwidth': {'min':0.8,'max':3,'step':0.01},
+        'expander_weighting_bandwidth': {'min':DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,'max':DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH,'step':0.01},
+        'expander_weighting_low_pass': {'min':1000,'max':500000,'step':500},
+        'expander_weighting_low_pass_transition': {'min':1000,'max':25000,'step':200},
         
-        'deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1,'step':1},
-        'deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1},
-        'deemphasis_db_per_octave': {'min':1,'max':1,'step':0.1},
-        'deemphasis_bandwidth': {'min':DEFAULT_VHS_DEEMPHASIS_BANDWIDTH,'max':DEFAULT_VHS_DEEMPHASIS_BANDWIDTH,'step':0.001},
+        'deemphasis_tau_1': {'min':DEFAULT_VHS_NR_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_NR_DEEMPHASIS_TAU_1,'step':1},
+        'deemphasis_tau_2': {'min':DEFAULT_VHS_NR_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_NR_DEEMPHASIS_TAU_2,'step':1},
+        'deemphasis_bandwidth': {'min':DEFAULT_VHS_NR_DEEMPHASIS_BANDWIDTH,'max':DEFAULT_VHS_NR_DEEMPHASIS_BANDWIDTH,'step':0.001},
+        
+        'nr_deemphasis_tau_1': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_1,'max':DEFAULT_VHS_DEEMPHASIS_TAU_1,'step':1},
+        'nr_deemphasis_tau_2': {'min':DEFAULT_VHS_DEEMPHASIS_TAU_2,'max':DEFAULT_VHS_DEEMPHASIS_TAU_2,'step':1},
+        'nr_deemphasis_bandwidth': {'min':DEFAULT_VHS_DEEMPHASIS_BANDWIDTH,'max':DEFAULT_VHS_DEEMPHASIS_BANDWIDTH,'step':0.001},
     }
 
     ranges = get_ranges(param_dict)
@@ -521,13 +543,24 @@ def main() -> int:
                         for f in done:
                             result = f.result()
                             row = [
-                                result.expander_attack_tau, result.expander_release_tau,
-                                result.expander_gain, result.expander_ratio,
-                                result.expander_weighting_tau_1, result.expander_weighting_tau_2,
-                                result.expander_weighting_low_pass_tau, result.expander_weighting_bandwidth,
-                                result.deemphasis_tau_1, result.deemphasis_tau_2,
-                                result.deemphasis_db_per_octave, result.deemphasis_bandwidth,
-                                result.similarity, result.max_gain_error, result.rms_error
+                                result.expander_attack_tau,
+                                result.expander_release_tau,
+                                result.expander_gain,
+                                result.expander_ratio,
+                                result.expander_weighting_tau_1,
+                                result.expander_weighting_tau_2,
+                                result.expander_weighting_bandwidth,
+                                result.expander_weighting_low_pass,
+                                result.expander_weighting_low_pass_transition,
+                                result.deemphasis_tau_1,
+                                result.deemphasis_tau_2,
+                                result.deemphasis_bandwidth,
+                                result.nr_deemphasis_tau_1,
+                                result.nr_deemphasis_tau_2,
+                                result.nr_deemphasis_bandwidth,
+                                result.similarity,
+                                result.max_gain_error,
+                                result.rms_error
                             ]
 
                             if result.similarity >= best_similarity or result.rms_error <= best_rms_error:
@@ -545,13 +578,24 @@ def main() -> int:
                 for f in as_completed(futures):
                     result = f.result()
                     row = [
-                        result.expander_attack_tau, result.expander_release_tau,
-                        result.expander_gain, result.expander_ratio,
-                        result.expander_weighting_tau_1, result.expander_weighting_tau_2,
-                        result.expander_weighting_low_pass_tau, result.expander_weighting_bandwidth,
-                        result.deemphasis_tau_1, result.deemphasis_tau_2,
-                        result.deemphasis_db_per_octave, result.deemphasis_bandwidth,
-                        result.similarity, result.max_gain_error, result.rms_error
+                        result.expander_attack_tau,
+                        result.expander_release_tau,
+                        result.expander_gain,
+                        result.expander_ratio,
+                        result.expander_weighting_tau_1,
+                        result.expander_weighting_tau_2,
+                        result.expander_weighting_bandwidth,
+                        result.expander_weighting_low_pass,
+                        result.expander_weighting_low_pass_transition,
+                        result.deemphasis_tau_1,
+                        result.deemphasis_tau_2,
+                        result.deemphasis_bandwidth,
+                        result.nr_deemphasis_tau_1,
+                        result.nr_deemphasis_tau_2,
+                        result.nr_deemphasis_bandwidth,
+                        result.similarity,
+                        result.max_gain_error,
+                        result.rms_error
                     ]
 
                     if result.similarity >= best_similarity or result.rms_error <= best_rms_error:

@@ -30,7 +30,8 @@ from scipy.signal import (
     fftconvolve,
     find_peaks,
     freqz,
-    bilinear
+    bilinear,
+    group_delay
 )
 from scipy.interpolate import interp1d
 from soxr import ResampleStream, resample
@@ -46,41 +47,43 @@ from vhsdecode.hifi.utils import DecoderSharedMemory, NumbaAudioArray
 
 import matplotlib.pyplot as plt
 
-
 DEFAULT_EXPANDER_GAIN = 40
-DEFAULT_EXPANDER_RATIO = 2
-DEFAULT_EXPANDER_ATTACK_TAU = 6e-3 # 3e-3 to 10e-3
-DEFAULT_EXPANDER_RELEASE_TAU = 70e-3
+DEFAULT_EXPANDER_RATIO = 2 #           2:1 logarithmic
+DEFAULT_EXPANDER_ATTACK_TAU = 5e-3 #   3us to 10us
+DEFAULT_EXPANDER_RELEASE_TAU = 70e-3 # 70us +-20%
 
 # TAU_1         low end of shelf curve
 # TAU_2         high end of shelf curve
-# DB_PER_OCTAVE slope of the filter
 
 # High shelf filter for weighted input to expander
-DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1 = 240e-6
-DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 = 24e-6 # 56e-6
-DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS = 1.74e-5 #1.58e-5, 1.45e-5
+DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1 = 240e-6 # 240us
+DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 = 24e-6 #  24us
 DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH = 1
+DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS = 20000
+DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION = 3200
 
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1 = 5.5e-5
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2 = 2.35e-5
-DEFAULT_8MM_EXPANDER_WEIGHTING_DB_PER_OCTAVE = 6
 DEFAULT_8MM_EXPANDER_WEIGHTING_BANDWIDTH = 2.393
+DEFAULT_8MM_EXPANDER_WEIGHTING_LOW_PASS = 20000
+DEFAULT_8MM_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION = 3200
 
-DEFAULT_VHS_PRE_DEEMPHASIS_TAU_1 = 56e-6
-DEFAULT_VHS_PRE_DEEMPHASIS_TAU_2 = 20e-6
-DEFAULT_VHS_PRE_DEEMPHASIS_BANDWIDTH = 1
-
-# Low shelf filter for deemphasis
-DEFAULT_VHS_DEEMPHASIS_TAU_1 = 240e-6
-DEFAULT_VHS_DEEMPHASIS_TAU_2 = 56e-6
-DEFAULT_VHS_DEEMPHASIS_DB_PER_OCTAVE = 1
+DEFAULT_VHS_DEEMPHASIS_TAU_1 = 56e-6 # 56us +- 20%
+DEFAULT_VHS_DEEMPHASIS_TAU_2 = 20e-6 # 20us +- 20%
 DEFAULT_VHS_DEEMPHASIS_BANDWIDTH = 1
 
-DEFAULT_8MM_DEEMPHASIS_TAU_1 = 1.1e-4
-DEFAULT_8MM_DEEMPHASIS_TAU_2 = 1.3e-5
-DEFAULT_8MM_DEEMPHASIS_DB_PER_OCTAVE = 6
-DEFAULT_8MM_DEEMPHASIS_BANDWIDTH = 2.4
+DEFAULT_8MM_DEEMPHASIS_TAU_1 = 56e-6
+DEFAULT_8MM_DEEMPHASIS_TAU_2 = 20e-6
+DEFAULT_8MM_DEEMPHASIS_BANDWIDTH = 1
+
+# Low shelf filter for deemphasis
+DEFAULT_VHS_NR_DEEMPHASIS_TAU_1 = 240e-6 # 240us
+DEFAULT_VHS_NR_DEEMPHASIS_TAU_2 = 56e-6 #  56us
+DEFAULT_VHS_NR_DEEMPHASIS_BANDWIDTH = 1
+
+DEFAULT_8MM_NR_DEEMPHASIS_TAU_1 = 1.1e-4
+DEFAULT_8MM_NR_DEEMPHASIS_TAU_2 = 1.3e-5
+DEFAULT_8MM_NR_DEEMPHASIS_BANDWIDTH = 2.4
 
 # set the amount of spectral noise reduction to apply to the signal before deemphasis
 DEFAULT_SPECTRAL_NR_AMOUNT = 0.4
@@ -848,16 +851,20 @@ class Deemphasis:
         audio_rate,
         deemphasis_low_tau: float,
         deemphasis_high_tau: float,
-        deemphasis_db_per_octave: float,
         deemphasis_bandwidth: float,
+        nr_deemphasis_low_tau: float,
+        nr_deemphasis_high_tau: float,
+        nr_deemphasis_bandwidth: float,
     ):
         self.audio_rate = audio_rate
 
         # deemphasis filter for output audio
         self.deemphasis_T1 = deemphasis_low_tau
         self.deemphasis_T2 = deemphasis_high_tau
-        self.deemphasis_db_per_octave = deemphasis_db_per_octave
         self.deemphasis_bandwidth = deemphasis_bandwidth
+        self.nr_deemphasis_T1 = nr_deemphasis_low_tau
+        self.nr_deemphasis_T2 = nr_deemphasis_high_tau
+        self.nr_deemphasis_bandwidth = nr_deemphasis_bandwidth
 
         self.deemph_b, self.deemph_a = build_shelf_filter(
             "low",
@@ -866,13 +873,26 @@ class Deemphasis:
             self.deemphasis_bandwidth,
             self.audio_rate,
         )
-        self.zi_x = 0.0
-        self.zi_y = 0.0
+        self.zi_deemph_x = 0.0
+        self.zi_deemph_y = 0.0
+
+        self.nr_deemph_b, self.nr_deemph_a = build_shelf_filter(
+            "low",
+            self.nr_deemphasis_T1,
+            self.nr_deemphasis_T2,
+            self.nr_deemphasis_bandwidth,
+            self.audio_rate,
+        )
+        self.zi_nr_deemph_x = 0.0
+        self.zi_nr_deemph_y = 0.0
 
     def get_response(self):
         # compute frequency response
-        w, h_total = freqz(self.deemph_b, self.deemph_a, worN=4096, fs=self.audio_rate)
+        w, h_nr_deemph = freqz(self.nr_deemph_b, self.nr_deemph_a, worN=4096, fs=self.audio_rate)
+        _, h_deemph = freqz(self.deemph_b, self.deemph_a, worN=4096, fs=self.audio_rate)
     
+        h_total = h_nr_deemph * h_deemph
+
         magnitude_db = 20 * np.log10(np.abs(h_total))
 
         return w, magnitude_db
@@ -881,12 +901,12 @@ class Deemphasis:
     @njit(
         [
             (
-                numba.types.Array(numba.types.float32, 1, "C"),
-                numba.types.float32,
-                numba.types.float32,
-                numba.types.float32,
-                numba.types.float32,
-                numba.types.float32,
+                numba.types.Array(numba.types.float32, 1, "A"),
+                numba.types.float64,
+                numba.types.float64,
+                numba.types.float64,
+                numba.types.float64,
+                numba.types.float64,
             ),
             (
                 numba.types.Array(numba.types.float64, 1, "A"),
@@ -921,13 +941,21 @@ class Deemphasis:
         return zi_x, zi_y
 
     def process(self, audio_out):
-        self.zi_x, self.zi_y = Deemphasis.lfilt_inplace(
+        self.zi_deemph_x, self.zi_deemph_y = Deemphasis.lfilt_inplace(
             audio_out,
             self.deemph_b[0],
             self.deemph_b[1],
             self.deemph_a[1],
-            self.zi_x,
-            self.zi_y
+            self.zi_deemph_x,
+            self.zi_deemph_y
+        )
+        self.zi_nr_deemph_x, self.zi_nr_deemph_y = Deemphasis.lfilt_inplace(
+            audio_out,
+            self.nr_deemph_b[0],
+            self.nr_deemph_b[1],
+            self.nr_deemph_a[1],
+            self.zi_nr_deemph_x,
+            self.zi_nr_deemph_y
         )
 
 def simple_lowpass(fs, tau):
@@ -941,60 +969,69 @@ class Expander:
     def __init__(
         self,
         audio_rate,
-        gain: float = DEFAULT_EXPANDER_GAIN,
-        ratio: float = DEFAULT_EXPANDER_RATIO,
-        attack_tau: float = DEFAULT_EXPANDER_ATTACK_TAU,
-        release_tau: float = DEFAULT_EXPANDER_RELEASE_TAU,
-        weighting_low_tau: float = DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,
-        weighting_high_tau: float = DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,
-        weighting_low_pass: float = DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS,
-        weighting_bandwidth: float = DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH
+        gain: float,
+        ratio: float,
+        attack_tau: float,
+        release_tau: float,
+        deemphasis_low_tau: float,
+        deemphasis_high_tau: float,
+        deemphasis_bandwidth: float,
+        weighting_low_tau: float,
+        weighting_high_tau: float,
+        weighting_bandwidth: float,
+        weighting_low_pass: float,
+        weighting_low_pass_transition: float
     ):
         self.audio_rate = audio_rate
         self.linear_to_db = 20 / log(10)
         self.db_to_linear = log(10) / 20
-        envelope_detection_smoothing_tau = 0.001
 
         # makeup gain to apply after expansion
         self.gain = 10 ** (gain / 20)
         self.ratio = float(ratio)
 
-        error_db = 10
+        error_db = 20
         target_db = 2
         K = np.log(target_db / error_db)
         self.atkCoeff = np.exp(K / (attack_tau * self.audio_rate))
         self.relCoeff = np.exp(K / (release_tau * self.audio_rate))
-        self.detCoeff = np.exp(-1 / (envelope_detection_smoothing_tau * self.audio_rate))
 
         self.env_db = -120.0
-        self.det_db = 0
 
-        # this is set to avoid high frequency noise to interfere with the NR envelope tracking
-        self.Lo_cut = 18e3
-        self.Lo_transition = 8e3
+        #self.notch_center = 15.750e3
+        #self.notch_width = 50
+        #self.notch_iirb, self.notch_iira = iirnotch(self.notch_center/(self.audio_rate/2), self.notch_center / self.notch_width)
+        #self.notch_filter = FiltersClass(
+        #    np.array(self.notch_iirb), np.array(self.notch_iira), dtype=np.float64
+        #)
 
-        self.lowcut_iirb, self.lowcut_iira = firdes_lowpass(
+        self.lowpass_iirb, self.lowpass_iira = firdes_lowpass(
             self.audio_rate,
-            self.Lo_cut,
-            self.Lo_transition,
+            min(weighting_low_pass, self.audio_rate / 2 - 1),
+            weighting_low_pass_transition
         )
         self.WeightedLowcut = FiltersClass(
-            np.array(self.lowcut_iirb), np.array(self.lowcut_iira), dtype=np.float64
+            np.array(self.lowpass_iirb), np.array(self.lowpass_iira), dtype=np.float64
         )
 
-        # first low pass
-        self.lowpass_iirb, self.lowpass_iira = simple_lowpass(
-            self.audio_rate,
-            weighting_low_pass
+        # deemphasis applied to input to noise reduction stage
+        self.deemphasis_T1 = deemphasis_low_tau
+        self.deemphasis_T2 = deemphasis_high_tau
+        self.deemphasis_bandwidth = deemphasis_bandwidth
+        self.deemphasis_iirb, self.deemphasis_iira = build_shelf_filter(
+            "low",
+            self.deemphasis_T1,
+            self.deemphasis_T2,
+            self.deemphasis_bandwidth,
+            self.audio_rate
         )
-        self.zi_lp_x = 0.0
-        self.zi_lp_y = 0.0
+        self.zi_deemph_x = 0.0
+        self.zi_deemph_y = 0.0
 
         # weighted filter for envelope detector
         self.weighting_T1 = weighting_low_tau
         self.weighting_T2 = weighting_high_tau
         self.weighting_bandwidth = weighting_bandwidth
-
         self.env_iirb, self.env_iira = build_shelf_filter(
             "high",
             self.weighting_T1,
@@ -1005,13 +1042,41 @@ class Expander:
         self.zi_x = 0.0
         self.zi_y = 0.0
 
+        # calculate group delay for all filters to pick the right envelope look ahead
+        total_group_delay = ceil(
+            # self.max_group_delay(self.lowpass_iirb, self.lowpass_iira) + 
+            self.max_group_delay(self.deemphasis_iirb, self.deemphasis_iira) + 
+            self.max_group_delay(self.env_iirb, self.env_iira)
+        )
+        
+        self.audio_delay = np.zeros(total_group_delay, dtype=np.float64)
+        self.audio_delay_idx = 0
+
+    def max_group_delay(self, b, a, f_min=20.0, f_max=20000.0, w=4096):
+        """
+        Returns maximum group delay in seconds over [f_min, f_max].
+        """
+        w, gd = group_delay((b, a), w=w, fs=self.audio_rate)
+
+        mask = (w >= f_min) & (w <= f_max)
+        gd = gd[mask]
+
+        # gd is in samples
+        return np.max(gd)
+
     def get_response(self):
         # compute frequency response
-        w, h_cut = freqz(self.lowcut_iirb, self.lowcut_iira, worN=4096, fs=self.audio_rate)
+        # _, h_notch = freqz(self.notch_iirb, self.notch_iira, worN=4096, fs=self.audio_rate)
         _, h_low = freqz(self.lowpass_iirb, self.lowpass_iira, worN=4096, fs=self.audio_rate)
-        _, h_high = freqz(self.env_iirb, self.env_iira, worN=4096, fs=self.audio_rate)
+        _, h_deemph = freqz(self.deemphasis_iirb, self.deemphasis_iira, worN=4096, fs=self.audio_rate)
+        w, h_high = freqz(self.env_iirb, self.env_iira, worN=4096, fs=self.audio_rate)
     
-        h_total = h_cut * h_low * h_high
+        h_total = (
+            # h_notch *
+            h_low * 
+            h_deemph * 
+            h_high
+        )
     
         magnitude_db = 20 * np.log10(np.abs(h_total))
 
@@ -1021,9 +1086,9 @@ class Expander:
     @njit(
         [(
             NumbaAudioArray,
-            numba.types.Array(numba.types.float64, 1, "A"),
-            numba.types.float64,
-            numba.types.float64,
+            numba.types.Array(numba.types.float64, 1, "C"),
+            numba.types.Array(numba.types.float64, 1, "C"),
+            numba.types.int32,
             numba.types.float64,
             numba.types.float64,
             numba.types.float64,
@@ -1039,50 +1104,57 @@ class Expander:
     def expand(
         audio,
         side_chain,
-        env_db,          # persistent GAIN state (dB)
-        det_db,
+        delay_buf,
+        delay_idx,
+        env_db,
         linear_to_db,
         db_to_linear,
         atkCoeff,
         relCoeff,
-        detCoeff,
         gain,
         ratio,
     ):
-        audio_len = audio.shape[0]
-        ratio_m1 = ratio - 1.0  # downward expander ratio
-    
-        for i in range(audio_len):
-            # ---- 1. Peak detector ----
+        n = audio.shape[0]
+        ratio_m1 = ratio - 1.0
+        buf_len = delay_buf.shape[0]
+
+        for i in range(n):
+            # delay peak detection to do lookahead attack / release
+            delay_buf[delay_idx] = audio[i]
+
+            # detect envelope for current sample
             sc_db = log(abs(side_chain[i]) + 1e-20) * linear_to_db
+            
+            # apply ratio
+            target_gain_db = ratio_m1 * sc_db
 
-            # ---- 2. Detector smoothing (1–3 ms typical) ----
-            det_db = det_db + (sc_db - det_db) * detCoeff
-
-            # ---- 3. Ideal expander gain ----
-            target_gain_db = ratio_m1 * det_db  # only below threshold (0 dB)
-
-            # ---- 5. Attack/release smoothing ----
+            # attack or release
             coeff = relCoeff + (atkCoeff - relCoeff) * (target_gain_db < env_db)
             env_db = coeff * env_db + (1.0 - coeff) * target_gain_db
 
-            # ---- 6. Apply gain ----
-            audio[i] *= exp(env_db * db_to_linear) * gain
-    
-        return env_db, det_db
+            read_idx = (delay_idx + 1) % buf_len
+            delayed_sample = delay_buf[read_idx]
+
+            audio[i] = delayed_sample * exp(env_db * db_to_linear) * gain
+
+            delay_idx = (delay_idx + 1) % buf_len
+
+        return env_db, delay_idx
 
     def process(self, pre_in, audio_out):
+        #pre_in = self.notch_filter.filtfilt(pre_in)
+
         # prevent high frequency noise from interfering with envelope detector
-        side_chain = self.WeightedLowcut.filtfilt(pre_in)
+        side_chain = self.WeightedLowcut.lfilt(pre_in)
         
-        # apply the low pass filter
-        self.zi_lp_x, self.zi_lp_y = Deemphasis.lfilt_inplace(
+        # reverse pre-emphasis
+        self.zi_deemph_x, self.zi_deemph_y = Deemphasis.lfilt_inplace(
             side_chain,
-            self.lowpass_iirb[0],
-            self.lowpass_iirb[1],
-            self.lowpass_iira[1],
-            self.zi_lp_x,
-            self.zi_lp_y
+            self.deemphasis_iirb[0],
+            self.deemphasis_iirb[1],
+            self.deemphasis_iira[1],
+            self.zi_deemph_x,
+            self.zi_deemph_y
         )
 
         # high pass weighted input to envelope detector
@@ -1095,18 +1167,18 @@ class Expander:
             self.zi_y
         )
 
-        self.env_db, self.det_db = Expander.expand(
+        self.env_db, self.audio_delay_idx = Expander.expand(
             audio_out,
             side_chain,
+            self.audio_delay,
+            self.audio_delay_idx,
             self.env_db,
-            self.det_db,
             self.linear_to_db,
             self.db_to_linear,
             self.atkCoeff,
             self.relCoeff,
-            self.detCoeff,
             self.gain,
-            self.ratio
+            self.ratio,
         )
 
 
