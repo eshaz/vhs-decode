@@ -987,24 +987,18 @@ class Expander:
         self.db_to_linear = log(10) / 20
 
         # makeup gain to apply after expansion
-        self.gain = 10 ** (gain / 20)
+        self.gain = gain
         self.ratio = float(ratio)
 
         error_db = 20
         target_db = 2
-        K = np.log(target_db / error_db)
+        #K = np.log(target_db / error_db)
         #K = -np.log(9)
+        K = -1
         self.atkCoeff = np.exp(K / (attack_tau * self.audio_rate))
         self.relCoeff = np.exp(K / (release_tau * self.audio_rate))
 
         self.env_db = -120.0
-
-        #self.notch_center = 15.750e3
-        #self.notch_width = 50
-        #self.notch_iirb, self.notch_iira = iirnotch(self.notch_center/(self.audio_rate/2), self.notch_center / self.notch_width)
-        #self.notch_filter = FiltersClass(
-        #    np.array(self.notch_iirb), np.array(self.notch_iira), dtype=np.float64
-        #)
 
         self.lowpass_iirb, self.lowpass_iira = firdes_lowpass(
             self.audio_rate,
@@ -1043,31 +1037,8 @@ class Expander:
         self.zi_x = 0.0
         self.zi_y = 0.0
 
-        # sum group delay for all filters to determine the correct envelope look ahead
-        total_group_delay = ceil(
-            # self.max_group_delay(self.lowpass_iirb, self.lowpass_iira) + 
-            self.max_group_delay(self.deemphasis_iirb, self.deemphasis_iira) + 
-            self.max_group_delay(self.env_iirb, self.env_iira)
-        )
-        
-        self.audio_delay = np.zeros(total_group_delay, dtype=np.float64)
-        self.audio_delay_idx = 0
-
-    def max_group_delay(self, b, a, f_min=20.0, f_max=20000.0, w=4096):
-        """
-        Returns maximum group delay in seconds over [f_min, f_max].
-        """
-        w, gd = group_delay((b, a), w=w, fs=self.audio_rate)
-
-        mask = (w >= f_min) & (w <= f_max)
-        gd = gd[mask]
-
-        # gd is in samples
-        return np.max(gd)
-
     def get_response(self):
         # compute frequency response
-        # _, h_notch = freqz(self.notch_iirb, self.notch_iira, worN=4096, fs=self.audio_rate)
         _, h_low = freqz(self.lowpass_iirb, self.lowpass_iira, worN=4096, fs=self.audio_rate)
         _, h_deemph = freqz(self.deemphasis_iirb, self.deemphasis_iira, worN=4096, fs=self.audio_rate)
         w, h_high = freqz(self.env_iirb, self.env_iira, worN=4096, fs=self.audio_rate)
@@ -1088,8 +1059,6 @@ class Expander:
         [(
             NumbaAudioArray,
             numba.types.Array(numba.types.float64, 1, "C"),
-            numba.types.Array(numba.types.float64, 1, "C"),
-            numba.types.int32,
             numba.types.float64,
             numba.types.float64,
             numba.types.float64,
@@ -1105,8 +1074,6 @@ class Expander:
     def expand(
         audio,
         side_chain,
-        delay_buf,
-        delay_idx,
         env_db,
         linear_to_db,
         db_to_linear,
@@ -1116,44 +1083,34 @@ class Expander:
         ratio,
     ):
         n = audio.shape[0]
-        buf_len = delay_buf.shape[0]
         rel_minus_atk = relCoeff - atkCoeff
 
+        # calculate target db (can be vectorized)
         for i in range(n):
-            # delay peak detection to do lookahead attack / release
-            delay_buf[delay_idx] = audio[i]
-
             # detect envelope for current sample
             sc_db = log(abs(side_chain[i]) + 1e-20) * linear_to_db
             
             # apply ratio
-            target_gain_db = sc_db * ratio - sc_db
+            side_chain[i] = sc_db * ratio - sc_db
 
-            # attack or release coefficient
+        # detect envelope (must be done as scalar, since envelope is stateful)
+        for i in range(n):
+            target_gain_db = side_chain[i]
+
             is_release = env_db > target_gain_db
             coeff = atkCoeff + rel_minus_atk * is_release
 
             # apply attack / release
             env_db = coeff * env_db + (1 - coeff) * target_gain_db
+            side_chain[i] = env_db
 
-            #if env_db < target_gain_db:
-            #    env_db = atkCoeff * env_db + (1 - atkCoeff) * target_gain_db
-            #else:
-            #    env_db = relCoeff * env_db + (1 - relCoeff) * target_gain_db
+        # apply expansion (can be vectorized)
+        for i in range(n):
+            audio[i] *= exp((gain + side_chain[i]) * db_to_linear)
 
-            read_idx = (delay_idx + 1) % buf_len
-            delayed_sample = delay_buf[read_idx]
-
-            audio[i] = delayed_sample * exp(env_db * db_to_linear) * gain
-
-            delay_idx = (delay_idx + 1) % buf_len
-
-        return env_db, delay_idx
+        return env_db
 
     def process(self, pre_in, audio_out):
-        #pre_in = self.notch_filter.filtfilt(pre_in)
-
-        # prevent high frequency noise from interfering with envelope detector
         side_chain = self.WeightedLowcut.lfilt(pre_in)
         
         # reverse pre-emphasis
@@ -1176,11 +1133,9 @@ class Expander:
             self.zi_y
         )
 
-        self.env_db, self.audio_delay_idx = Expander.expand(
+        self.env_db = Expander.expand(
             audio_out,
             side_chain,
-            self.audio_delay,
-            self.audio_delay_idx,
             self.env_db,
             self.linear_to_db,
             self.db_to_linear,
