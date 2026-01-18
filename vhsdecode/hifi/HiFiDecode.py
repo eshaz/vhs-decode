@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from fractions import Fraction
-from math import log, pi, sqrt, ceil, floor, atan2, log1p, cos, sin, lcm, exp, tanh
+from math import log, pi, sqrt, ceil, floor, atan2, log1p, cos, sin, lcm, exp
 from typing import Tuple
 from time import perf_counter
 from setproctitle import setproctitle
@@ -17,7 +17,7 @@ import atexit
 
 import numpy as np
 import numba
-from numba import njit, guvectorize
+from numba import njit
 from scipy.signal import (
     lfilter_zi,
     filtfilt,
@@ -30,15 +30,13 @@ from scipy.signal import (
     fftconvolve,
     find_peaks,
     freqz,
-    bilinear,
-    group_delay
+    bilinear
 )
 from scipy.interpolate import interp1d
 from soxr import ResampleStream, resample
 
 from noisereduce.spectralgate.nonstationary import SpectralGateNonStationary
 
-from vhsdecode.addons.FMdeemph import gen_shelf
 from vhsdecode.addons.gnuradioZMQ import ZMQSend, ZMQ_AVAILABLE
 from vhsdecode.utils import firdes_lowpass, firdes_highpass, StackableMA
 
@@ -49,7 +47,7 @@ import matplotlib.pyplot as plt
 
 DEFAULT_EXPANDER_GAIN = 20
 DEFAULT_EXPANDER_RATIO = 2 #           2:1 logarithmic
-DEFAULT_EXPANDER_ATTACK_TAU = 5e-3 #   3us to 10us
+DEFAULT_EXPANDER_ATTACK_TAU = 10e-3 #  3us to 10us
 DEFAULT_EXPANDER_RELEASE_TAU = 70e-3 # 70us +-20%
 
 # TAU_1         low end of shelf curve
@@ -60,7 +58,7 @@ DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1 = 240e-6 # 240us
 DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 = 24e-6 #  24us
 DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH = 1
 DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS = 20000
-DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION = 153600
+DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION = 100000
 
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1 = 5.5e-5
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2 = 2.35e-5
@@ -1044,7 +1042,6 @@ class Expander:
         w, h_high = freqz(self.env_iirb, self.env_iira, worN=4096, fs=self.audio_rate)
     
         h_total = (
-            # h_notch *
             h_low * 
             h_deemph * 
             h_high
@@ -1083,17 +1080,18 @@ class Expander:
         ratio,
     ):
         n = audio.shape[0]
+        epsilon = np.finfo(np.float64).eps
         rel_minus_atk = relCoeff - atkCoeff
 
-        # calculate target db (can be vectorized)
+        # calculate envelope and apply ratio for target db (can be vectorized)
         for i in range(n):
             # detect envelope for current sample
-            sc_db = log(abs(side_chain[i]) + 1e-20) * linear_to_db
+            sc_db = log(max(abs(side_chain[i]), epsilon)) * linear_to_db + gain
             
-            # apply ratio
+            # apply ratio (target db)
             side_chain[i] = sc_db * ratio - sc_db
 
-        # detect envelope (must be done as scalar, since envelope is stateful)
+        # apply attack / release to target db (must be done as scalar, since envelope is stateful)
         for i in range(n):
             target_gain_db = side_chain[i]
 
@@ -1104,9 +1102,9 @@ class Expander:
             env_db = coeff * env_db + (1 - coeff) * target_gain_db
             side_chain[i] = env_db
 
-        # apply expansion (can be vectorized)
+        # apply expansion to audio (can be vectorized)
         for i in range(n):
-            audio[i] *= exp((gain + side_chain[i]) * db_to_linear)
+            audio[i] *= exp(side_chain[i] * db_to_linear)
 
         return env_db
 
