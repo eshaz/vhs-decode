@@ -763,11 +763,11 @@ class HifiUi(QMainWindow):
         )
         weighting_layout.addWidget(self.expander_weighting_high_tau_dial_control)
         self.expander_weighting_low_pass_dial_control = DialControl(
-            self, "Low Pass (Hz)", QtGui.QDoubleValidator(), 1, 5000, 20000, 100, width=4
+            self, "Low Pass (Hz)", QtGui.QDoubleValidator(), 1, 5000, 21000, 100, width=4
         )
         weighting_layout.addWidget(self.expander_weighting_low_pass_dial_control)
         self.expander_weighting_low_pass_transition_dial_control = DialControl(
-            self, "Low Pass Transition (Hz)", QtGui.QDoubleValidator(), 1, 5000, 200000, 100, width=5
+            self, "Low Pass Transition (Hz)", QtGui.QDoubleValidator(), 1, 5000, 100000, 100, width=5
         )
         weighting_layout.addWidget(self.expander_weighting_low_pass_transition_dial_control)
 
@@ -865,6 +865,7 @@ class HifiUi(QMainWindow):
         self.nr_deemphasis_high_tau_dial_control.valueChanged.connect(self.schedule_plot_update)
 
         self.audio_mode_combo.currentIndexChanged.connect(self.schedule_plot_update)
+        self.sample_rate_combo.currentIndexChanged.connect(self.schedule_plot_update)
     
     def show_plot(self):
         geo = self.geometry()
