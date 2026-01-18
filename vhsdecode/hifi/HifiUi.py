@@ -1641,7 +1641,6 @@ class PlotWindow(QWidget):
         expander_data = deemphasis_data.copy()
         expander.process(no_proc_data, expander_data)
 
-
         self.plot_data(title + " input", input_data*0.5, fs)
         self.plot_data(title + " raw", no_proc_data, fs)
         self.plot_data(title + " deemphasis", deemphasis_data, fs)
@@ -1651,29 +1650,29 @@ class PlotWindow(QWidget):
         self.ax.clear()
         ui_values = self.getValues()
 
-
         deemphasis = Deemphasis(
             ui_values.audio_sample_rate,
             ui_values.deemphasis_low_tau,
             ui_values.deemphasis_high_tau,
             ui_values.deemphasis_bandwidth,
+        )
+        deemphasis_freqs, deemphasis_mag_db = deemphasis.get_response()
+
+        nr_deemphasis = Deemphasis(
+            ui_values.audio_sample_rate,
             ui_values.nr_deemphasis_low_tau,
             ui_values.nr_deemphasis_high_tau,
             ui_values.nr_deemphasis_bandwidth,
         )
-
-        print(ui_values.deemphasis_low_tau)
-        deemphasis_freqs, deemphasis_mag_db = deemphasis.get_response()
+        nr_deemphasis_freqs, nr_deemphasis_mag_db = nr_deemphasis.get_response()
 
         expander = Expander(
             ui_values.audio_sample_rate,
             ui_values.expander_gain,
             ui_values.expander_ratio,
             ui_values.expander_attack_tau,
+            0, # hold_tau
             ui_values.expander_release_tau,
-            ui_values.deemphasis_low_tau,
-            ui_values.deemphasis_high_tau,
-            ui_values.deemphasis_bandwidth,
             ui_values.expander_weighting_low_tau,
             ui_values.expander_weighting_high_tau,
             ui_values.expander_weighting_bandwidth,
@@ -1692,14 +1691,22 @@ class PlotWindow(QWidget):
         )
         self.plot_response(
             "Deemphasis",
-            "blue",
+            "red",
             deemphasis_freqs,
             deemphasis_mag_db,
+            ui_values.deemphasis_low_tau,
+            ui_values.deemphasis_high_tau,
+        )
+        self.plot_response(
+            "NR Deemphasis",
+            "blue",
+            nr_deemphasis_freqs,
+            nr_deemphasis_mag_db,
             ui_values.nr_deemphasis_low_tau,
             ui_values.nr_deemphasis_high_tau,
         )
-        self.plot_deemphasis_expander_response("VHS white noise", expander, deemphasis, self.fs_whitenoise_in, self.data_whitenoise_in, self.data_vhs_whitenoise)
-        self.plot_deemphasis_expander_response("VHS sweep", expander, deemphasis, self.fs_sweep_in, self.data_sweep_in, self.data_vhs_sweep)
+        # self.plot_deemphasis_expander_response("VHS white noise", expander, deemphasis, self.fs_whitenoise_in, self.data_whitenoise_in, self.data_vhs_whitenoise)
+        # self.plot_deemphasis_expander_response("VHS sweep", expander, deemphasis, self.fs_sweep_in, self.data_sweep_in, self.data_vhs_sweep)
 
         self.ax.grid(True, which="both")
         self.ax.set_xlabel("Frequency [Hz]")

@@ -938,6 +938,7 @@ class PostProcessor:
         self.enable_expander = decode_options["enable_expander"]
         self.enable_deemphasis = decode_options["enable_deemphasis"]
         self.spectral_nr_amount = decode_options["spectral_nr_amount"]
+        self.format = decode_options["format"]
         self.peak_gain = peak_gain
 
         # create processes and wire up queues
@@ -1044,9 +1045,11 @@ class PostProcessor:
         atexit.register(self.spectral_nr_worker_r.terminate)
         atexit.register(self.spectral_nr_worker_r.join)
 
+        expander_worker = PostProcessor.expander_8mm_worker if self.format == "8mm" else PostProcessor.expander_vhs_worker
+
         expander_worker_l_out_rx, expander_worker_l_out_tx = Pipe(duplex=False)
         self.expander_worker_l = Process(
-            target=PostProcessor.expander_worker,
+            target=expander_worker,
             name="hifi_expander_l",
             args=(
                 spectral_nr_worker_l_rx,
@@ -1063,6 +1066,7 @@ class PostProcessor:
                 decode_options["expander_gain"],
                 decode_options["expander_ratio"],
                 decode_options["expander_attack_tau"],
+                0, # hold
                 decode_options["expander_release_tau"],
                 decode_options["expander_weighting_low_tau"],
                 decode_options["expander_weighting_high_tau"],
@@ -1077,7 +1081,7 @@ class PostProcessor:
 
         expander_worker_r_out_rx, expander_worker_r_out_tx = Pipe(duplex=False)
         self.expander_worker_r = Process(
-            target=PostProcessor.expander_worker,
+            target=expander_worker,
             name="hifi_expander_r",
             args=(
                 spectral_nr_worker_r_rx,
@@ -1094,6 +1098,7 @@ class PostProcessor:
                 decode_options["expander_gain"],
                 decode_options["expander_ratio"],
                 decode_options["expander_attack_tau"],
+                0, # hold
                 decode_options["expander_release_tau"],
                 decode_options["expander_weighting_low_tau"],
                 decode_options["expander_weighting_high_tau"],
@@ -1208,7 +1213,7 @@ class PostProcessor:
             out_conn.send((decoder_state, channel_num))
 
     @staticmethod
-    def expander_worker(
+    def expander_vhs_worker(
         in_conn,
         out_conn,
         enable_deemphasis,
@@ -1223,6 +1228,7 @@ class PostProcessor:
         expander_gain,
         expander_ratio,
         expander_attack_tau,
+        expander_hold_tau,
         expander_release_tau,
         expander_weighting_low_tau,
         expander_weighting_high_tau,
@@ -1231,25 +1237,31 @@ class PostProcessor:
         expander_weighting_low_pass_transition,
     ):
         setproctitle(current_process().name)
-        deemphasis = Deemphasis(
+        deemphasis_pre_1 = Deemphasis(
             final_audio_rate,
             deemphasis_low_tau,
             deemphasis_high_tau,
             deemphasis_bandwidth,
+        )
+        deemphasis_pre_2 = Deemphasis(
+            final_audio_rate,
+            deemphasis_low_tau,
+            deemphasis_high_tau,
+            deemphasis_bandwidth,
+        )
+        nr_deemphasis = Deemphasis(
+            final_audio_rate,
             nr_deemphasis_low_tau,
             nr_deemphasis_high_tau,
             nr_deemphasis_bandwidth
         )
-
         expander = Expander(
             final_audio_rate,
             expander_gain,
             expander_ratio,
             expander_attack_tau,
+            expander_hold_tau,
             expander_release_tau,
-            deemphasis_low_tau,
-            deemphasis_high_tau,
-            deemphasis_bandwidth,
             expander_weighting_low_tau,
             expander_weighting_high_tau,
             expander_weighting_bandwidth,
@@ -1276,13 +1288,104 @@ class PostProcessor:
                 post = buffer.get_post_right()
 
             if enable_deemphasis:
-                deemphasis.process(post)
+                # first deemphasis stage happens before the noise reduction block
+                deemphasis_pre_1.process(pre)
+                deemphasis_pre_2.process(post)
+
+                # second deemphasis stage only happens on the audio (not the weighted input)
+                nr_deemphasis.process(post)
 
             if enable_expander:
                 if decoder_state.block_num == 0:
                     # prime the expander's gain if this is the first block
                     expander.process(pre, np.copy(post))
                 expander.process(pre, post)
+
+            buffer.close()
+            out_conn.send(decoder_state)
+
+    @staticmethod
+    def expander_8mm_worker(
+        in_conn,
+        out_conn,
+        enable_deemphasis,
+        enable_expander,
+        final_audio_rate,
+        deemphasis_low_tau,
+        deemphasis_high_tau,
+        deemphasis_bandwidth,
+        nr_deemphasis_low_tau,
+        nr_deemphasis_high_tau,
+        nr_deemphasis_bandwidth,
+        expander_gain,
+        expander_ratio,
+        expander_attack_tau,
+        expander_hold_tau,
+        expander_release_tau,
+        expander_weighting_low_tau,
+        expander_weighting_high_tau,
+        expander_weighting_bandwidth,
+        expander_weighting_low_pass,
+        expander_weighting_low_pass_transition,
+    ):
+        setproctitle(current_process().name)
+        deemphasis_2 = Deemphasis(
+            final_audio_rate,
+            deemphasis_low_tau,
+            deemphasis_high_tau,
+            deemphasis_bandwidth,
+        )
+        deemphasis_1 = Deemphasis(
+            final_audio_rate,
+            nr_deemphasis_low_tau,
+            nr_deemphasis_high_tau,
+            nr_deemphasis_bandwidth
+        )
+        expander = Expander(
+            final_audio_rate,
+            expander_gain,
+            expander_ratio,
+            expander_attack_tau,
+            expander_hold_tau,
+            expander_release_tau,
+            expander_weighting_low_tau,
+            expander_weighting_high_tau,
+            expander_weighting_bandwidth,
+            expander_weighting_low_pass,
+            expander_weighting_low_pass_transition,
+        )
+
+        while True:
+            while True:
+                try:
+                    decoder_state, channel_num = in_conn.recv()
+                    break
+                except InterruptedError:
+                    pass
+                except EOFError:
+                    return
+
+            buffer = PostProcessorSharedMemory(decoder_state)
+            if channel_num == 0:
+                pre = buffer.get_pre_left()
+                post = buffer.get_post_left()
+            else:
+                pre = buffer.get_pre_right()
+                post = buffer.get_post_right()
+
+            # see IEC 60843-1-1993 pg.101
+            if enable_deemphasis:
+                deemphasis_2.process(post)
+
+            if enable_expander:
+                if decoder_state.block_num == 0:
+                    # prime the expander's gain if this is the first block
+                    expander.process(pre, np.copy(post))
+                expander.process(pre, post)
+
+            if enable_deemphasis:
+                # reverse noise reduction pre-emphasis
+                deemphasis_1.process(post)
 
             buffer.close()
             out_conn.send(decoder_state)

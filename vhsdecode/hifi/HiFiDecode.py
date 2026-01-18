@@ -47,8 +47,15 @@ import matplotlib.pyplot as plt
 
 DEFAULT_EXPANDER_GAIN = 20
 DEFAULT_EXPANDER_RATIO = 2 #           2:1 logarithmic
-DEFAULT_EXPANDER_ATTACK_TAU = 10e-3 #  3us to 10us
-DEFAULT_EXPANDER_RELEASE_TAU = 70e-3 # 70us +-20%
+DEFAULT_EXPANDER_ATTACK_TAU = 10e-3 #  3ms to 10ms
+DEFAULT_EXPANDER_HOLD_TAU = 0
+DEFAULT_EXPANDER_RELEASE_TAU = 70e-3 # 70ms +-20%
+
+DEFAULT_8MM_EXPANDER_GAIN = 20
+DEFAULT_8MM_EXPANDER_RATIO = 2 #           2:1 logarithmic
+DEFAULT_8MM_EXPANDER_ATTACK_TAU = 3e-3 #   3us +- 0.6ms
+DEFAULT_8MM_EXPANDER_HOLD_TAU = 15e-3 #    15ms +- 3ms, gain is held until this time before releasing
+DEFAULT_8MM_EXPANDER_RELEASE_TAU = 40e-3 # 40ms +- 3ms
 
 # TAU_1         low end of shelf curve
 # TAU_2         high end of shelf curve
@@ -60,18 +67,18 @@ DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH = 1
 DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS = 20000
 DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION = 100000
 
-DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1 = 5.5e-5
-DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2 = 2.35e-5
-DEFAULT_8MM_EXPANDER_WEIGHTING_BANDWIDTH = 2.393
+DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1 = 75e-6
+DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2 = 27e-6
+DEFAULT_8MM_EXPANDER_WEIGHTING_BANDWIDTH = 1
 DEFAULT_8MM_EXPANDER_WEIGHTING_LOW_PASS = 20000
-DEFAULT_8MM_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION = 3200
+DEFAULT_8MM_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION = 100000
 
 DEFAULT_VHS_DEEMPHASIS_TAU_1 = 56e-6 # 56us +- 20%
 DEFAULT_VHS_DEEMPHASIS_TAU_2 = 20e-6 # 20us +- 20%
 DEFAULT_VHS_DEEMPHASIS_BANDWIDTH = 1
 
-DEFAULT_8MM_DEEMPHASIS_TAU_1 = 56e-6
-DEFAULT_8MM_DEEMPHASIS_TAU_2 = 20e-6
+DEFAULT_8MM_DEEMPHASIS_TAU_1 = 75e-6
+DEFAULT_8MM_DEEMPHASIS_TAU_2 = 27e-6
 DEFAULT_8MM_DEEMPHASIS_BANDWIDTH = 1
 
 # Low shelf filter for deemphasis
@@ -79,9 +86,9 @@ DEFAULT_VHS_NR_DEEMPHASIS_TAU_1 = 240e-6 # 240us
 DEFAULT_VHS_NR_DEEMPHASIS_TAU_2 = 56e-6 #  56us
 DEFAULT_VHS_NR_DEEMPHASIS_BANDWIDTH = 1
 
-DEFAULT_8MM_NR_DEEMPHASIS_TAU_1 = 1.1e-4
-DEFAULT_8MM_NR_DEEMPHASIS_TAU_2 = 1.3e-5
-DEFAULT_8MM_NR_DEEMPHASIS_BANDWIDTH = 2.4
+DEFAULT_8MM_NR_DEEMPHASIS_TAU_1 = 75e-6
+DEFAULT_8MM_NR_DEEMPHASIS_TAU_2 = 19e-6
+DEFAULT_8MM_NR_DEEMPHASIS_BANDWIDTH = 1
 
 # set the amount of spectral noise reduction to apply to the signal before deemphasis
 DEFAULT_SPECTRAL_NR_AMOUNT = 0.4
@@ -849,10 +856,7 @@ class Deemphasis:
         audio_rate,
         deemphasis_low_tau: float,
         deemphasis_high_tau: float,
-        deemphasis_bandwidth: float,
-        nr_deemphasis_low_tau: float,
-        nr_deemphasis_high_tau: float,
-        nr_deemphasis_bandwidth: float,
+        deemphasis_bandwidth: float
     ):
         self.audio_rate = audio_rate
 
@@ -860,9 +864,6 @@ class Deemphasis:
         self.deemphasis_T1 = deemphasis_low_tau
         self.deemphasis_T2 = deemphasis_high_tau
         self.deemphasis_bandwidth = deemphasis_bandwidth
-        self.nr_deemphasis_T1 = nr_deemphasis_low_tau
-        self.nr_deemphasis_T2 = nr_deemphasis_high_tau
-        self.nr_deemphasis_bandwidth = nr_deemphasis_bandwidth
 
         self.deemph_b, self.deemph_a = build_shelf_filter(
             "low",
@@ -874,24 +875,11 @@ class Deemphasis:
         self.zi_deemph_x = 0.0
         self.zi_deemph_y = 0.0
 
-        self.nr_deemph_b, self.nr_deemph_a = build_shelf_filter(
-            "low",
-            self.nr_deemphasis_T1,
-            self.nr_deemphasis_T2,
-            self.nr_deemphasis_bandwidth,
-            self.audio_rate,
-        )
-        self.zi_nr_deemph_x = 0.0
-        self.zi_nr_deemph_y = 0.0
-
     def get_response(self):
         # compute frequency response
-        w, h_nr_deemph = freqz(self.nr_deemph_b, self.nr_deemph_a, worN=4096, fs=self.audio_rate)
-        _, h_deemph = freqz(self.deemph_b, self.deemph_a, worN=4096, fs=self.audio_rate)
-    
-        h_total = h_nr_deemph * h_deemph
+        w, h_deemph = freqz(self.deemph_b, self.deemph_a, worN=4096, fs=self.audio_rate)
 
-        magnitude_db = 20 * np.log10(np.abs(h_total))
+        magnitude_db = 20 * np.log10(np.abs(h_deemph))
 
         return w, magnitude_db
 
@@ -947,14 +935,6 @@ class Deemphasis:
             self.zi_deemph_x,
             self.zi_deemph_y
         )
-        self.zi_nr_deemph_x, self.zi_nr_deemph_y = Deemphasis.lfilt_inplace(
-            audio_out,
-            self.nr_deemph_b[0],
-            self.nr_deemph_b[1],
-            self.nr_deemph_a[1],
-            self.zi_nr_deemph_x,
-            self.zi_nr_deemph_y
-        )
 
 def simple_lowpass(fs, tau):
     b_analog = [1]
@@ -970,10 +950,8 @@ class Expander:
         gain: float,
         ratio: float,
         attack_tau: float,
+        hold_tau: float,
         release_tau: float,
-        deemphasis_low_tau: float,
-        deemphasis_high_tau: float,
-        deemphasis_bandwidth: float,
         weighting_low_tau: float,
         weighting_high_tau: float,
         weighting_bandwidth: float,
@@ -1007,20 +985,6 @@ class Expander:
             np.array(self.lowpass_iirb), np.array(self.lowpass_iira), dtype=np.float64
         )
 
-        # deemphasis applied to input to noise reduction stage
-        self.deemphasis_T1 = deemphasis_low_tau
-        self.deemphasis_T2 = deemphasis_high_tau
-        self.deemphasis_bandwidth = deemphasis_bandwidth
-        self.deemphasis_iirb, self.deemphasis_iira = build_shelf_filter(
-            "low",
-            self.deemphasis_T1,
-            self.deemphasis_T2,
-            self.deemphasis_bandwidth,
-            self.audio_rate
-        )
-        self.zi_deemph_x = 0.0
-        self.zi_deemph_y = 0.0
-
         # weighted filter for envelope detector
         self.weighting_T1 = weighting_low_tau
         self.weighting_T2 = weighting_high_tau
@@ -1038,12 +1002,10 @@ class Expander:
     def get_response(self):
         # compute frequency response
         _, h_low = freqz(self.lowpass_iirb, self.lowpass_iira, worN=4096, fs=self.audio_rate)
-        _, h_deemph = freqz(self.deemphasis_iirb, self.deemphasis_iira, worN=4096, fs=self.audio_rate)
         w, h_high = freqz(self.env_iirb, self.env_iira, worN=4096, fs=self.audio_rate)
     
         h_total = (
             h_low * 
-            h_deemph * 
             h_high
         )
     
@@ -1110,16 +1072,6 @@ class Expander:
 
     def process(self, pre_in, audio_out):
         side_chain = self.WeightedLowcut.lfilt(pre_in)
-        
-        # reverse pre-emphasis
-        self.zi_deemph_x, self.zi_deemph_y = Deemphasis.lfilt_inplace(
-            side_chain,
-            self.deemphasis_iirb[0],
-            self.deemphasis_iirb[1],
-            self.deemphasis_iira[1],
-            self.zi_deemph_x,
-            self.zi_deemph_y
-        )
 
         # high pass weighted input to envelope detector
         self.zi_x, self.zi_y = Deemphasis.lfilt_inplace(
