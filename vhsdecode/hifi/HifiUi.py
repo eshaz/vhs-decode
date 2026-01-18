@@ -63,7 +63,14 @@ from vhsdecode.hifi.HiFiDecode import (
     DEFAULT_EXPANDER_GAIN,
     DEFAULT_EXPANDER_RATIO,
     DEFAULT_EXPANDER_ATTACK_TAU,
+    DEFAULT_EXPANDER_HOLD_TAU,
     DEFAULT_EXPANDER_RELEASE_TAU,
+
+    DEFAULT_8MM_EXPANDER_GAIN,
+    DEFAULT_8MM_EXPANDER_RATIO,
+    DEFAULT_8MM_EXPANDER_ATTACK_TAU,
+    DEFAULT_8MM_EXPANDER_HOLD_TAU,
+    DEFAULT_8MM_EXPANDER_RELEASE_TAU,
 
     DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,
     DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,
@@ -115,6 +122,7 @@ class MainUIParameters:
         self.expander_gain: float = DEFAULT_EXPANDER_GAIN
         self.expander_ratio: float = DEFAULT_EXPANDER_RATIO
         self.expander_attack_tau: float = DEFAULT_EXPANDER_ATTACK_TAU
+        self.expander_hold_tau: float = DEFAULT_EXPANDER_HOLD_TAU
         self.expander_release_tau: float = DEFAULT_EXPANDER_RELEASE_TAU
         self.expander_weighting_low_tau: float = DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1
         self.expander_weighting_high_tau: float = DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2
@@ -158,6 +166,7 @@ def decode_options_to_ui_parameters(decode_options):
     values.expander_gain = decode_options["expander_gain"]
     values.expander_ratio = decode_options["expander_ratio"]
     values.expander_attack_tau = decode_options["expander_attack_tau"]
+    values.expander_hold_tau = decode_options["expander_hold_tau"]
     values.expander_release_tau = decode_options["expander_release_tau"]
     values.expander_weighting_low_tau = decode_options["expander_weighting_low_tau"]
     values.expander_weighting_high_tau = decode_options["expander_weighting_high_tau"]
@@ -203,6 +212,7 @@ def ui_parameters_to_decode_options(values: MainUIParameters):
         "expander_gain": values.expander_gain,
         "expander_ratio": values.expander_ratio,
         "expander_attack_tau": values.expander_attack_tau,
+        "expander_hold_tau": values.expander_hold_tau,
         "expander_release_tau": values.expander_release_tau,
         "expander_weighting_low_tau": values.expander_weighting_low_tau,
         "expander_weighting_high_tau": values.expander_weighting_high_tau,
@@ -720,6 +730,10 @@ class HifiUi(QMainWindow):
             self, "Attack (𝜏)", QtGui.QDoubleValidator(), 10e3, 10e-4, 10e-3
         )
         expander_controls_layout.addWidget(self.expander_attack_tau_dial_control)
+        self.expander_hold_tau_dial_control = DialControl(
+            self, "Hold (𝜏)", QtGui.QDoubleValidator(), 10e3, 10e-4, 10e-3
+        )
+        expander_controls_layout.addWidget(self.expander_hold_tau_dial_control)
         self.expander_release_tau_dial_control = DialControl(
             self, "Release (𝜏)", QtGui.QDoubleValidator(), 10e2, 10e-3, 10e-2
         )
@@ -844,7 +858,9 @@ class HifiUi(QMainWindow):
         self._plot_update_timer.timeout.connect(self.weighting_deemphasis_plot.update_plot)
 
         self.expander_gain_dial_control.valueChanged.connect(self.schedule_plot_update)
+        self.expander_ratio_dial_control.valueChanged.connect(self.schedule_plot_update)
         self.expander_attack_tau_dial_control.valueChanged.connect(self.schedule_plot_update)
+        self.expander_hold_tau_dial_control.valueChanged.connect(self.schedule_plot_update)
         self.expander_release_tau_dial_control.valueChanged.connect(self.schedule_plot_update)
         self.expander_ratio_dial_control.valueChanged.connect(self.schedule_plot_update)
 
@@ -893,6 +909,7 @@ class HifiUi(QMainWindow):
         self.expander_gain_dial_control.setValue(values.expander_gain)
         self.expander_ratio_dial_control.setValue(values.expander_ratio)
         self.expander_attack_tau_dial_control.setValue(values.expander_attack_tau)
+        self.expander_hold_tau_dial_control.setValue(values.expander_hold_tau)
         self.expander_release_tau_dial_control.setValue(values.expander_release_tau)
         self.expander_weighting_low_tau_dial_control.setValue(
             values.expander_weighting_low_tau
@@ -979,6 +996,7 @@ class HifiUi(QMainWindow):
         values.expander_gain = self.expander_gain_dial_control.value()
         values.expander_ratio = self.expander_ratio_dial_control.value()
         values.expander_attack_tau = self.expander_attack_tau_dial_control.value()
+        values.expander_hold_tau = self.expander_hold_tau_dial_control.value()
         values.expander_release_tau = self.expander_release_tau_dial_control.value()
         values.expander_weighting_low_tau = (
             self.expander_weighting_low_tau_dial_control.value()
@@ -1054,6 +1072,11 @@ class HifiUi(QMainWindow):
             self.nr_deemphasis_low_tau_dial_control.setValue(DEFAULT_VHS_NR_DEEMPHASIS_TAU_1)
             self.nr_deemphasis_high_tau_dial_control.setValue(DEFAULT_VHS_NR_DEEMPHASIS_TAU_2)
             self.nr_deemphasis_bandwidth_dial_control.setValue(DEFAULT_VHS_NR_DEEMPHASIS_BANDWIDTH)
+            self.expander_gain_dial_control.setValue(DEFAULT_EXPANDER_GAIN)
+            self.expander_ratio_dial_control.setValue(DEFAULT_EXPANDER_RATIO)
+            self.expander_attack_tau_dial_control.setValue(DEFAULT_EXPANDER_ATTACK_TAU)
+            self.expander_hold_tau_dial_control.setValue(DEFAULT_EXPANDER_HOLD_TAU)
+            self.expander_release_tau_dial_control.setValue(DEFAULT_EXPANDER_RELEASE_TAU)
             self.expander_weighting_low_tau_dial_control.setValue(DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1)
             self.expander_weighting_high_tau_dial_control.setValue(DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2)
             self.expander_weighting_bandwidth_dial_control.setValue(DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH)
@@ -1066,6 +1089,11 @@ class HifiUi(QMainWindow):
             self.nr_deemphasis_low_tau_dial_control.setValue(DEFAULT_8MM_NR_DEEMPHASIS_TAU_1)
             self.nr_deemphasis_high_tau_dial_control.setValue(DEFAULT_8MM_NR_DEEMPHASIS_TAU_2)
             self.nr_deemphasis_bandwidth_dial_control.setValue(DEFAULT_8MM_NR_DEEMPHASIS_BANDWIDTH)
+            self.expander_gain_dial_control.setValue(DEFAULT_8MM_EXPANDER_GAIN)
+            self.expander_ratio_dial_control.setValue(DEFAULT_8MM_EXPANDER_RATIO)
+            self.expander_attack_tau_dial_control.setValue(DEFAULT_8MM_EXPANDER_ATTACK_TAU)
+            self.expander_hold_tau_dial_control.setValue(DEFAULT_8MM_EXPANDER_HOLD_TAU)
+            self.expander_release_tau_dial_control.setValue(DEFAULT_8MM_EXPANDER_RELEASE_TAU)
             self.expander_weighting_low_tau_dial_control.setValue(DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1)
             self.expander_weighting_high_tau_dial_control.setValue(DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2)
             self.expander_weighting_low_pass_dial_control.setValue(DEFAULT_8MM_EXPANDER_WEIGHTING_LOW_PASS)
@@ -1671,7 +1699,7 @@ class PlotWindow(QWidget):
             ui_values.expander_gain,
             ui_values.expander_ratio,
             ui_values.expander_attack_tau,
-            0, # hold_tau
+            ui_values.expander_hold_tau,
             ui_values.expander_release_tau,
             ui_values.expander_weighting_low_tau,
             ui_values.expander_weighting_high_tau,

@@ -13,8 +13,6 @@ from copy import deepcopy
 import string
 from random import SystemRandom
 
-import atexit
-
 import numpy as np
 import numba
 from numba import njit
@@ -45,7 +43,7 @@ from vhsdecode.hifi.utils import DecoderSharedMemory, NumbaAudioArray
 
 import matplotlib.pyplot as plt
 
-DEFAULT_EXPANDER_GAIN = 20
+DEFAULT_EXPANDER_GAIN = 32
 DEFAULT_EXPANDER_RATIO = 2 #           2:1 logarithmic
 DEFAULT_EXPANDER_ATTACK_TAU = 10e-3 #  3ms to 10ms
 DEFAULT_EXPANDER_HOLD_TAU = 0
@@ -973,8 +971,10 @@ class Expander:
         K = -1
         self.atkCoeff = np.exp(K / (attack_tau * self.audio_rate))
         self.relCoeff = np.exp(K / (release_tau * self.audio_rate))
+        self.hold_samples = round(hold_tau * self.audio_rate)
 
         self.env_db = -120.0
+        self.hold_state = 0
 
         self.lowpass_iirb, self.lowpass_iira = firdes_lowpass(
             self.audio_rate,
@@ -1023,6 +1023,8 @@ class Expander:
             numba.types.float64,
             numba.types.float64,
             numba.types.float64,
+            numba.types.int32,
+            numba.types.int32,
             numba.types.float64,
             numba.types.float64
         )],
@@ -1038,12 +1040,15 @@ class Expander:
         db_to_linear,
         atkCoeff,
         relCoeff,
+        hold_state,
+        hold_samples,
         gain,
-        ratio,
+        ratio
     ):
         n = audio.shape[0]
         epsilon = np.finfo(np.float64).eps
-        rel_minus_atk = relCoeff - atkCoeff
+        one_minus_atkCoeff = 1 - atkCoeff
+        one_minus_relCoeff = 1 - relCoeff
 
         # calculate envelope and apply ratio for target db (can be vectorized)
         for i in range(n):
@@ -1053,22 +1058,28 @@ class Expander:
             # apply ratio (target db)
             side_chain[i] = sc_db * ratio - sc_db
 
-        # apply attack / release to target db (must be done as scalar, since envelope is stateful)
+        # apply attack / release to target db (must be done as scalar, since envelope and hold are stateful)
         for i in range(n):
             target_gain_db = side_chain[i]
 
             is_release = env_db > target_gain_db
-            coeff = atkCoeff + rel_minus_atk * is_release
-
             # apply attack / release
-            env_db = coeff * env_db + (1 - coeff) * target_gain_db
+            if is_release:
+                if hold_state > 0:
+                    hold_state -= 1
+                else:
+                    env_db = relCoeff * env_db + one_minus_relCoeff * target_gain_db
+            else:
+                hold_state = hold_samples
+                env_db = atkCoeff * env_db + one_minus_atkCoeff * target_gain_db
+
             side_chain[i] = env_db
 
         # apply expansion to audio (can be vectorized)
         for i in range(n):
             audio[i] *= exp(side_chain[i] * db_to_linear)
 
-        return env_db
+        return env_db, hold_state
 
     def process(self, pre_in, audio_out):
         side_chain = self.WeightedLowcut.lfilt(pre_in)
@@ -1083,7 +1094,7 @@ class Expander:
             self.zi_y
         )
 
-        self.env_db = Expander.expand(
+        self.env_db, self.hold_state = Expander.expand(
             audio_out,
             side_chain,
             self.env_db,
@@ -1091,6 +1102,8 @@ class Expander:
             self.db_to_linear,
             self.atkCoeff,
             self.relCoeff,
+            self.hold_state,
+            self.hold_samples,
             self.gain,
             self.ratio,
         )

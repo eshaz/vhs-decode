@@ -51,7 +51,14 @@ from vhsdecode.hifi.HiFiDecode import (
     DEFAULT_EXPANDER_GAIN,
     DEFAULT_EXPANDER_RATIO,
     DEFAULT_EXPANDER_ATTACK_TAU,
+    DEFAULT_EXPANDER_HOLD_TAU,
     DEFAULT_EXPANDER_RELEASE_TAU,
+
+    DEFAULT_8MM_EXPANDER_GAIN,
+    DEFAULT_8MM_EXPANDER_RATIO,
+    DEFAULT_8MM_EXPANDER_ATTACK_TAU,
+    DEFAULT_8MM_EXPANDER_HOLD_TAU,
+    DEFAULT_8MM_EXPANDER_RELEASE_TAU,
 
     DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1,
     DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2,
@@ -339,36 +346,35 @@ expander_options_group.add_argument(
     default="on",
     help="Set expander block on/off",
 )
-
 expander_options_group.add_argument(
     "--expander_gain",
     dest="expander_gain",
     type=float,
-    default=DEFAULT_EXPANDER_GAIN,
-    help=f"Sets the expander gain (default is {DEFAULT_EXPANDER_GAIN}). "
-    f"Range (0~30): Higher values increase output gain of the expander",
+    help=f"Sets the expander gain (defaults: [VHS: {DEFAULT_EXPANDER_GAIN}] [8mm: {DEFAULT_8MM_EXPANDER_GAIN}]).",
 )
 expander_options_group.add_argument(
     "--expander_ratio",
     dest="expander_ratio",
     type=float,
-    default=DEFAULT_EXPANDER_RATIO,
-    help=f"Sets the ratio (default is {DEFAULT_EXPANDER_RATIO}). "
-    f"Range (1~2): Higher values increase the ratio of the expander",
+    help=f"Sets the ratio (defaults: [VHS: {DEFAULT_EXPANDER_RATIO}] [8mm: {DEFAULT_8MM_EXPANDER_RATIO}]).",
 )
 expander_options_group.add_argument(
     "--expander_attack_tau",
     dest="expander_attack_tau",
     type=float,
-    default=DEFAULT_EXPANDER_ATTACK_TAU,
-    help=f"Sets the expander attack speed in tau (default is {DEFAULT_EXPANDER_ATTACK_TAU}).",
+    help=f"Sets the expander attack speed in tau (defaults: [VHS: {DEFAULT_EXPANDER_ATTACK_TAU}] [8mm: {DEFAULT_8MM_EXPANDER_ATTACK_TAU}]).",
+)
+expander_options_group.add_argument(
+    "--expander_hold_tau",
+    dest="expander_hold_tau",
+    type=float,
+    help=f"Sets the expander hold time in tau (defaults: [VHS: {DEFAULT_EXPANDER_HOLD_TAU}] [8mm: {DEFAULT_8MM_EXPANDER_HOLD_TAU}]).",
 )
 expander_options_group.add_argument(
     "--expander_release_tau",
     dest="expander_release_tau",
     type=float,
-    default=DEFAULT_EXPANDER_RELEASE_TAU,
-    help=f"Sets the expander release speed in tau (default is {DEFAULT_EXPANDER_RELEASE_TAU}).",
+    help=f"Sets the expander release speed in tau (defaults: [VHS: {DEFAULT_EXPANDER_RELEASE_TAU}] [8mm: {DEFAULT_8MM_EXPANDER_RELEASE_TAU}]).",
 )
 expander_options_group.add_argument(
     "--expander_weighting_low_tau",
@@ -1066,7 +1072,7 @@ class PostProcessor:
                 decode_options["expander_gain"],
                 decode_options["expander_ratio"],
                 decode_options["expander_attack_tau"],
-                0, # hold
+                decode_options["expander_hold_tau"],
                 decode_options["expander_release_tau"],
                 decode_options["expander_weighting_low_tau"],
                 decode_options["expander_weighting_high_tau"],
@@ -1098,7 +1104,7 @@ class PostProcessor:
                 decode_options["expander_gain"],
                 decode_options["expander_ratio"],
                 decode_options["expander_attack_tau"],
-                0, # hold
+                decode_options["expander_hold_tau"],
                 decode_options["expander_release_tau"],
                 decode_options["expander_weighting_low_tau"],
                 decode_options["expander_weighting_high_tau"],
@@ -2180,6 +2186,12 @@ def main() -> int:
 
     if args.format_8mm:
         tape_format = "8mm"
+        default_expander_gain = DEFAULT_8MM_EXPANDER_GAIN
+        default_expander_ratio = DEFAULT_8MM_EXPANDER_RATIO
+        default_expander_attack_tau = DEFAULT_8MM_EXPANDER_ATTACK_TAU
+        default_expander_hold_tau = DEFAULT_8MM_EXPANDER_HOLD_TAU
+        default_expander_release_tau = DEFAULT_8MM_EXPANDER_RELEASE_TAU
+
         default_deemphasis_low_tau = DEFAULT_8MM_DEEMPHASIS_TAU_1
         default_deemphasis_high_tau = DEFAULT_8MM_DEEMPHASIS_TAU_2
         default_deemphasis_bandwidth = DEFAULT_8MM_DEEMPHASIS_BANDWIDTH
@@ -2195,6 +2207,12 @@ def main() -> int:
         default_expander_weighting_low_pass_transition = DEFAULT_8MM_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION
     else:
         tape_format = "vhs"
+        default_expander_gain = DEFAULT_EXPANDER_GAIN
+        default_expander_ratio = DEFAULT_EXPANDER_RATIO
+        default_expander_attack_tau = DEFAULT_EXPANDER_ATTACK_TAU
+        default_expander_hold_tau = DEFAULT_EXPANDER_HOLD_TAU
+        default_expander_release_tau = DEFAULT_EXPANDER_RELEASE_TAU
+
         default_deemphasis_low_tau = DEFAULT_VHS_DEEMPHASIS_TAU_1
         default_deemphasis_high_tau = DEFAULT_VHS_DEEMPHASIS_TAU_2
         default_deemphasis_bandwidth = DEFAULT_VHS_DEEMPHASIS_BANDWIDTH
@@ -2228,10 +2246,11 @@ def main() -> int:
         "auto_fine_tune": args.auto_fine_tune == "on" if not args.preview else False,
         "bias_guess": args.bias_guess,
         "normalize": args.normalize,
-        "expander_gain": args.expander_gain,
-        "expander_ratio": args.expander_ratio,
-        "expander_attack_tau": args.expander_attack_tau,
-        "expander_release_tau": args.expander_release_tau,
+        "expander_gain": args.expander_gain or default_expander_gain,
+        "expander_ratio": args.expander_ratio or default_expander_ratio,
+        "expander_attack_tau": args.expander_attack_tau or default_expander_attack_tau,
+        "expander_hold_tau": args.expander_hold_tau or default_expander_hold_tau,
+        "expander_release_tau": args.expander_release_tau or default_expander_release_tau,
         "expander_weighting_low_tau": args.expander_weighting_low_tau or default_expander_weighting_low_tau,
         "expander_weighting_high_tau": args.expander_weighting_high_tau or default_expander_weighting_high_tau,
         "expander_weighting_bandwidth": args.expander_weighting_bandwidth or default_expander_weighting_bandwidth,
