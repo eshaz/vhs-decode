@@ -43,13 +43,13 @@ from vhsdecode.hifi.utils import DecoderSharedMemory, NumbaAudioArray
 
 import matplotlib.pyplot as plt
 
-DEFAULT_EXPANDER_GAIN = 32
+DEFAULT_EXPANDER_GAIN = 30
 DEFAULT_EXPANDER_RATIO = 2 #           2:1 logarithmic
 DEFAULT_EXPANDER_ATTACK_TAU = 10e-3 #  3ms to 10ms
 DEFAULT_EXPANDER_HOLD_TAU = 0
 DEFAULT_EXPANDER_RELEASE_TAU = 70e-3 # 70ms +-20%
 
-DEFAULT_8MM_EXPANDER_GAIN = 20
+DEFAULT_8MM_EXPANDER_GAIN = 6
 DEFAULT_8MM_EXPANDER_RATIO = 2 #           2:1 logarithmic
 DEFAULT_8MM_EXPANDER_ATTACK_TAU = 3e-3 #   3us +- 0.6ms
 DEFAULT_8MM_EXPANDER_HOLD_TAU = 15e-3 #    15ms +- 3ms, gain is held until this time before releasing
@@ -61,32 +61,26 @@ DEFAULT_8MM_EXPANDER_RELEASE_TAU = 40e-3 # 40ms +- 3ms
 # High shelf filter for weighted input to expander
 DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_1 = 240e-6 # 240us
 DEFAULT_VHS_EXPANDER_WEIGHTING_TAU_2 = 24e-6 #  24us
-DEFAULT_VHS_EXPANDER_WEIGHTING_BANDWIDTH = 1
 DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS = 20000
 DEFAULT_VHS_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION = 100000
 
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_1 = 75e-6
 DEFAULT_8MM_EXPANDER_WEIGHTING_TAU_2 = 27e-6
-DEFAULT_8MM_EXPANDER_WEIGHTING_BANDWIDTH = 1
 DEFAULT_8MM_EXPANDER_WEIGHTING_LOW_PASS = 20000
 DEFAULT_8MM_EXPANDER_WEIGHTING_LOW_PASS_TRANSITION = 100000
 
 DEFAULT_VHS_DEEMPHASIS_TAU_1 = 56e-6 # 56us +- 20%
 DEFAULT_VHS_DEEMPHASIS_TAU_2 = 20e-6 # 20us +- 20%
-DEFAULT_VHS_DEEMPHASIS_BANDWIDTH = 1
 
 DEFAULT_8MM_DEEMPHASIS_TAU_1 = 75e-6
 DEFAULT_8MM_DEEMPHASIS_TAU_2 = 27e-6
-DEFAULT_8MM_DEEMPHASIS_BANDWIDTH = 1
 
 # Low shelf filter for deemphasis
 DEFAULT_VHS_NR_DEEMPHASIS_TAU_1 = 240e-6 # 240us
 DEFAULT_VHS_NR_DEEMPHASIS_TAU_2 = 56e-6 #  56us
-DEFAULT_VHS_NR_DEEMPHASIS_BANDWIDTH = 1
 
 DEFAULT_8MM_NR_DEEMPHASIS_TAU_1 = 75e-6
 DEFAULT_8MM_NR_DEEMPHASIS_TAU_2 = 19e-6
-DEFAULT_8MM_NR_DEEMPHASIS_BANDWIDTH = 1
 
 # set the amount of spectral noise reduction to apply to the signal before deemphasis
 DEFAULT_SPECTRAL_NR_AMOUNT = 0.4
@@ -575,11 +569,10 @@ def build_shelf_filter(
     direction,
     tau1,
     tau2,
-    shelf_gain,
     fs
 ):
     # set high point of filter to have no gain
-    b_1 = 1 / (shelf_gain * tau1 / tau2)
+    b_1 = 1 / (tau1 / tau2)
 
     if direction == "low":
         b_analog = [tau2 ** 2 / tau1, b_1]
@@ -854,20 +847,17 @@ class Deemphasis:
         audio_rate,
         deemphasis_low_tau: float,
         deemphasis_high_tau: float,
-        deemphasis_bandwidth: float
     ):
         self.audio_rate = audio_rate
 
         # deemphasis filter for output audio
         self.deemphasis_T1 = deemphasis_low_tau
         self.deemphasis_T2 = deemphasis_high_tau
-        self.deemphasis_bandwidth = deemphasis_bandwidth
 
         self.deemph_b, self.deemph_a = build_shelf_filter(
             "low",
             self.deemphasis_T1,
             self.deemphasis_T2,
-            self.deemphasis_bandwidth,
             self.audio_rate,
         )
         self.zi_deemph_x = 0.0
@@ -952,7 +942,6 @@ class Expander:
         release_tau: float,
         weighting_low_tau: float,
         weighting_high_tau: float,
-        weighting_bandwidth: float,
         weighting_low_pass: float,
         weighting_low_pass_transition: float
     ):
@@ -988,12 +977,10 @@ class Expander:
         # weighted filter for envelope detector
         self.weighting_T1 = weighting_low_tau
         self.weighting_T2 = weighting_high_tau
-        self.weighting_bandwidth = weighting_bandwidth
         self.env_iirb, self.env_iira = build_shelf_filter(
             "high",
             self.weighting_T1,
             self.weighting_T2,
-            self.weighting_bandwidth,
             self.audio_rate
         )
         self.zi_x = 0.0
