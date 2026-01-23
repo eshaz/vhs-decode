@@ -1008,16 +1008,21 @@ class Expander:
         self.gain = gain
         self.ratio = float(ratio)
 
-        db_tolerance = 2.0
-        delta_db = 20.0
-        delta_gain_db = abs((self.ratio - 1.0) * delta_db)
+        a_low = 10 ** (-40 / 20)
+        a_high = 10 ** (-20 / 20)
+        a_tolerance = 2
 
+        q = 10 ** ((a_tolerance / 20.0) / (self.ratio - 1.0))
 
-        self.atkCoeff = (db_tolerance / delta_gain_db) ** (1.0 / (attack_tau * self.audio_rate))
-        self.relCoeff = (db_tolerance / delta_gain_db) ** (1.0 / (release_tau * self.audio_rate))
+        fA = (a_high * (1 - 1 / q)) / (a_high - a_low)
+        self.atkCoeff = fA ** (1.0 / (attack_tau * self.audio_rate))
+
+        fR = (a_low * q) / a_high
+        self.relCoeff = fR ** (1.0 / (release_tau * self.audio_rate))
 
         self.hold_samples = round(hold_tau * self.audio_rate)
 
+        self.u_prev = 0.0
         self.env_lin = 0.0
         self.gain_db = 0.0
         self.hold_state = 0
@@ -1066,6 +1071,7 @@ class Expander:
             numba.types.float64,
             numba.types.float64,
             numba.types.float64,
+            numba.types.float64,
             numba.types.int32,
             numba.types.int32,
             numba.types.float64,
@@ -1080,6 +1086,7 @@ class Expander:
         side_chain,
         env_lin,
         gain_db,
+        u_prev,
         atkCoeff,
         relCoeff,
         hold_state,
@@ -1097,8 +1104,11 @@ class Expander:
         for i in range(n):
             u = abs(side_chain[i])
 
-            if u > env_lin:
-                env_lin = u
+            rising = u >= u_prev
+            attacking = u > env_lin
+
+            if rising and attacking:
+                env_lin = atkCoeff * env_lin + one_minus_atkCoeff * u
                 hold_state = hold_samples
             else:
                 if hold_state > 0:
@@ -1106,6 +1116,7 @@ class Expander:
                 else:
                     env_lin = relCoeff * env_lin
 
+            u_prev = u
             side_chain[i] = env_lin
 
         for i in range(n):
@@ -1124,7 +1135,7 @@ class Expander:
         for i in range(n):
             audio[i] *= 10 ** (side_chain[i] / 20)
 
-        return env_lin, gain_db, hold_state
+        return env_lin, gain_db, u_prev, hold_state
 
     def process(self, pre_in, audio_out):
         side_chain = self.WeightedLowcut.lfilt(pre_in)
@@ -1139,11 +1150,12 @@ class Expander:
             self.zi_y
         )
 
-        self.env_lin, self.gain_db, self.hold_state = Expander.expand(
+        self.env_lin, self.gain_db, self.u_prev, self.hold_state = Expander.expand(
             audio_out,
             side_chain,
             self.env_lin,
             self.gain_db,
+            self.u_prev,
             self.atkCoeff,
             self.relCoeff,
             self.hold_state,
