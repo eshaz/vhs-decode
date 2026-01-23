@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from fractions import Fraction
-from math import log, pi, sqrt, ceil, floor, atan2, log1p, cos, sin, lcm, exp
+from math import log, exp, pow, log10, pi, sqrt, ceil, floor, atan2, log1p, cos, sin, lcm
 from typing import Tuple
 from time import perf_counter
 from setproctitle import setproctitle
@@ -1003,23 +1003,25 @@ class Expander:
         weighting_low_pass_transition: float
     ):
         self.audio_rate = audio_rate
-        self.linear_to_db = 20 / log(10)
-        self.db_to_linear = log(10) / 20
 
         # makeup gain to apply after expansion
         self.gain = gain
         self.ratio = float(ratio)
+        a_low = 10 ** (-40 / 20)
+        a_high = 10 ** (-20 / 20)
+        a_tolerance = 2
 
-        error_db = 20
-        target_db = 2
-        #K = np.log(target_db / error_db)
-        #K = -np.log(9)
-        K = -1
-        self.atkCoeff = np.exp(K / (attack_tau * self.audio_rate))
-        self.relCoeff = np.exp(K / (release_tau * self.audio_rate))
+        q = 10 ** ((a_tolerance / 20) / (self.ratio - 1))
+
+        fA = (a_high * (1 - 1 / q)) / (a_high - a_low)
+
+        self.atkCoeff = fA ** (1 / (attack_tau * self.audio_rate))
+
+        self.relCoeff = ((a_low * q) / a_high) ** (1 / (release_tau * self.audio_rate))
+
         self.hold_samples = round(hold_tau * self.audio_rate)
 
-        self.env_db = -120.0
+        self.env_lin = 0.0
         self.hold_state = 0
 
         self.lowpass_iirb, self.lowpass_iira = firdes_lowpass(
@@ -1065,8 +1067,6 @@ class Expander:
             numba.types.float64,
             numba.types.float64,
             numba.types.float64,
-            numba.types.float64,
-            numba.types.float64,
             numba.types.int32,
             numba.types.int32,
             numba.types.float64,
@@ -1079,9 +1079,7 @@ class Expander:
     def expand(
         audio,
         side_chain,
-        env_db,
-        linear_to_db,
-        db_to_linear,
+        env_lin,
         atkCoeff,
         relCoeff,
         hold_state,
@@ -1092,38 +1090,33 @@ class Expander:
         n = audio.shape[0]
         epsilon = np.finfo(np.float64).eps
         one_minus_atkCoeff = 1 - atkCoeff
-        one_minus_relCoeff = 1 - relCoeff
+        ratio_minus_one = ratio - 1
 
-        # calculate envelope and apply ratio for target db (can be vectorized)
+        # peak detector is intentionally in the linear domain
         for i in range(n):
-            # detect envelope for current sample
-            sc_db = log(max(abs(side_chain[i]), epsilon)) * linear_to_db + gain
-            
-            # apply ratio (target db)
-            side_chain[i] = sc_db * ratio - sc_db
+            u = abs(side_chain[i])
 
-        # apply attack / release to target db (must be done as scalar, since envelope and hold are stateful)
-        for i in range(n):
-            target_gain_db = side_chain[i]
-
-            is_release = env_db > target_gain_db
-            # apply attack / release
-            if is_release:
+            is_attack = u > env_lin
+            if is_attack:
+                hold_state = hold_samples
+                env_lin = atkCoeff * env_lin + one_minus_atkCoeff * u
+            else:
                 if hold_state > 0:
                     hold_state -= 1
                 else:
-                    env_db = relCoeff * env_db + one_minus_relCoeff * target_gain_db
-            else:
-                hold_state = hold_samples
-                env_db = atkCoeff * env_db + one_minus_atkCoeff * target_gain_db
+                    env_lin = relCoeff * env_lin
 
-            side_chain[i] = env_db
+            side_chain[i] = env_lin
 
-        # apply expansion to audio (can be vectorized)
         for i in range(n):
-            audio[i] *= exp(side_chain[i] * db_to_linear)
+            # convert envelope to db
+            env_db = 20 * log10(max(abs(side_chain[i]), epsilon)) + gain
+            # apply ratio
+            env_db = ratio_minus_one * env_db
+            # apply expansion
+            audio[i] *= 10 ** (env_db / 20)
 
-        return env_db, hold_state
+        return env_lin, hold_state
 
     def process(self, pre_in, audio_out):
         side_chain = self.WeightedLowcut.lfilt(pre_in)
@@ -1138,12 +1131,10 @@ class Expander:
             self.zi_y
         )
 
-        self.env_db, self.hold_state = Expander.expand(
+        self.env_lin, self.hold_state = Expander.expand(
             audio_out,
             side_chain,
-            self.env_db,
-            self.linear_to_db,
-            self.db_to_linear,
+            self.env_lin,
             self.atkCoeff,
             self.relCoeff,
             self.hold_state,
