@@ -511,7 +511,7 @@ class FMdemod:
 
         # constants
         two_pi = 2 * pi
-        diff_divisor = two_pi * (1 / sample_rate)
+        diff_divisor = 1 / (two_pi * (1 / sample_rate))
         iq_len = len(i_osc)
         rf_len = len(in_rf)
 
@@ -573,7 +573,7 @@ class FMdemod:
             unwrapped = prev_unwrapped + delta + correction
 
             diff = prev_unwrapped - unwrapped
-            out = (carrier - diff / diff_divisor) / deviation
+            out = (carrier - diff * diff_divisor) / deviation
 
             out_demod[i - 1] = min(max(out, min_float), max_float)
 
@@ -1008,29 +1008,11 @@ class Expander:
         self.gain = gain
         self.ratio = float(ratio)
 
-        # IEC attack / release time measurement
-        # Given a 5kHz pulse that alternates from -40db -> -20db -> -40db...
-        a_low = 10 ** (-40 / 20) 
-        a_high = 10 ** (-20 / 20)
-        # the attack and release values are defined to be
-        # the time elapsed for the expander to reach within 2db of the target db
-        output_error_db = 2
-
-        # envelope tolerance factor, such that output error is <= +- output_error_db
-        q = 10 ** ((output_error_db / 20.0) / (self.ratio - 1.0))
-
-        # attack / release alpha coefficients calculated above IEC transient measurement method
-        fA = (a_high * (1 - 1 / q)) / (a_high - a_low)
-        fR = (a_low * q) / a_high
-
-        self.atkCoeff = fA ** (1.0 / (attack_tau * self.audio_rate))
-        self.relCoeff = fR ** (1.0 / (release_tau * self.audio_rate))
-
         self.hold_samples = round(hold_tau * self.audio_rate)
+        self.atkCoeff = exp(-1 / (attack_tau * self.audio_rate))
+        self.relCoeff = exp(-1 / (release_tau * self.audio_rate))
 
-        self.u_prev = 0.0
         self.env_lin = 0.0
-        self.gain_db = 0.0
         self.hold_state = 0
 
         self.lowpass_iirb, self.lowpass_iira = firdes_lowpass(
@@ -1076,8 +1058,6 @@ class Expander:
             numba.types.float64,
             numba.types.float64,
             numba.types.float64,
-            numba.types.float64,
-            numba.types.float64,
             numba.types.int32,
             numba.types.int32,
             numba.types.float64,
@@ -1091,8 +1071,6 @@ class Expander:
         audio,
         side_chain,
         env_lin,
-        gain_db,
-        u_prev,
         atkCoeff,
         relCoeff,
         hold_state,
@@ -1103,46 +1081,36 @@ class Expander:
         n = audio.shape[0]
         epsilon = np.finfo(np.float64).eps
         one_minus_atkCoeff = 1 - atkCoeff
-        one_minus_relCoeff = 1 - relCoeff
+    
         ratio_minus_one = ratio - 1
         inv20 = 1 / 20
 
-        # peak detector is intentionally in the linear domain
+        # simulates a diode / capacitor peak detector
         for i in range(n):
-            u = abs(side_chain[i])
+            sc = abs(side_chain[i])
 
-            rising = u >= u_prev
-            attacking = u > env_lin
+            attacking = sc > env_lin
 
-            if rising and attacking:
-                env_lin = atkCoeff * env_lin + one_minus_atkCoeff * u
+            if attacking:
+                # simulate the envelope detector capacitor charging
+                env_lin = atkCoeff * env_lin + one_minus_atkCoeff * sc
                 hold_state = hold_samples
             else:
+                # simulate the envelope detector capacitor discharging
                 if hold_state > 0:
                     hold_state -= 1
                 else:
                     env_lin = relCoeff * env_lin
 
-            u_prev = u
             side_chain[i] = env_lin
-
+            
         for i in range(n):
-            # convert envelope to db
-            env = side_chain[i]
-            env_db = 20.0 * log10(max(env, epsilon))
-            target_gain_db = ratio_minus_one * env_db
+            env_db = 20.0 * log10(max(side_chain[i], epsilon))
+            target_gain_db = ratio_minus_one * env_db + makeup_gain_db
 
-            if target_gain_db < gain_db:
-                gain_db = relCoeff * gain_db + one_minus_relCoeff * target_gain_db
-            else:
-                gain_db = target_gain_db #atkCoeff * gain_db + one_minus_atkCoeff * target_gain_db
+            audio[i] *= 10 ** (target_gain_db * inv20)
 
-            side_chain[i] = gain_db + makeup_gain_db
-        
-        for i in range(n):
-            audio[i] *= 10 ** (side_chain[i] * inv20)
-
-        return env_lin, gain_db, u_prev, hold_state
+        return env_lin, hold_state
 
     def process(self, pre_in, audio_out):
         side_chain = self.WeightedLowcut.lfilt(pre_in)
@@ -1157,12 +1125,10 @@ class Expander:
             self.zi_y
         )
 
-        self.env_lin, self.gain_db, self.u_prev, self.hold_state = Expander.expand(
+        self.env_lin, self.hold_state = Expander.expand(
             audio_out,
             side_chain,
             self.env_lin,
-            self.gain_db,
-            self.u_prev,
             self.atkCoeff,
             self.relCoeff,
             self.hold_state,
