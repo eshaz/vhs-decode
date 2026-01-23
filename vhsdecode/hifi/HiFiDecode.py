@@ -80,7 +80,7 @@ ui_to_audio_mode = {
 DEFAULT_VHS_EXPANDER_GAIN = 30
 # IEC 60774-2 5.1: Noise Reduction
 DEFAULT_VHS_EXPANDER_RATIO = 2 #           2:1 logarithmic
-DEFAULT_VHS_EXPANDER_ATTACK_TAU = 3e-3 #  3ms to 10ms
+DEFAULT_VHS_EXPANDER_ATTACK_TAU = 7e-3 #   3ms to 10ms
 DEFAULT_VHS_EXPANDER_HOLD_TAU = 0 #        None (only used for 8mm)
 DEFAULT_VHS_EXPANDER_RELEASE_TAU = 70e-3 # 70ms +-20%
 
@@ -1008,16 +1008,22 @@ class Expander:
         self.gain = gain
         self.ratio = float(ratio)
 
-        a_low = 10 ** (-40 / 20)
+        # IEC attack / release time measurement
+        # Given a 5kHz pulse that alternates from -40db -> -20db -> -40db...
+        a_low = 10 ** (-40 / 20) 
         a_high = 10 ** (-20 / 20)
-        a_tolerance = 2
+        # the attack and release values are defined to be
+        # the time elapsed for the expander to reach within 2db of the target db
+        output_error_db = 2
 
-        q = 10 ** ((a_tolerance / 20.0) / (self.ratio - 1.0))
+        # envelope tolerance factor, such that output error is <= +- output_error_db
+        q = 10 ** ((output_error_db / 20.0) / (self.ratio - 1.0))
 
+        # attack / release alpha coefficients calculated above IEC transient measurement method
         fA = (a_high * (1 - 1 / q)) / (a_high - a_low)
-        self.atkCoeff = fA ** (1.0 / (attack_tau * self.audio_rate))
-
         fR = (a_low * q) / a_high
+
+        self.atkCoeff = fA ** (1.0 / (attack_tau * self.audio_rate))
         self.relCoeff = fR ** (1.0 / (release_tau * self.audio_rate))
 
         self.hold_samples = round(hold_tau * self.audio_rate)
@@ -1099,6 +1105,7 @@ class Expander:
         one_minus_atkCoeff = 1 - atkCoeff
         one_minus_relCoeff = 1 - relCoeff
         ratio_minus_one = ratio - 1
+        inv20 = 1 / 20
 
         # peak detector is intentionally in the linear domain
         for i in range(n):
@@ -1128,12 +1135,12 @@ class Expander:
             if target_gain_db < gain_db:
                 gain_db = relCoeff * gain_db + one_minus_relCoeff * target_gain_db
             else:
-                gain_db = atkCoeff * gain_db + one_minus_atkCoeff * target_gain_db
+                gain_db = target_gain_db #atkCoeff * gain_db + one_minus_atkCoeff * target_gain_db
 
             side_chain[i] = gain_db + makeup_gain_db
         
         for i in range(n):
-            audio[i] *= 10 ** (side_chain[i] / 20)
+            audio[i] *= 10 ** (side_chain[i] * inv20)
 
         return env_lin, gain_db, u_prev, hold_state
 
