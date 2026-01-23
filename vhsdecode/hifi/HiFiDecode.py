@@ -80,7 +80,7 @@ ui_to_audio_mode = {
 DEFAULT_VHS_EXPANDER_GAIN = 30
 # IEC 60774-2 5.1: Noise Reduction
 DEFAULT_VHS_EXPANDER_RATIO = 2 #           2:1 logarithmic
-DEFAULT_VHS_EXPANDER_ATTACK_TAU = 10e-3 #  3ms to 10ms
+DEFAULT_VHS_EXPANDER_ATTACK_TAU = 3e-3 #  3ms to 10ms
 DEFAULT_VHS_EXPANDER_HOLD_TAU = 0 #        None (only used for 8mm)
 DEFAULT_VHS_EXPANDER_RELEASE_TAU = 70e-3 # 70ms +-20%
 
@@ -1007,21 +1007,19 @@ class Expander:
         # makeup gain to apply after expansion
         self.gain = gain
         self.ratio = float(ratio)
-        a_low = 10 ** (-40 / 20)
-        a_high = 10 ** (-20 / 20)
-        a_tolerance = 2
 
-        q = 10 ** ((a_tolerance / 20) / (self.ratio - 1))
+        db_tolerance = 2.0
+        delta_db = 20.0
+        delta_gain_db = abs((self.ratio - 1.0) * delta_db)
 
-        fA = (a_high * (1 - 1 / q)) / (a_high - a_low)
 
-        self.atkCoeff = fA ** (1 / (attack_tau * self.audio_rate))
-
-        self.relCoeff = ((a_low * q) / a_high) ** (1 / (release_tau * self.audio_rate))
+        self.atkCoeff = (db_tolerance / delta_gain_db) ** (1.0 / (attack_tau * self.audio_rate))
+        self.relCoeff = (db_tolerance / delta_gain_db) ** (1.0 / (release_tau * self.audio_rate))
 
         self.hold_samples = round(hold_tau * self.audio_rate)
 
         self.env_lin = 0.0
+        self.gain_db = 0.0
         self.hold_state = 0
 
         self.lowpass_iirb, self.lowpass_iira = firdes_lowpass(
@@ -1067,6 +1065,7 @@ class Expander:
             numba.types.float64,
             numba.types.float64,
             numba.types.float64,
+            numba.types.float64,
             numba.types.int32,
             numba.types.int32,
             numba.types.float64,
@@ -1080,26 +1079,27 @@ class Expander:
         audio,
         side_chain,
         env_lin,
+        gain_db,
         atkCoeff,
         relCoeff,
         hold_state,
         hold_samples,
-        gain,
+        makeup_gain_db,
         ratio
     ):
         n = audio.shape[0]
         epsilon = np.finfo(np.float64).eps
         one_minus_atkCoeff = 1 - atkCoeff
+        one_minus_relCoeff = 1 - relCoeff
         ratio_minus_one = ratio - 1
 
         # peak detector is intentionally in the linear domain
         for i in range(n):
             u = abs(side_chain[i])
 
-            is_attack = u > env_lin
-            if is_attack:
+            if u > env_lin:
+                env_lin = u
                 hold_state = hold_samples
-                env_lin = atkCoeff * env_lin + one_minus_atkCoeff * u
             else:
                 if hold_state > 0:
                     hold_state -= 1
@@ -1110,13 +1110,21 @@ class Expander:
 
         for i in range(n):
             # convert envelope to db
-            env_db = 20 * log10(max(abs(side_chain[i]), epsilon)) + gain
-            # apply ratio
-            env_db = ratio_minus_one * env_db
-            # apply expansion
-            audio[i] *= 10 ** (env_db / 20)
+            env = side_chain[i]
+            env_db = 20.0 * log10(max(env, epsilon))
+            target_gain_db = ratio_minus_one * env_db
 
-        return env_lin, hold_state
+            if target_gain_db < gain_db:
+                gain_db = relCoeff * gain_db + one_minus_relCoeff * target_gain_db
+            else:
+                gain_db = atkCoeff * gain_db + one_minus_atkCoeff * target_gain_db
+
+            side_chain[i] = gain_db + makeup_gain_db
+        
+        for i in range(n):
+            audio[i] *= 10 ** (side_chain[i] / 20)
+
+        return env_lin, gain_db, hold_state
 
     def process(self, pre_in, audio_out):
         side_chain = self.WeightedLowcut.lfilt(pre_in)
@@ -1131,10 +1139,11 @@ class Expander:
             self.zi_y
         )
 
-        self.env_lin, self.hold_state = Expander.expand(
+        self.env_lin, self.gain_db, self.hold_state = Expander.expand(
             audio_out,
             side_chain,
             self.env_lin,
+            self.gain_db,
             self.atkCoeff,
             self.relCoeff,
             self.hold_state,
