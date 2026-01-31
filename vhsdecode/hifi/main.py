@@ -1433,13 +1433,12 @@ class PostProcessor:
             max_gain_left, max_gain_right = PostProcessor.stereo_interleave(
                 l, r, stereo, sample_rate, decoder_state.block_num == 0
             )
-
-            if peak_gain_left.value < max_gain_left:
-                with peak_gain_left.get_lock():
+            with peak_gain_left.get_lock():
+                if peak_gain_left.value < max_gain_left:
                     peak_gain_left.value = max_gain_left
 
-            if peak_gain_right.value < max_gain_right:
-                with peak_gain_right.get_lock():
+            with peak_gain_right.get_lock():
+                if peak_gain_right.value < max_gain_right:
                     peak_gain_right.value = max_gain_right
 
             buffer.close()
