@@ -2617,15 +2617,19 @@ class HiFiDecode:
             r_out = buffer.get_pre_right()
 
             # shift the audio left to remove the block overlap
-            overlap_to_trim = max(0, round((len(audioL) - decoder_state.block_audio_final_len) / 2))
-            remaining_length = min(len(l_out), len(audioL) - overlap_to_trim)
+            copy_start = max(0, round((len(audioL) - decoder_state.block_audio_final_len) / 2))
+            copy_length = min(len(l_out), len(audioL) - copy_start)
+            remaining_start = copy_start + copy_length
 
+            l_out[remaining_start:] = 0
+            r_out[remaining_start:] = 0
             DecoderSharedMemory.copy_data_src_offset_float32(
-                audioL, l_out, overlap_to_trim, remaining_length
+                audioL, l_out, copy_start, copy_length
             )
             DecoderSharedMemory.copy_data_src_offset_float32(
-                audioR, r_out, overlap_to_trim, remaining_length
+                audioR, r_out, copy_start, copy_length
             )
+
             if measure_perf:
                 end_final_audio_copy = perf_counter()
 
