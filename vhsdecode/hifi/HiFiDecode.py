@@ -556,6 +556,8 @@ class FMdemod:
 
         prev_angle = 0  # doesn't matter since the final chunks have overlap
         prev_unwrapped = prev_angle
+        dc = np.float64(0)
+        out_temp = np.empty(rf_len, dtype=np.float64)
 
         for i in range(1, rf_len - QUADRATURE_LP_ORDER):
             #
@@ -605,11 +607,17 @@ class FMdemod:
             delta += two_pi * ((delta < -pi) - (delta > pi))
             unwrapped = prev_unwrapped + delta
 
-            out = np.float32(carrier_scaled + delta * phase_scale)
-            out_demod[i - 1] = out if np.isfinite(out) else 0
+            out = carrier_scaled + delta * phase_scale
+            dc += out
+            out_temp[i - 1] = out
 
             prev_angle = current_angle
             prev_unwrapped = unwrapped
+        
+        # remove any large dc offset
+        dc_reciprocal = 1 / (dc / rf_len)
+        for i in range(rf_len):
+            out_demod[i] = out_temp[i] * dc_reciprocal
 
     def work(self, input: np.array, output: np.array):
         if self.type == DEMOD_HILBERT:
