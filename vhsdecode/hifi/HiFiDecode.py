@@ -489,8 +489,6 @@ class FMdemod:
             (
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
                 NumbaAudioArray,
-                numba.types.float32,
-                numba.types.float32,
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
@@ -502,8 +500,6 @@ class FMdemod:
             (
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "A"),
                 NumbaAudioArray,
-                numba.types.float32,
-                numba.types.float32,
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
@@ -520,8 +516,6 @@ class FMdemod:
     def demod_quadrature(
         in_rf,
         out_demod,
-        min_float,
-        max_float,
         i_osc,
         q_osc,
         filter_b,
@@ -611,9 +605,8 @@ class FMdemod:
             delta += two_pi * ((delta < -pi) - (delta > pi))
             unwrapped = prev_unwrapped + delta
 
-            out = carrier_scaled + delta * phase_scale
-
-            out_demod[i - 1] = min(max(out, min_float), max_float)
+            out = np.float32(carrier_scaled + delta * phase_scale)
+            out_demod[i - 1] = out if np.isfinite(out) else 0
 
             prev_angle = current_angle
             prev_unwrapped = unwrapped
@@ -633,8 +626,6 @@ class FMdemod:
             FMdemod.demod_quadrature(
                 input,
                 output,
-                self.min_float,
-                self.max_float,
                 self.i_osc,
                 self.q_osc,
                 self.quadrature_lp_b,
@@ -2003,7 +1994,7 @@ class HiFiDecode:
         fastmath=True,
     )
     def cancelDC_trim(audio: np.array, trim: int) -> float:
-        dc = REAL_DTYPE(np.mean(audio[trim:-trim]))
+        dc = np.mean(audio[trim:-trim])
 
         for i in range(trim, len(audio) - trim):
             audio[i] = audio[i] - dc
