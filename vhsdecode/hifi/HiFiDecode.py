@@ -2600,10 +2600,7 @@ class HiFiDecode:
                     return
 
             buffer = DecoderSharedMemory(decoder_state)
-            if decoder_state.is_last_block:
-                raw_data = buffer.get_last_block()
-            else:
-                raw_data = buffer.get_block()
+            raw_data = buffer.get_block()
 
             audioL, audioR = decoder.block_decode(
                 raw_data,

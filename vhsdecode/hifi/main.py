@@ -1992,23 +1992,22 @@ async def decode_parallel(
             )
         elif decoder_state.is_last_block and frames_read > 0:
             # shift the read in data to (end - discard overlap)
+            block = buffer.get_block()
+
             frames_read_with_overlap = frames_read + decoder_state.block_overlap
-            block_in_offset = len(block_in) - frames_read_with_overlap
-            
-            np.roll(block_in, block_in_offset)
+            block_in_offset = len(block) - frames_read_with_overlap
+            block_data_read = block_in[0:frames_read].copy()
+            DecoderSharedMemory.copy_data_dst_offset_int16(
+                block_data_read, block, block_in_offset, frames_read
+            )
 
             # copy in the entire previous block to use as overlap
             # at the end of this decode worker, only the new audio will be returned
             previous_block_in_offset = len(previous_block) - block_in_offset
             DecoderSharedMemory.copy_data_src_offset_int16(
-                previous_block, block_in, previous_block_in_offset, block_in_offset
+                previous_block, block, previous_block_in_offset, block_in_offset
             )
         else:
-            # save the this block, shift the offset right to copy only the newest data
-            DecoderSharedMemory.copy_data_src_offset_int16(
-                block_in, previous_block, len(block_in) - len(previous_block), len(previous_block)
-            )
-
             # copy the overlapping data from the previous read
             block_in_overlap = buffer.get_block_in_start_overlap()
             DecoderSharedMemory.copy_data_int16(
@@ -2019,6 +2018,14 @@ async def decode_parallel(
             current_overlap = buffer.get_block_in_end_overlap()
             DecoderSharedMemory.copy_data_int16(
                 current_overlap, previous_overlap, len(current_overlap)
+            )
+
+        if not decoder_state.is_last_block:
+            # save the full block for the next iteration, including previous overlap
+            # will be used if the next block is the last block
+            block = buffer.get_block()
+            DecoderSharedMemory.copy_data_int16(
+                block, previous_block, len(previous_block)
             )
 
         buffer.close()

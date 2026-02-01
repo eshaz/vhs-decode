@@ -286,16 +286,6 @@ class DecoderSharedMemory:
             buffer=self.buf,
             order="C"
         )
-    
-    # block data only including the data that was read
-    def get_last_block(self) -> np.array:
-        return np.ndarray(
-            self.block_start_overlap_len + self.block_frames_read,
-            dtype=self.block_dtype,
-            offset=self.block_start_overlap_offset,
-            buffer=self.buf,
-            order="C"
-        )
 
     # block starts after first overlap, goes until the end of the last overlap
     # first part of the block is copied from the previous read
