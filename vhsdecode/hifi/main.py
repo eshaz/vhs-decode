@@ -32,6 +32,7 @@ from vhsdecode.hifi.utils import (
     DecoderState,
     PostProcessorSharedMemory,
     NumbaAudioArray,
+    BLOCK_DTYPE
 )
 
 import argparse
@@ -1940,6 +1941,7 @@ async def decode_parallel(
         input_position,
         exit_requested,
         previous_overlap,
+        previous_block
     ):
         buffer = DecoderSharedMemory(decoder_state)
         # read input data into the shared memory buffer
@@ -1988,14 +1990,31 @@ async def decode_parallel(
             DecoderSharedMemory.copy_data_int16(
                 block_data_read, block, start_overlap_end
             )
+        elif decoder_state.is_last_block and frames_read > 0:
+            # shift the read in data to (end - discard overlap)
+            frames_read_with_overlap = frames_read + decoder_state.block_overlap
+            block_in_offset = len(block_in) - frames_read_with_overlap
+            
+            np.roll(block_in, block_in_offset)
+
+            # copy in the entire previous block to use as overlap
+            # at the end of this decode worker, only the new audio will be returned
+            previous_block_in_offset = len(previous_block) - block_in_offset
+            DecoderSharedMemory.copy_data_src_offset_int16(
+                previous_block, block_in, previous_block_in_offset, block_in_offset
+            )
         else:
+            # save the this block, shift the offset right to copy only the newest data
+            DecoderSharedMemory.copy_data_src_offset_int16(
+                block_in, previous_block, len(block_in) - len(previous_block), len(previous_block)
+            )
+
             # copy the overlapping data from the previous read
             block_in_overlap = buffer.get_block_in_start_overlap()
             DecoderSharedMemory.copy_data_int16(
                 previous_overlap, block_in_overlap, len(block_in_overlap)
             )
 
-        if not decoder_state.is_last_block:
             # copy the the current overlap to use in the next iteration
             current_overlap = buffer.get_block_in_end_overlap()
             DecoderSharedMemory.copy_data_int16(
@@ -2038,6 +2057,7 @@ async def decode_parallel(
     with as_soundfile(input_file) as f:
         loop = asyncio.get_event_loop()
         previous_overlap = np.empty(0)
+        previous_block = np.empty(block_size, dtype=BLOCK_DTYPE)
         progressB = TimeProgressBar(f.frames, f.frames)
         block_num = 0
 
@@ -2072,6 +2092,7 @@ async def decode_parallel(
                 input_position,
                 exit_requested,
                 previous_overlap,
+                previous_block
             )
             
             with blocks_enqueued.get_lock():

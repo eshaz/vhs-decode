@@ -390,6 +390,25 @@ class DecoderSharedMemory:
     ):
         for i in range(length):
             dst[i + dst_offset] = src[i]
+    
+    
+    @staticmethod
+    @njit(
+        numba.types.void(
+            numba.types.Array(numba.int16, 1, "C"),
+            numba.types.Array(numba.int16, 1, "C"),
+            numba.types.int64,
+            numba.types.int64,
+        ),
+        cache=True,
+        fastmath=True,
+        nogil=True,
+    )
+    def copy_data_src_offset_int16(
+        src: np.array, dst: np.array, src_offset: int, length: int
+    ):
+        for i in range(length):
+            dst[i] = src[i + src_offset]
 
     @staticmethod
     @njit(

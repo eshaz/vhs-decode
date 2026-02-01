@@ -489,6 +489,8 @@ class FMdemod:
             (
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
                 NumbaAudioArray,
+                numba.types.float32,
+                numba.types.float32,
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
@@ -500,6 +502,8 @@ class FMdemod:
             (
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "A"),
                 NumbaAudioArray,
+                numba.types.float32,
+                numba.types.float32,
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
                 numba.types.Array(DEMOD_DTYPE_NB, 1, "C"),
@@ -516,6 +520,8 @@ class FMdemod:
     def demod_quadrature(
         in_rf,
         out_demod,
+        min_float,
+        max_float,
         i_osc,
         q_osc,
         filter_b,
@@ -556,8 +562,6 @@ class FMdemod:
 
         prev_angle = 0  # doesn't matter since the final chunks have overlap
         prev_unwrapped = prev_angle
-        dc = np.float64(0)
-        out_temp = np.empty(rf_len, dtype=np.float64)
 
         for i in range(1, rf_len - QUADRATURE_LP_ORDER):
             #
@@ -608,16 +612,11 @@ class FMdemod:
             unwrapped = prev_unwrapped + delta
 
             out = carrier_scaled + delta * phase_scale
-            dc += out
-            out_temp[i - 1] = out
+
+            out_demod[i - 1] = min(max(out, min_float), max_float)
 
             prev_angle = current_angle
             prev_unwrapped = unwrapped
-        
-        # remove any large dc offset
-        dc_reciprocal = 1 / (dc / rf_len)
-        for i in range(rf_len):
-            out_demod[i] = out_temp[i] * dc_reciprocal
 
     def work(self, input: np.array, output: np.array):
         if self.type == DEMOD_HILBERT:
@@ -634,6 +633,8 @@ class FMdemod:
             FMdemod.demod_quadrature(
                 input,
                 output,
+                self.min_float,
+                self.max_float,
                 self.i_osc,
                 self.q_osc,
                 self.quadrature_lp_b,
@@ -2002,7 +2003,7 @@ class HiFiDecode:
         fastmath=True,
     )
     def cancelDC_trim(audio: np.array, trim: int) -> float:
-        dc = np.mean(audio[trim:-trim])
+        dc = REAL_DTYPE(np.mean(audio[trim:-trim]))
 
         for i in range(trim, len(audio) - trim):
             audio[i] = audio[i] - dc
@@ -2615,20 +2616,19 @@ class HiFiDecode:
             l_out = buffer.get_pre_left()
             r_out = buffer.get_pre_right()
 
-            # shift the audio left to remove the block overlap
-            copy_start = max(0, round((len(audioL) - decoder_state.block_audio_final_len) / 2))
-            copy_length = min(len(l_out), len(audioL) - copy_start)
-            remaining_start = copy_start + copy_length
+            if decoder_state.is_last_block:
+                # only copy the last part of the data
+                overlap_to_trim = len(audioL) - (decoder_state.block_audio_final_len + decoder_state.block_audio_final_overlap)
+            else:
+                # shift the audio left to remove the block overlap
+                overlap_to_trim = max(0, round((len(audioL) - decoder_state.block_audio_final_len) / 2))
 
-            l_out[remaining_start:] = 0
-            r_out[remaining_start:] = 0
             DecoderSharedMemory.copy_data_src_offset_float32(
-                audioL, l_out, copy_start, copy_length
+                audioL, l_out, overlap_to_trim, decoder_state.block_audio_final_len
             )
             DecoderSharedMemory.copy_data_src_offset_float32(
-                audioR, r_out, copy_start, copy_length
+                audioR, r_out, overlap_to_trim, decoder_state.block_audio_final_len
             )
-
             if measure_perf:
                 end_final_audio_copy = perf_counter()
 
