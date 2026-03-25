@@ -37,6 +37,11 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include <QMap>
+
+#include <fftw3.h>
+#include <onnxruntime_cxx_api.h>
+
 
 // Indexes for the candidates considered in 3D adaptive mode
 enum CandidateIndex : qint32 {
@@ -97,7 +102,7 @@ qint32 Comb::Configuration::getLookBehind() const {
 qint32 Comb::Configuration::getLookAhead() const {
     if (dimensions == 3) {
         // ... and also the next frame
-        return 1;
+        return 2;
     }
 
     return 0;
@@ -133,81 +138,87 @@ void Comb::updateConfiguration(const LdDecodeMetaData::VideoParameters &_videoPa
     configurationSet = true;
 }
 
+// -----------------------------------------------------------------------------
+// [REVISED] decodeFrames: 4-Field Block / 2-Field Step (Overlap-Add)
+// -----------------------------------------------------------------------------
 void Comb::decodeFrames(const QVector<SourceField> &inputFields, qint32 startIndex, qint32 endIndex,
                         QVector<ComponentFrame> &componentFrames)
 {
     assert(configurationSet);
     assert((componentFrames.size() * 2) == (endIndex - startIndex));
 
-    // Buffers for the next, current and previous frame.
-    // Because we only need three of these, we allocate them upfront then
-    // rotate the pointers below.
-    auto nextFrameBuffer = std::make_unique<FrameBuffer>(videoParameters, configuration);
-    auto currentFrameBuffer = std::make_unique<FrameBuffer>(videoParameters, configuration);
-    auto previousFrameBuffer = std::make_unique<FrameBuffer>(videoParameters, configuration);
+    // Cache to hold FrameBuffers because OLA requires adding to future frames
+    // Key: Frame Index (relative to input array)
+    QMap<int, std::shared_ptr<FrameBuffer>> bufferCache;
 
-    // Decode each pair of fields into a frame.
-    // To support 3D operation, where we need to see three input frames at a time,
-    // each iteration of the loop loads and 1D/2D-filters frame N + 1, then
-    // 3D-filters and outputs frame N.
-    const qint32 preStartIndex = (configuration.dimensions == 3) ? startIndex - 4 : startIndex - 2;
-    for (qint32 fieldIndex = preStartIndex; fieldIndex < endIndex; fieldIndex += 2) {
-        const qint32 frameIndex = (fieldIndex - startIndex) / 2;
-
-        // Rotate the buffers
-        {
-            auto recycle = std::move(previousFrameBuffer);
-            previousFrameBuffer = std::move(currentFrameBuffer);
-            currentFrameBuffer = std::move(nextFrameBuffer);
-            nextFrameBuffer = std::move(recycle);
+    // Helper: Get existing buffer or create new one populated with fields
+    auto getFrameBuffer = [&](int frameIdx) -> std::shared_ptr<FrameBuffer> {
+        if (bufferCache.contains(frameIdx)) {
+            return bufferCache[frameIdx];
         }
 
-        // If there's another input field, bring it into nextFrameBuffer
-        if (fieldIndex + 3 < inputFields.size()) {
-            // Load fields into the buffer
-            nextFrameBuffer->loadFields(inputFields[fieldIndex + 2], inputFields[fieldIndex + 3]);
+        auto buf = std::make_shared<FrameBuffer>(videoParameters, configuration);
+        
+        // Calculate absolute field indices in inputFields
+        int fieldIdx1 = startIndex + frameIdx * 2;
+        int fieldIdx2 = fieldIdx1 + 1;
 
-            // Extract chroma using 1D filter
-            nextFrameBuffer->split1D();
+        if (fieldIdx1 >= 0 && fieldIdx2 < inputFields.size()) {
+            buf->loadFields(inputFields[fieldIdx1], inputFields[fieldIdx2]);
+            // Pre-calculate 1D/2D for fallback
+            buf->split1D();
+            buf->split2D();
+        } 
+        // Else: buffer remains black (boundary handling)
 
-            // Extract chroma using 2D filter
-            nextFrameBuffer->split2D();
-        }
+        bufferCache.insert(frameIdx, buf);
+        return buf;
+    };
 
-        if (fieldIndex < startIndex) {
-            // This is a look-behind frame; no further decoding needed.
-            continue;
-        }
-
+    // Step by 2 fields (1 frame)
+    // 4 Fields Block Logic: [Current, Next]
+    for (qint32 fieldIndex = startIndex; fieldIndex < endIndex; fieldIndex += 2) {
+        int currentFrameIdx = (fieldIndex - startIndex) / 2;
+        
+        // Block = [Current, Next] (4 Fields)
+        auto bufCurr = getFrameBuffer(currentFrameIdx);
+        auto bufNext = getFrameBuffer(currentFrameIdx + 1);
+        
         if (configuration.dimensions == 3) {
-            // Extract chroma using 3D filter
-            currentFrameBuffer->split3D(*previousFrameBuffer, *nextFrameBuffer);
+            // Process 4-field block
+            // Result is accumulated into bufCurr AND bufNext
+            bufCurr->split3D(*bufNext, currentFrameIdx);
         }
+        
+        // Output Current Frame
+        if (currentFrameIdx >= 0 && currentFrameIdx < componentFrames.size()) {
+            auto buf = bufCurr;
+            
+            componentFrames[currentFrameIdx].init(videoParameters);
+            buf->setComponentFrame(componentFrames[currentFrameIdx]);
 
-        // Initialise and clear the component frame
-        componentFrames[frameIndex].init(videoParameters);
-        currentFrameBuffer->setComponentFrame(componentFrames[frameIndex]);
+            if (configuration.dimensions == 3) {
+                buf->finalizeOLA();
+            }
 
-        // Demodulate chroma giving I/Q
-        if (configuration.phaseCompensation) {
-            currentFrameBuffer->splitIQlocked();
-        } else {
-            currentFrameBuffer->splitIQ();
-            // Extract Y from baseband and I/Q
-            currentFrameBuffer->adjustY();
-        }
-        currentFrameBuffer->filterIQ();
+            if (configuration.phaseCompensation) {
+                buf->splitIQlocked();
+            } else {
+                buf->splitIQ();
+                buf->adjustY();
+            }
+        
+            buf->filterIQ();
 
-        // Apply noise reduction
-        currentFrameBuffer->doCNR();
-        currentFrameBuffer->doYNR();
+            // Apply noise reduction
+            buf->doCNR();
+            buf->doYNR();
 
-        // Transform I/Q to U/V
-        currentFrameBuffer->transformIQ(configuration.chromaGain, configuration.chromaPhase);
+            // Transform I/Q to U/V
+            buf->transformIQ(configuration.chromaGain, configuration.chromaPhase);
 
-        // Overlay the map if required
-        if (configuration.dimensions == 3 && configuration.showMap) {
-            currentFrameBuffer->overlayMap(*previousFrameBuffer, *nextFrameBuffer);
+            // Frame is done, remove from cache
+            bufferCache.remove(currentFrameIdx);
         }
     }
 }
@@ -218,25 +229,19 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
                                const Configuration &configuration_)
     : videoParameters(videoParameters_), configuration(configuration_)
 {
-    // Set the frame height
     frameHeight = ((videoParameters.fieldHeight * 2) - 1);
-
-    // Set the IRE scale
     irescale = (videoParameters.white16bIre - videoParameters.black16bIre) / 100;
-}
 
-/*
- * The color burst frequency is 227.5 cycles per line, so it flips 180 degrees for each line.
- *
- * The color burst *signal* is at 180 degrees, which is a greenish yellow.
- *
- * When SCH phase is 0 (properly aligned) the color burst is in phase with the leading edge of the HSYNC pulse.
- *
- * Per RS-170 note 6, Fields 1 and 4 have positive/rising burst phase at that point on even (1-based!) lines.
- * The color burst signal should begin exactly 19 cycles later.
- *
- * getLinePhase returns true if the color burst is rising at the leading edge.
- */
+    // Initialize Accumulators
+    int safeWidth = videoParameters.fieldWidth;
+    int safeHeight = videoParameters.fieldHeight * 2;
+    accChroma.resize(safeHeight, std::vector<double>(safeWidth, 0.0));
+    weightSum.resize(safeHeight, std::vector<double>(safeWidth, 0.0));
+
+    // Initialize rawbuffer to black to avoid uninitialized reads
+    int totalSamples = videoParameters.fieldWidth * frameHeight;
+    rawbuffer.fill(0, totalSamples); 
+}
 
 inline qint32 Comb::FrameBuffer::getFieldID(qint32 lineNumber) const
 {
@@ -392,42 +397,343 @@ void Comb::FrameBuffer::split2D()
     }
 }
 
-// Extract chroma into clpbuffer[2] using an adaptive 3D filter.
-//
-// For each sample, this builds a list of candidates from other positions that
-// should have a 180 degree phase relationship to the current sample, and look
-// like they have similar luma/chroma content. It then picks the most similar
-// candidate.
-void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame, const FrameBuffer &nextFrame)
-{
-    for (qint32 lineNumber = videoParameters.firstActiveFrameLine; lineNumber < videoParameters.lastActiveFrameLine; lineNumber++) {
-        for (qint32 h = videoParameters.activeVideoStart; h < videoParameters.activeVideoEnd; h++) {
-            // Select the best candidate
-            qint32 bestIndex;
-            double bestSample;
-            getBestCandidate(lineNumber, h, previousFrame, nextFrame, bestIndex, bestSample);
+#ifndef IDX3
+#define IDX3(t, y, x, Nt, Ny, Nx) ((t)*(Ny)*(Nx) + (y)*(Nx) + (x))
+#endif
 
-            if (bestIndex < CAND_PREV_FIELD) {
-                // A 1D or 2D candidate was best.
-                // Use split2D's output, to save duplicating the line-blending heuristics here.
-                clpbuffer[2].pixel[lineNumber][h] = clpbuffer[1].pixel[lineNumber][h];
+// [FIX] 4-Field Split3D with STRICT Patent Logic (Symmetry & Freq Weight)
+void Comb::FrameBuffer::split3D(FrameBuffer &nextFrame, int frameIdx)
+{
+    const int Nx = 16;
+    const int Ny = 16;
+    const int Nt = 4;
+    
+    // 50% Overlap (Step 8) is required for perfect reconstruction with Sine Window
+    const int STEP_X = 8;
+    const int STEP_Y = 8;
+    const int SC_X = 4;
+
+    // FFTW Setup
+    fftw_complex *in = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * Nt * Ny * Nx);
+    fftw_complex *out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * Nt * Ny * Nx);
+    fftw_plan p_fwd = fftw_plan_dft_3d(Nt, Ny, Nx, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+    fftw_plan p_inv = fftw_plan_dft_3d(Nt, Ny, Nx, out, in, FFTW_BACKWARD, FFTW_ESTIMATE);
+
+    // Windows: Sine Window (Standard for 50% overlap OLA)
+    std::vector<double> winX(Nx), winY(Ny), winT(Nt);
+    for(int i=0; i<Nx; ++i) winX[i] = sin(M_PI * (i + 0.5) / Nx);
+    for(int i=0; i<Ny; ++i) winY[i] = sin(M_PI * (i + 0.5) / Ny);
+    for(int i=0; i<Nt; ++i) winT[i] = sin(M_PI * (i + 0.5) / Nt); 
+
+    FrameBuffer* frames[2] = { this, &nextFrame };
+
+    // [CHANGE 1] Loop Range: Start BEFORE the image, End AFTER the image
+    // Ensures edges are covered by the window center.
+    int startY = videoParameters.firstActiveFrameLine - (Ny / 2); 
+    int endY = videoParameters.lastActiveFrameLine; 
+    
+    int startX = videoParameters.activeVideoStart - (Nx / 2);
+    int endX = videoParameters.activeVideoEnd;
+
+    for (int y = startY; y < endY; y += STEP_Y) {
+        for (int x = startX; x < endX; x += STEP_X) {
+
+            // --- A. Fill Input (With Padding) ---
+            for(int i=0; i < Nt*Ny*Nx; ++i) { in[i][0] = 0.0; in[i][1] = 0.0; }
+
+            double blockDC = 0.0;
+            int pixelCount = 0;
+
+            for (int f = 0; f < 2; ++f) { 
+                for (int sub_t = 0; sub_t < 2; ++sub_t) { 
+                    int t = f * 2 + sub_t;
+                    bool isOddField = (t % 2 != 0); 
+                    
+                    for (int dy = 0; dy < Ny; ++dy) {
+                        int absY = y + dy;
+                        // [CHECK] Is this line inside the video?
+                        bool isYInside = (absY >= videoParameters.firstActiveFrameLine) && (absY < videoParameters.lastActiveFrameLine);
+                        
+                        // Interlace Check (Must match field polarity)
+                        bool isOddLine = (absY % 2 != 0);
+                        if (isOddLine != isOddField) continue; // Zero Pad for Interlace
+
+                        // Boundary Padding Logic:
+                        // If outside Y range, we leave it as 0.0 (Black Padding).
+                        // If inside Y range, we check X range.
+                        if (isYInside) {
+                            const quint16 *lineData = frames[f]->rawbuffer.data() + (absY * videoParameters.fieldWidth);
+                            for (int dx = 0; dx < Nx; ++dx) {
+                                int absX = x + dx;
+                                bool isXInside = (absX >= videoParameters.activeVideoStart) && (absX < videoParameters.activeVideoEnd);
+                                
+                                if (isXInside) {
+                                    // Valid Pixel
+                                    double val = (double)lineData[absX];
+                                    int i = IDX3(t, dy, dx, Nt, Ny, Nx);
+                                    in[i][0] = val; 
+                                    blockDC += val;
+                                    pixelCount++;
+                                }
+                                // Else: Outside X range -> Leave as 0.0 (Padding)
+                            }
+                        }
+                        // Else: Outside Y range -> Leave as 0.0 (Padding)
+                    }
+                }
+            }
+            if (pixelCount > 0) blockDC /= (double)pixelCount;
+
+            // DC Removal & Windowing
+            for(int t=0; t<Nt; ++t) {
+                bool isOddField = (t % 2 != 0);
+                for(int dy=0; dy<Ny; ++dy) {
+                    int absY = y + dy;
+                    bool isYInside = (absY >= videoParameters.firstActiveFrameLine) && (absY < videoParameters.lastActiveFrameLine);
+                    bool isOddLine = (absY % 2 != 0); // Polarity check based on absolute Y
+
+                    for (int dx = 0; dx < Nx; ++dx) {
+                        int absX = x + dx;
+                        bool isXInside = (absX >= videoParameters.activeVideoStart) && (absX < videoParameters.activeVideoEnd);
+                        
+                        int idx = IDX3(t, dy, dx, Nt, Ny, Nx);
+
+                        // Only remove DC if it was a real pixel
+                        // Padded pixels (0.0) should NOT have DC subtracted (0 - DC = large jump)
+                        // However, standard windowing applies to everything. 
+                        // To keep edges smooth, we treat padding as "Black" (0.0).
+                        
+                        if (isYInside && isXInside && (isOddLine == isOddField)) {
+                            in[idx][0] = (in[idx][0] - blockDC) * winT[t] * winY[dy] * winX[dx];
+                        } else {
+                            // Padding or Interlace Gap -> 0.0 * Window = 0.0
+                            in[idx][0] = 0.0;
+                        }
+                    }
+                }
+            }
+
+            // --- B. FFT ---
+            fftw_execute(p_fwd);
+
+            // =========================================================
+            // [DATA GENERATION] Deterministic Subsampling & Thread-Safe Export
+            // =========================================================
+            /*
+            //./ld-chroma-decoder -t 1 -f ntsc3d 必须使用单线程
+            static bool dump_enabled = true; 
+            // 记得跑第二次时改为 "train_target.bin"
+            static const char* dump_filename = "/home/a/train_input.bin"; 
+            
+            static std::mutex dump_mutex; 
+
+            // 确定性哈希采样 (Deterministic Hashing)
+            // 不使用随机数，而是根据 (Frame, Y, X) 计算一个固定的 ID
+            // 确保 Input 和 Target 两次运行时，选中的块是完全一一对应的。
+            
+            uint32_t seed = (uint32_t)frameIdx;
+            seed = seed * 31 + (uint32_t)y;
+            seed = seed * 31 + (uint32_t)x;
+            // 简单的混淆算法 (Xorshift style)
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            
+            // 采样率 5% (seed % 100 < 5)
+            // 这样对于同一个位置的块，无论何时运行，结果都一样。
+            bool should_save = (seed % 100) < 5; 
+
+            if (dump_enabled && should_save) {
+                std::lock_guard<std::mutex> lock(dump_mutex);
+                
+                static std::ofstream dumpFile;
+                if (!dumpFile.is_open()) {
+                    dumpFile.open(dump_filename, std::ios::binary | std::ios::out | std::ios::app);
+                }
+
+                if (dumpFile.is_open()) {
+                    dumpFile.write(reinterpret_cast<const char*>(out), sizeof(fftw_complex) * Nt * Ny * Nx);
+                }
+            }
+            // =========================================================
+            */
+            
+
+            // --- C. Logic: Patent Compliant Frequency Dependent LUT (Full 3D) ---
+            // =========================================================
+            // [AI INFERENCE] Neural Network Logic (Linux Version)
+            // =========================================================
+            
+            // 1. 初始化 ONNX Session (静态单例，只加载一次)
+            static std::unique_ptr<Ort::Env> env;
+            static std::unique_ptr<Ort::Session> session;
+            static bool model_loaded = false;
+            
+            if (!model_loaded) {
+                try {
+                    // 初始化环境
+                    env = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "NTSC_AI");
+                    
+                    // Session 配置
+                    Ort::SessionOptions session_options;
+                    session_options.SetIntraOpNumThreads(11); // 单线程推理足够快了
+                    
+                    // 加载模型
+                    // [Linux] 路径直接用字符串，不需要 L""
+                    // 请确保 chroma_net.onnx 文件在运行目录下，或者写绝对路径
+                    const char* model_path = "/home/ethan/git/vhs-decode/tools/chroma_net.onnx"; 
+                    
+                    session = std::make_unique<Ort::Session>(*env, model_path, session_options);
+                    model_loaded = true;
+                    qDebug() << "AI: ONNX Model loaded successfully from" << model_path;
+                } catch (const std::exception& e) {
+                    qCritical() << "AI: Failed to load ONNX model:" << e.what();
+                    // 如果加载失败，程序可能需要退出或回退到传统逻辑
+                }
+            }
+
+            if (model_loaded) {
+                // 2. 准备输入 Tensor
+                // Shape: [Batch=1, Channel=2, Depth=4, Height=16, Width=16]
+                std::vector<int64_t> input_shape = {1, 2, 4, 16, 16};
+                size_t input_element_count = 2048; // 1*2*4*16*16
+                std::vector<float> input_tensor_values(input_element_count);
+                
+                // 填充数据：必须严格遵守 Python 训练时的顺序 [Mag, RefMag]
+                int ptr = 0;
+                
+                // Channel 0: Original Magnitude
+                for (int t = 0; t < Nt; ++t) {
+                    for (int y = 0; y < Ny; ++y) {
+                        for (int x = 0; x < Nx; ++x) {
+                            int idx = IDX3(t, y, x, Nt, Ny, Nx);
+                            double mag = sqrt(out[idx][0]*out[idx][0] + out[idx][1]*out[idx][1]);
+                            input_tensor_values[ptr++] = (float)mag;
+                        }
+                    }
+                }
+                
+                // Channel 1: Reflected Magnitude
+                for (int t = 0; t < Nt; ++t) {
+                    // Ref T: (2 - t) % 4
+                    int ref_t = (2 - t) % 4;
+                    if (ref_t < 0) ref_t += 4;
+
+                    for (int y = 0; y < Ny; ++y) {
+                        // Ref Y: (16 - x) % 16
+                        int ref_y = (16 - y) % 16;
+                        for (int x = 0; x < Nx; ++x) {
+                            // Ref X: (8 - x) % 16
+                            int ref_x = (8 - x) % 16;
+                            if (ref_x < 0) ref_x += 16;
+                            
+                            int idx_ref = IDX3(ref_t, ref_y, ref_x, Nt, Ny, Nx);
+                            double mag_ref = sqrt(out[idx_ref][0]*out[idx_ref][0] + out[idx_ref][1]*out[idx_ref][1]);
+                            
+                            input_tensor_values[ptr++] = (float)mag_ref;
+                        }
+                    }
+                }
+
+                // 3. 创建 Tensor
+                auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+                Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+                    memory_info, input_tensor_values.data(), input_element_count, input_shape.data(), input_shape.size()
+                );
+
+                // 4. 运行推理
+                const char* input_names[] = {"input"};
+                const char* output_names[] = {"output"};
+                
+                auto output_tensors = session->Run(
+                    Ort::RunOptions{nullptr}, 
+                    input_names, &input_tensor, 1, 
+                    output_names, 1
+                );
+
+                // 5. 获取输出并应用 Mask
+                // Output Shape: [1, 1, 4, 16, 16]
+                float* mask_data = output_tensors[0].GetTensorMutableData<float>();
+                
+                int mask_idx = 0;
+                for (int t = 0; t < Nt; ++t) {
+                    for (int y = 0; y < Ny; ++y) {
+                        for (int x = 0; x < Nx; ++x) {
+                            int idx = IDX3(t, y, x, Nt, Ny, Nx);
+                            float gain = mask_data[mask_idx++];
+                            
+                            // 应用神经网络算出来的增益！
+                            out[idx][0] *= gain;
+                            out[idx][1] *= gain;
+                        }
+                    }
+                }
+            }
+            // =========================================================   
+                 
+            // --- D. IFFT ---
+            fftw_execute(p_inv);
+
+            // --- E. Accumulate (With Boundary Guards) ---
+            for (int t = 0; t < Nt; ++t) {
+                int f_idx = t / 2;
+                bool isOddField = (t % 2 != 0);
+                FrameBuffer* targetFrame = frames[f_idx];
+
+                for (int dy = 0; dy < Ny; ++dy) {
+                    int absY = y + dy;
+                    
+                    // [CHECK] Only accumulate if valid Y
+                    if (absY < videoParameters.firstActiveFrameLine || absY >= videoParameters.lastActiveFrameLine) continue;
+                    
+                    // Interlace check
+                    if ((absY % 2) != isOddField) continue;
+
+                    for (int dx = 0; dx < Nx; ++dx) {
+                        int absX = x + dx;
+                        
+                        // [CHECK] Only accumulate if valid X
+                        if (absX < videoParameters.activeVideoStart || absX >= videoParameters.activeVideoEnd) continue;
+
+                        int idx = IDX3(t, dy, dx, Nt, Ny, Nx);
+                        
+                        double val = in[idx][0] / (double)(Nt * Ny * Nx);
+                        double w = winT[t] * winY[dy] * winX[dx];
+                        
+                        targetFrame->accChroma[absY][absX] += val * w;
+                        targetFrame->weightSum[absY][absX] += w * w;
+                    }
+                }
+            }
+        }
+    }
+    fftw_destroy_plan(p_fwd); fftw_destroy_plan(p_inv);
+    fftw_free(in); fftw_free(out);
+}
+
+// [MODIFIED] Finalize OLA: Removed 2D Fallback
+void Comb::FrameBuffer::finalizeOLA() {
+    int writeHeight = videoParameters.lastActiveFrameLine;
+    int writeWidth = videoParameters.activeVideoEnd;
+    
+    for (int y = videoParameters.firstActiveFrameLine; y < writeHeight; ++y) {
+        for (int x = videoParameters.activeVideoStart; x < writeWidth; ++x) {
+            double w = weightSum[y][x];
+            
+            // Because we now cover edges with padding, weightSum should > 0 everywhere.
+            // If for some reason it's 0 (e.g. extremely corner), result is 0.
+            if (w > 0.00001) {
+                clpbuffer[2].pixel[y][x] = accChroma[y][x] / w;
             } else {
-                // Compute a 3D result.
-                // This sample is Y + C; the candidate is (ideally) Y - C. So compute C as ((Y + C) - (Y - C)) / 2.
-                clpbuffer[2].pixel[lineNumber][h] = (clpbuffer[0].pixel[lineNumber][h] - bestSample) / 2;
+                clpbuffer[2].pixel[y][x] = 0.0; // No 2D fallback, just black chroma
             }
         }
     }
 }
 
-// Evaluate all candidates for 3D decoding for a given position, and return the best one
-void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
-                                         const FrameBuffer &previousFrame, const FrameBuffer &nextFrame,
-                                         qint32 &bestIndex, double &bestSample) const
-{
+// ... (Rest of auxiliary functions) ...
+void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h, const FrameBuffer &previousFrame, const FrameBuffer &nextFrame, qint32 &bestIndex, double &bestSample) const {
     Candidate candidates[8];
-
-    // Bias the comparison so that we prefer 3D results, then 2D, then 1D
     static constexpr double LINE_BONUS = -2.0;
     static constexpr double FIELD_BONUS = LINE_BONUS - 2.0;
     static constexpr double FRAME_BONUS = FIELD_BONUS - 2.0;

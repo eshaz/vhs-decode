@@ -32,12 +32,16 @@
 #include <QDebug>
 #include <QFile>
 #include <QtMath>
+#include <vector> 
 
 #include "lddecodemetadata.h"
 
 #include "componentframe.h"
 #include "decoder.h"
 #include "sourcefield.h"
+#include <fstream>
+#include <mutex>
+#include <cstdlib>
 
 class Comb
 {
@@ -77,8 +81,6 @@ public:
     static constexpr qint32 MAX_WIDTH = 910;
     static constexpr qint32 MAX_HEIGHT = 525;
 
-protected:
-
 private:
     // Comb-filter configuration parameters
     bool configurationSet;
@@ -92,18 +94,25 @@ private:
 
         void loadFields(const SourceField &firstField, const SourceField &secondField);
 
+        // OLA Accumulators
+        std::vector<std::vector<double>> accChroma;
+        std::vector<std::vector<double>> weightSum;
+
         void split1D();
         void split2D();
-        void split3D(const FrameBuffer &previousFrame, const FrameBuffer &nextFrame);
+        
+        // [FIX] Adjusted for 4-Field Block (Current + Next)
+        void split3D(FrameBuffer &nextFrame,int frameIdx);
 
         void setComponentFrame(ComponentFrame &_componentFrame) {
             componentFrame = &_componentFrame;
         }
 
+        void finalizeOLA();
+
         void splitIQ();
         void splitIQlocked();
         void filterIQ();
-        void filterIQFull();
         void adjustY();
         void doCNR();
         void doYNR();
