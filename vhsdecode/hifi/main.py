@@ -722,23 +722,33 @@ class UnseekableSoundFile(sf.SoundFile):
 
     def buffer_read_into(self, buffer, dtype="int16"):
         item_size = np.dtype(dtype).itemsize
+        # new np buffer from here that is the exact size of the actually needed bytes!!!
         bytes_read = self.file_path.readinto(buffer)
 
         assert bytes_read % item_size == 0, "data is misaligned"
         bytes_read //= np.dtype(dtype).itemsize
 
-        return bytes_read
+        return np.frombuffer(buffer, count=bytes_read)
 
 
 class UnSigned16BitFileReader(io.RawIOBase):
-    def __init__(self, file_path):
+    def __init__(self, buffer, file_path):
+        self.buffer = buffer
         self.file_path = file_path
         self.file = open(file_path, "rb")
+        self.signed = True
 
-    def readinto(self, buffer):
-        buffer_uint16 = np.frombuffer(buffer, dtype=np.uint16)
-        bytes_read = self.file.readinto(buffer_uint16)
-        UnSigned16BitFileReader.uint16_to_int16(buffer_uint16, buffer)
+    # returns uint 16
+    def readinto(self, buffer, size):
+        # read in to a view that is larger than the actual needed data (allow for prefetching for future processes)
+        if self.signed:
+            buffer_view = np.frombuffer(buffer, count=size, dtype=np.uint16)
+            bytes_read = self.file.readinto(buffer)
+            UnSigned16BitFileReader.uint16_to_int16(buffer_view, buffer)
+        else:
+            buffer_view = np.frombuffer(buffer, count=size, dtype=np.int16)
+            bytes_read = self.file.readinto(buffer)
+
         if not bytes_read:
             return 0
 
@@ -766,6 +776,12 @@ class UnSigned16BitFileReader(io.RawIOBase):
 
     def close(self):
         self.file.close()
+
+
+class Signed16BitFileReader(UnSigned16BitFileReader):
+    def __init__(self, buffer, file_path):
+        super().__init__(buffer, file_path)
+        self.signed = False
 
 
 # This part is what opens the file
@@ -804,15 +820,7 @@ def as_soundfile(pathR, sample_rate=DEFAULT_FINAL_AUDIO_RATE):
             endian="LITTLE",
         )
     elif "u16" == extension or "r16" == extension:
-        return UnseekableSoundFile(
-            UnSigned16BitFileReader(pathR),
-            "r",
-            channels=1,
-            samplerate=int(sample_rate),
-            format="RAW",
-            subtype="PCM_16",
-            endian="LITTLE",
-        )
+        return UnSigned16BitFileReader(pathR),
     elif "flac" == extension:
         return sf.SoundFile(
             pathR,
