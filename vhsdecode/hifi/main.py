@@ -25,6 +25,7 @@ import asyncio
 from setproctitle import setproctitle
 from contextlib import nullcontext
 
+import ctypes
 import numpy as np
 import soundfile as sf
 
@@ -593,19 +594,34 @@ def test_if_ffmpeg_is_installed():
         print("WARN: ffmpeg not installed (or not in PATH)")
         return False
 
+if sys.platform == "win32":
+    libc = ctypes.cdll.msvcrt
+else:
+    libc = ctypes.CDLL(None)
 
 class BufferedInputStream(io.RawIOBase):
-    def __init__(self, buffer):
-        self.buffer = buffer
+    def __init__(self, internal_buffer):
+        self.buffer = internal_buffer
         self._pos: int = 0
+        self._total_size: int = internal_buffer.nbytes
 
     def readinto(self, buffer):
-        bytes_read = self.buffer.readinto(buffer)
-        if not bytes_read:
+        bytes_to_read = len(buffer)
+        if bytes_to_read == 0:
             return 0
 
-        self._pos += bytes_read
-        return bytes_read
+        if self._pos + bytes_to_read > self._total_size:
+            bytes_to_read = self._total_size - self._pos
+            if bytes_to_read <= 0:
+                return 0
+
+        dest = ctypes.c_char.from_buffer(buffer)
+        src = self.buffer.ctypes.data + self._pos
+
+        libc.memcpy(dest, src, bytes_to_read)
+
+        self._pos += bytes_to_read
+        return bytes_to_read
 
     def readable(self):
         return True
@@ -620,10 +636,10 @@ class BufferedInputStream(io.RawIOBase):
         pass
 
     def fileno(self):
-        return self.buffer.fileno()
+        raise IOError("NumPy shared memory stream does not have a fileno")
 
     def isatty(self):
-        return self.buffer.isatty()
+        return False
 
     def tell(self):
         # hack, there is no way to know the current position
