@@ -731,45 +731,22 @@ class UnseekableSoundFile(sf.SoundFile):
         return np.frombuffer(buffer, count=bytes_read)
 
 
-class UnSigned16BitFileReader(io.RawIOBase):
+class BufferedFileReader(io.RawIOBase):
     def __init__(self, buffer, file_path):
-        self.buffer = buffer
         self.file_path = file_path
         self.file = open(file_path, "rb")
-        self.signed = True
+        self.dtype = np.uint16
 
     # returns uint 16
     def readinto(self, buffer, size):
         # read in to a view that is larger than the actual needed data (allow for prefetching for future processes)
-        if self.signed:
-            buffer_view = np.frombuffer(buffer, count=size, dtype=np.uint16)
-            bytes_read = self.file.readinto(buffer)
-            UnSigned16BitFileReader.uint16_to_int16(buffer_view, buffer)
-        else:
-            buffer_view = np.frombuffer(buffer, count=size, dtype=np.int16)
-            bytes_read = self.file.readinto(buffer)
+        buffer_view = np.frombuffer(buffer, count=size, dtype=self.dtype)
+        bytes_read = self.file.readinto(buffer)
 
         if not bytes_read:
             return 0
 
         return bytes_read
-
-    @staticmethod
-    @guvectorize(
-        [
-            (
-                numba.types.Array(numba.types.uint16, 1, "C"),
-                numba.types.Array(numba.types.int16, 1, "C"),
-            )
-        ],
-        "(n)->(n)",
-        cache=True,
-        fastmath=True,
-        nopython=True,
-    )
-    def uint16_to_int16(uint16_in, int16_out):
-        for i in range(len(uint16_in)):
-            int16_out[i] = uint16_in[i] - 2**15
 
     def readable(self):
         return True
@@ -777,11 +754,25 @@ class UnSigned16BitFileReader(io.RawIOBase):
     def close(self):
         self.file.close()
 
-
-class Signed16BitFileReader(UnSigned16BitFileReader):
+class UnSigned8BitFileReader(BufferedFileReader):
     def __init__(self, buffer, file_path):
         super().__init__(buffer, file_path)
-        self.signed = False
+        self.dtype = np.uint8
+
+class Signed8BitFileReader(BufferedFileReader):
+    def __init__(self, buffer, file_path):
+        super().__init__(buffer, file_path)
+        self.dtype = np.int8
+
+class UnSigned16BitFileReader(BufferedFileReader):
+    def __init__(self, buffer, file_path):
+        super().__init__(buffer, file_path)
+        self.dtype = np.uint16
+
+class Signed16BitFileReader(BufferedFileReader):
+    def __init__(self, buffer, file_path):
+        super().__init__(buffer, file_path)
+        self.dtype = np.int16
 
 
 # This part is what opens the file
@@ -790,37 +781,13 @@ def as_soundfile(pathR, sample_rate=DEFAULT_FINAL_AUDIO_RATE):
     path = pathR.lower()
     extension = pathR.lower().split(".")[-1]
     if "raw" == extension or "s16" == extension:
-        return sf.SoundFile(
-            pathR,
-            "r",
-            channels=1,
-            samplerate=int(sample_rate),
-            format="RAW",
-            subtype="PCM_16",
-            endian="LITTLE",
-        )
+        return Signed16BitFileReader(pathR)
     elif "u8" == extension or "r8" == extension:
-        return sf.SoundFile(
-            pathR,
-            "r",
-            channels=1,
-            samplerate=int(sample_rate),
-            format="RAW",
-            subtype="PCM_U8",
-            endian="LITTLE",
-        )
+        return UnSigned8BitFileReader(pathR)    
     elif "s8" == extension:
-        return sf.SoundFile(
-            pathR,
-            "r",
-            channels=1,
-            samplerate=int(sample_rate),
-            format="RAW",
-            subtype="PCM_S8",
-            endian="LITTLE",
-        )
+        return Signed8BitFileReader(pathR)    
     elif "u16" == extension or "r16" == extension:
-        return UnSigned16BitFileReader(pathR),
+        return UnSigned16BitFileReader(pathR)
     elif "flac" == extension:
         return sf.SoundFile(
             pathR,
@@ -900,15 +867,7 @@ def as_soundfile(pathR, sample_rate=DEFAULT_FINAL_AUDIO_RATE):
             )
     elif "-" == path:
         try:
-            return UnseekableSoundFile(
-                BufferedInputStream(sys.stdin.buffer),
-                "r",
-                channels=1,
-                samplerate=int(sample_rate),
-                format="RAW",
-                subtype="PCM_16",
-                endian="LITTLE",
-            )
+            return UnSigned16BitFileReader(pathR)
         except Exception as e:
             print("Failed to open standard in, unable to decode")
             raise e
