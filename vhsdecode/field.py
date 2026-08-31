@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import vhsdecode.sync as sync
 import vhsdecode.formats as formats
 from vhsdecode.doc import detect_dropouts_rf
+from vhsdecode import luma_amplitude
 from vhsdecode.chroma import (
     apply_chroma_envelope_gain,
     decode_chroma,
@@ -1134,6 +1135,11 @@ class FieldShared:
         # measured - so those measurements read a corrected signal rather than
         # having to be compensated for one afterwards.
         apply_chroma_envelope_gain(self)
+
+        # An extra channel for downstream analysis, when it was asked for. The
+        # measurement is shared with the correction above rather than repeated.
+        if self.rf.options.luma_deviation:
+            luma_amplitude.attach_luma_deviation(self)
 
         # required to trigger the chroma downscaling to happen again (if this is run after scaling for some reason)
         self.chroma_tbc_buffer = None

@@ -4,6 +4,7 @@ from numba import njit
 import math
 
 import vhsdecode.formats as vhs_formats
+from vhsdecode.rust_utils import sosfiltfilt_rust
 
 
 @dataclass
@@ -64,13 +65,21 @@ def detect_dropouts_rf(field, dod_options):
     Uses either an percentage of the frame average rf level, or an absolute value.
     TODO: A more advanced algorithm with hysteresis etc.
     """
-    env = field.data["video"]["envelope"]
+    # The envelope is carried at full bandwidth for the amplitude measurement,
+    # which needs every excursion it can see. Dropout detection wants the
+    # opposite: on a wide envelope a single damaged region crosses the
+    # threshold repeatedly, breaking into a run of short spans with unmarked
+    # gaps between them, and the concealment then covers less of the damage
+    # than it should. So it is band limited here instead - once over the
+    # assembled field rather than once per block.
+    env = sosfiltfilt_rust(field.rf.Filters["FEnvPost"], field.data["video"]["envelope"])
+
     threshold_p = dod_options.dod_threshold_p
     threshold_abs = dod_options.dod_threshold_a
     hysteresis = dod_options.dod_hysteresis
 
     threshold = 0.0
-    field_average = np.mean(field.data["video"]["envelope"])
+    field_average = np.mean(env)
     # Store the average for later.
     field.rf.field_averages.rf_level.push(field_average)
     if threshold_abs is not None:
@@ -99,9 +108,16 @@ def detect_dropouts_rf(field, dod_options):
     if debug_plot and debug_plot.is_plot_requested("luma_noise"):
         from vhsdecode.debug_plot import plot_luma_noise
 
+        video = field.data["video"]
         plot_luma_noise(
+            video["envelope"],
             env,
-            field.data["video"]["demod"],
+            video["demod"],
+            video["demod_raw"] if "demod_raw" in video else None,
+            getattr(field, "chroma_envelope_deviation", None),
+            getattr(field, "chroma_envelope_correction", None),
+            getattr(field, "chroma_envelope_response", None),
+            field.isFirstField,
             dropouts_rf,
             threshold,
             hysteresis,

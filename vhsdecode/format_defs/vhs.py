@@ -30,6 +30,9 @@ def fill_rfparams_vhs_shared(rfparams: dict, tape_speed: int = 0) -> None:
     rfparams["nonlinear_exp_scaling"] = [0.06, 0.12, 0.12, 0.12][tape_speed]
     rfparams["use_sub_deemphasis"] = [False, True, True, True][tape_speed]
 
+    # Smoothing applied to the detected RF envelope.
+    rfparams["envelope_lpf_freq"] = 700000
+
     # Make sure these exist in the dict so they can be overridden
     rfparams["video_rf_peak_freq"] = None
     rfparams["video_rf_peak_gain"] = None

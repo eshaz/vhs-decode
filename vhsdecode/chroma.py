@@ -12,90 +12,93 @@ from numba import njit
 from numba.experimental import jitclass
 from functools import cache
 
+BURST_START_LINE=10
+
 
 # ---------------------------------------------------------------------------
 # Color-under amplitude correction from the luma carrier's amplitude
 #
-# The Luma FM carrier has a mostly constant amplitude at record time, so every
-# deviation from constant is imposed by the tape. The luma carrier and the
-# color-under were written by the same head, onto the same oxide, at the same
-# instant, so head-to-medium separation is shared between them and scales with
-# wavelength. `vhsdecode.luma_amplitude` measures that deviation; everything
-# here scales it across to the color-under and applies it.
+# An FM carrier is recorded at constant amplitude, so every departure from
+# constant is loss the tape imposed. The luma carrier and the color-under were
+# written by the same head, onto the same oxide, at the same instant, so they
+# shared that loss. `vhsdecode.luma_amplitude` measures the departure;
+# everything here scales it across to the color-under and reverses it.
 #
-# Measured on the RF sample grid over the assembled field, ahead of the time
-# base correction, so the measurement is free of its wow level adjustment - a
-# timebase artifact, not tape noise. Applied on the output grid, resampled
-# through the same time base correction as the chroma and with the same shift,
-# so it lands on the samples it was measured from, and inside the up-conversion
-# so it cannot feed back into the burst measurements that set chroma phase and
-# line locations.
+# Both happen on the raw RF, before the time base correction and
+# before anything has been measured from the color-under: the tape imposed the
+# loss at that rate, so it is undone at that rate.
 
-# How the luma carrier's amplitude noise transfers to the color-under, and how
-# far it can be trusted.
-#
-# Format figures are from the JVC Video Technical Guide VTG82063 section 1:
-# writing speed 5.80 m/s, video track pitch 0.058 mm at SP and 0.019 mm at EP,
-# luma FM sync tip 3.4 MHz and peak white 4.4 MHz, colour-under 629.371 kHz.
-# At that writing speed the luma carrier is recorded at 1.32 to 1.71 um and the
-# colour-under at 9.22 um, so the two bands sit about a factor of six apart in
-# wavelength - which is the whole reason one can be corrected from the other.
-#
-# The transfer. Head-to-medium separation modulates both bands together, and the
-# Wallace relation makes that transfer the ratio of their wavelengths - at a
-# common writing speed, the inverse ratio of their frequencies. Everything else
-# the carrier passed through drops out of it. Gap loss and coating thickness
-# loss do not depend on separation, so they differentiate away, and the transfer
-# for a spacing perturbation is the frequency ratio whatever the tape is made
-# of. That is why the guide's silence on head gap length and coating thickness
-# does not matter here: those terms cancel.
-#
-# But not all of the amplitude noise is spacing. Particulate density varies from
-# one reproduce volume to the next, and that varies the flux at every wavelength
-# equally - it transfers at unity, not at the wavelength ratio. So the measured
-# coupling sits above the pure Wallace value, and what sets it is the fraction
-# of the noise that is wavelength independent:
-#
-#     transfer = fraction + (1 - fraction) * wavelength ratio
-#
-# Calibrated at 0.19, which is where the measured within-field luma-to-chroma
-# coupling of 0.186-0.248 lands once the attenuation of its own regression is
-# taken into account. Bounded by construction: 0 is pure spacing loss, 1 is
-# noise that ignores wavelength entirely.
 WAVELENGTH_INDEPENDENT_NOISE = 0.194
 
-# The trust. A correction driven by a noisy estimate has to be scaled back by
-# the Wiener factor, signal power over signal plus noise power. That noise is
-# particulate - the medium is a finite number of particles - so its power goes
-# as one over the number the head reproduces from, and that count is
-# proportional to track width. Tape signal-to-noise therefore improves by 3 dB
-# per doubling of track width, and the weight is
+# How far the measurement can be trusted.
+#
+# The reference is itself noisy, so the correction is scaled back by the Wiener
+# weight - signal power over signal plus noise power:
 #
 #     weight = track width / (track width + half-coupling width)
 #
-# where the half-coupling width is where signal and noise powers are equal.
-# At 18.3 um that puts the amplitude measurement at 5.0 dB at the 58 um SP
-# track and 0.2 dB at the 19.3 um EP track - which is why the correction has to
-# be scaled back so much harder at the slower speeds. It matters: measured
-# optimum amounts were 0.94-1.07 across five SP patterns but 0.62-0.73 across
-# four EP patterns, and running the SP value on EP does not merely
-# under-perform, it makes the picture worse.
-#
-# This and the fraction above are calibrated against those two speeds and
-# reproduce both exactly, so neither is separately identified - two parameters
-# through two points. LP falls out at 0.61 and PAL SP at 0.73; neither has been
-# tested. Note the knee lands within 5% of the EP width itself, which is the
-# usual sign of a fit with no degrees of freedom left over.
+# The noise is particulate, and a wider track reproduces from proportionally
+# more particles, so the half-coupling width is the track width at which the
+# two powers meet. This is why the slower speeds need the correction held back
+# so much harder: EP lays down a third of SP's track. Estimated alongside the
+# fraction above.
 HALF_COUPLING_TRACK_WIDTH = 18.29
 
 # Used only when a format supplies no track width of its own.
 REFERENCE_TRACK_WIDTH = 58.0
+
+# How far the transfer above survives as the loss gets faster.
+#
+# The trust weight settles how much of the luma's deviation belongs on the
+# color-under, but not how quickly. Head to medium separation is mechanical and
+# therefore slow; the luma envelope's own noise is broadband. So the fraction of
+# the deviation worth transferring is a Wiener weight in frequency as well, and
+# it falls away as the modulation gets faster - measured against the
+# color-under's own amplitude it is the whole of the modelled transfer at a few
+# tens of kHz and about half of it by 150 kHz, on both speeds and both test
+# patterns.
+#
+# Applied flat, as it was, the gain therefore spends most of its excursion where
+# it predicts nothing, and the only defence is to scale the whole correction
+# back - which is why the slow part, the part that is real, ends up under
+# applied. Measuring the roll-off and imposing it lets the rest come up: the
+# best flat amount measured 0.23-0.72 across the test patterns and rises to
+# 0.38-1.12 once shaped.
+#
+# The shape is not a chosen curve. No single pole order describes it (chi2/dof
+# 2-24 for every one tried) and it differs between tapes and speeds, so it is
+# measured per field by regressing the color-under's own amplitude on the luma's
+# deviation, band by band.
+
+# Bands the transfer is measured in, across the color-under's modulation range.
+# The response is read off these rather than fitted through them, so they are
+# kept well above what a roll-off needs.
+TRANSFER_BANDS = 12
+
+# A band is used only where it stands this many standard errors clear of zero.
+# Below that it carries no information about the response and the isotonic fit
+# spans it instead.
+TRANSFER_MIN_SIGMA = 3.0
+
+# Fields the measured response is averaged over. The regression is noisy in a
+# single field - the color-under's own picture content is the larger part of
+# what it sees - but the transfer is a property of the head and the tape, so it
+# holds across a decode.
+TRANSFER_AVERAGE_FIELDS = 30
+
+# Fields between measurements, once that average has something in it. Measuring
+# every field resolves a quantity that is constant over the whole averaging
+# window several times over; on this stride the window still turns over inside
+# two seconds of tape. The shaping is applied every field regardless - only the
+# regression behind it is strided.
+TRANSFER_MEASURE_STRIDE = 4
 
 
 @njit(cache=True, nogil=True, fastmath=True)
 def _transfer_exponent(
     deviation,
     carrier_hz,
+    steadiness,
     color_under_carrier_hz,
     wavelength_independent,
     trust,
@@ -104,22 +107,19 @@ def _transfer_exponent(
 ):
     """The power the luma's amplitude deviation is raised to, per sample.
 
-    The exponent is the transfer from luma amplitude loss to color-under
-    amplitude loss: the wavelength ratio for the part of the noise that is
-    spacing, unity for the part that is not, taken per sample against the luma
-    carrier's own instantaneous frequency because that is what set the luma
-    wavelength at that moment. Scaled back by how far the measurement can be
-    trusted at this track width.
+    The transfer above, evaluated against the luma carrier's own instantaneous
+    frequency since that is what set its wavelength at the moment in question,
+    and scaled by how far this track width lets the measurement be trusted.
 
-    The confidence weight is the Wiener weight for an estimate whose noise is
-    fixed and whose signal is the measured level, normalised to one at nominal
-    so undamaged material is left exactly as it was. Where the carrier has
-    collapsed, scaling the chroma up would restore noise rather than
-    saturation, so the correction is withdrawn there.
+    Confidence is a second Wiener weight, on the measurement rather than the
+    medium: one where the carrier sits at its normal level, falling away where
+    it has collapsed, because scaling the chroma up there would restore noise
+    rather than saturation. Steadiness withdraws it again wherever the carrier
+    is sweeping too fast for the path to follow, since the amplitude there is
+    reporting the path rather than the tape - see `path_transient_scale`.
 
-    Arithmetic only, written into a caller-supplied array: this runs over every
-    sample of every field, and raising the deviation to it is left to the
-    ufunc that can do it eight samples at a time.
+    Arithmetic only, into a caller-supplied array; raising the deviation to it
+    is left to the ufunc that can do eight samples at a time.
     """
     count = len(deviation)
     half = dropout_fraction * dropout_fraction
@@ -128,7 +128,7 @@ def _transfer_exponent(
     for i in range(count):
         value = deviation[i]
         squared = value * value
-        confidence = squared * scale / (squared + half)
+        confidence = squared * scale / (squared + half) * steadiness[i]
         wavelength_ratio = color_under_carrier_hz / carrier_hz[i]
         transfer = (
             wavelength_independent
@@ -140,25 +140,26 @@ def _transfer_exponent(
 def _envelope_gain_from_deviation(
     deviation,
     carrier_hz,
+    steadiness,
     color_under_carrier_hz,
     wavelength_independent,
     trust,
     dropout_fraction,
 ):
-    """The color-under gain that reverses the luma's measured amplitude noise.
+    """The color-under gain that reverses the luma's measured amplitude loss.
 
-    `deviation ** exponent` is the whole of it. The exponent is assembled in a
-    compiled loop, which is what that kind of branchless per-sample arithmetic
-    is for, and the exponentiation itself is handed to numpy, whose single
-    precision power loop is vectorised - where the same `exp(-e*log(v)*c)`
-    written inside the compiled loop is not, because numba can only vectorise
-    transcendentals through a vector math library this build has no access to.
-    Same arithmetic, an order of magnitude apart in cost.
+    `deviation ** exponent`, split in two. The exponent is assembled in a
+    compiled loop, which is what branchless per-sample arithmetic is for, and
+    the power is handed to numpy, whose single precision loop is vectorised
+    where numba's is not - numba can only vectorise transcendentals through a
+    vector math library this build cannot reach. The same arithmetic either
+    way, an order of magnitude apart in cost.
     """
     gain = np.empty(len(deviation), dtype=np.float32)
     _transfer_exponent(
         deviation,
         carrier_hz,
+        steadiness,
         np.float32(color_under_carrier_hz),
         np.float32(wavelength_independent),
         np.float32(trust),
@@ -172,32 +173,233 @@ def _envelope_gain_from_deviation(
 def _scale_color_under(chroma, gain, amount):
     """Scale the color-under by the correction, in place, on the RF grid.
 
-    A plain multiply is all that is needed. The color-under has been band
-    passed and has had its block mean subtracted, so it is already zero mean
-    and carries no DC term for a time varying gain to turn into a real
-    component at the subcarrier frequency.
+    A plain multiply suffices: the color-under has been band passed and had its
+    block mean subtracted, so it carries no DC term for a time varying gain to
+    turn into a real component at the subcarrier frequency.
     """
     one = np.float32(1.0)
     for i in range(len(gain)):
         chroma[i] *= one + (gain[i] - one) * amount
 
 
+@njit(cache=True, nogil=True, fastmath=True)
+def _line_comb_pair(deviation, power, linelocs, first_line, last_line, mean_power, x, y):
+    """Both signals, less the same phase one line earlier, in one pass.
+
+    On a repeating picture both the luma deviation and the color-under's
+    amplitude are dominated by content locked to the line, which shares its
+    harmonics with the other and so produces high coherence at arbitrary phase.
+    The transfer cannot be read through that. Subtracting the previous line
+    removes everything picture-locked and leaves the tape's own contribution.
+    It is linear and applied to both signals identically, so the transfer it
+    measures is unchanged.
+
+    The previous line is found from the decoder's own line locations rather
+    than a nominal line length, so the comb follows the time base instead of
+    assuming there isn't one.
+    """
+    out = 0
+    limit = len(x)
+    for line in range(first_line, last_line):
+        this_start = linelocs[line]
+        this_length = linelocs[line + 1] - this_start
+        previous_start = linelocs[line - 1]
+        previous_length = this_start - previous_start
+        if this_length <= 0.0 or previous_length <= 0.0:
+            continue
+        scale = previous_length / this_length
+        begin = int(np.ceil(this_start))
+        stop = int(np.floor(linelocs[line + 1]))
+        for position in range(begin, stop):
+            if out >= limit:
+                return out
+            source = previous_start + (position - this_start) * scale
+            lower = int(source)
+            fraction = np.float32(source - lower)
+            back = deviation[lower] + (deviation[lower + 1] - deviation[lower]) * fraction
+            x[out] = (deviation[position] - back)
+            back = power[lower] + (power[lower + 1] - power[lower]) * fraction
+            y[out] = (power[position] - back) / mean_power
+            out += 1
+    return out
+
+
+def _isotonic(values, weight):
+    """Weighted least squares fit under a non-increasing constraint.
+
+    Pool adjacent violators. The transfer is a Wiener weight against a noise
+    that grows with frequency, so it can only fall; imposing that is what makes
+    a per-field estimate usable without choosing a curve for it to follow.
+    """
+    level = list(values)
+    mass = list(weight)
+    count = [1] * len(level)
+    i = 0
+    while i < len(level) - 1:
+        if level[i] >= level[i + 1]:
+            i += 1
+            continue
+        total = mass[i] + mass[i + 1]
+        level[i] = (level[i] * mass[i] + level[i + 1] * mass[i + 1]) / total
+        mass[i] = total
+        count[i] += count[i + 1]
+        del level[i + 1], mass[i + 1], count[i + 1]
+        if i > 0:
+            i -= 1
+    return np.repeat(np.array(level), count)
+
+
+def _measure_transfer_response(field, deviation, half_width_hz):
+    """How much of the modelled transfer survives, band by band.
+
+    Regresses the color-under's own amplitude on the luma's deviation. The
+    color-under is squared rather than enveloped - no analytic signal, no
+    filter - which puts its amplitude at baseband alongside a copy around twice
+    the under-carrier that is far outside the range this looks at.
+
+    Returns the band centres and the response normalised to unity where the
+    transfer is strongest, or None where the field cannot support it. Nothing
+    about the level is taken from here: that is the track width's business, and
+    this carries only the shape.
+    """
+    video = field.data["video"]
+    linelocs = np.asarray(field.linelocs, dtype=np.float64)
+    if len(linelocs) < 20:
+        return None
+
+    # The active field. There is no color-under in the vertical interval, so a
+    # ratio measured there is noise over nothing.
+    first = field.lineoffset + 12
+    last = min(len(linelocs) - 2, field.lineoffset + field.linecount)
+    if last <= first:
+        return None
+    start = int(np.ceil(linelocs[first]))
+    end = min(int(np.floor(linelocs[last])), len(deviation))
+
+    # Long enough that the comb's nulls, which sit at multiples of the line
+    # rate, fall inside a segment rather than across it.
+    samples_per_line = float(np.median(np.diff(linelocs)))
+    segment = 1 << int(np.ceil(np.log2(max(2.0 * samples_per_line, 256.0))))
+    if end - start < 4 * segment:
+        return None
+
+    burst = np.asarray(video["demod_burst"], dtype=np.float32)
+    power = burst * burst
+    mean_power = float(power[start:end].mean())
+    if not mean_power > 0.0:
+        return None
+
+    span = end - start
+    x = np.empty(span, dtype=np.float32)
+    y = np.empty(span, dtype=np.float32)
+    kept = _line_comb_pair(
+        np.asarray(deviation, dtype=np.float32),
+        power,
+        linelocs,
+        first,
+        last,
+        np.float32(mean_power),
+        x,
+        y,
+    )
+    if kept < 4 * segment:
+        return None
+
+    # Abutting rather than overlapping segments. Half the transforms, and the
+    # response is averaged over whole fields anyway.
+    count = kept // segment
+    taper = np.hanning(segment).astype(np.float32)
+    fx = sps_fft.rfft(x[: count * segment].reshape(count, segment) * taper, axis=1)
+    fy = sps_fft.rfft(y[: count * segment].reshape(count, segment) * taper, axis=1)
+    sxx = np.einsum("ij,ij->j", fx.conj(), fx).real.astype(np.float64)
+    sxy = np.einsum("ij,ij->j", fx.conj(), fy).real.astype(np.float64)
+    syy = np.einsum("ij,ij->j", fy.conj(), fy).real.astype(np.float64)
+
+    frequency = np.fft.rfftfreq(segment, 1.0 / field.rf.freq_hz)
+    edges = np.linspace(0.0, half_width_hz, TRANSFER_BANDS + 1)
+    centre = 0.5 * (edges[:-1] + edges[1:])
+    response = np.zeros(TRANSFER_BANDS)
+    weight = np.zeros(TRANSFER_BANDS)
+    for b in range(TRANSFER_BANDS):
+        inside = (frequency >= edges[b]) & (frequency < edges[b + 1])
+        a, c, d = sxx[inside].sum(), sxy[inside].sum(), syy[inside].sum()
+        if not (a > 0.0 and d > 0.0):
+            continue
+        transfer = c / a
+        coherence = transfer * transfer * a / d
+        samples = max(int(np.count_nonzero(inside)) * count - 1, 1)
+        error = np.sqrt(max((d / a) * (1.0 - coherence), 0.0) / samples)
+        if transfer > TRANSFER_MIN_SIGMA * error:
+            response[b] = transfer
+            weight[b] = 1.0 / (error * error)
+
+    used = weight > 0.0
+    if np.count_nonzero(used) < 3:
+        return None
+
+    fitted = _isotonic(response[used], weight[used])
+    peak = fitted[0]
+    if not peak > 0.0:
+        return None
+    fitted = np.clip(fitted / peak, 0.0, 1.0)
+
+    # Onto the fixed grid, so a field's answer means the same thing as every
+    # other field's and they can simply be averaged. Below the lowest band that
+    # resolved, the response is held: the transfer cannot rise with frequency.
+    # Above the highest, it runs down to zero at the half-width - the bands in
+    # between showed no transfer to measure, and the color-under cannot carry
+    # amplitude modulation past the half-width at all, so falling to zero there
+    # is the mildest continuation that respects both.
+    measured_hz = centre[used]
+    filled = np.interp(centre, measured_hz, fitted, left=fitted[0], right=np.nan)
+    beyond = centre > measured_hz[-1]
+    if beyond.any():
+        span = half_width_hz - measured_hz[-1]
+        filled[beyond] = fitted[-1] * np.clip(
+            1.0 - (centre[beyond] - measured_hz[-1]) / max(span, 1.0), 0.0, 1.0
+        )
+    return centre, filled
+
+
+def _shape_gain(gain, band_hz, band_response, freq_hz, half_width_hz):
+    """Impose the measured response on the correction, in place, zero phase.
+
+    The gain is shaped as `gain - 1` rather than in the logarithm: the
+    correction runs at a few percent, so the two agree to second order, and
+    this is the form the scaling below already consumes. Above the frequency
+    the color-under can carry amplitude modulation at all the response is zero,
+    so the gain is band limited whatever the regression found.
+
+    Applied over the whole field at once as a real, even mask, which is zero
+    phase by construction - a causal filter here would slide the correction off
+    the loss it is meant to reverse.
+    """
+    excursion = gain - np.float32(1.0)
+    spectrum = sps_fft.rfft(excursion)
+    frequency = np.fft.rfftfreq(len(excursion), 1.0 / freq_hz)
+    # Anchored flat below the first band and at zero on the half-width, so the
+    # mask runs down to nothing rather than stepping off wherever the
+    # measurement ran out.
+    knots_hz = np.concatenate(([0.0], band_hz, [half_width_hz]))
+    knots = np.concatenate(([band_response[0]], band_response, [0.0]))
+    mask = np.interp(frequency, knots_hz, knots, left=knots[0], right=0.0)
+    spectrum *= mask.astype(spectrum.real.dtype)
+    gain[:] = np.float32(1.0) + sps_fft.irfft(spectrum, n=len(excursion)).astype(
+        np.float32
+    )
+    return gain
+
+
 def apply_chroma_envelope_gain(field):
     """Reverse the tape's amplitude noise on the color-under, in place.
 
-    Measure the luma envelope for changes in amplitude that do not follow the
-    demodulated signal. Changes in amplitude that are not correlated to the
-    demodulated luma's frequency are likely noise. This uses the luma's
-    carrier's amplitude as a base to measure amplitude based noise and reverse
-    this noise in the QAM color under.
+    Whatever in the luma carrier's amplitude does not follow its own frequency
+    is tape noise rather than picture, and the color-under written beside it
+    took the same loss. The reverse is applied to the field's own copy of the
+    color-under, once, before the bursts are measured - so everything
+    downstream reads a signal that noise has already been taken out of.
 
-    Applied on the raw RF sample grid, on the field's own copy of the
-    color-under, before anything has been measured from it. The noise was
-    imposed at that rate, so it is reversed at that rate - and everything that
-    reads the color-under afterwards, the burst measurements included, then
-    reads a signal the tape's amplitude noise has already been taken out of.
-
-    Runs once per field. Returns whether it did anything.
+    Returns whether it did anything.
     """
     if getattr(field, "chroma_envelope_gain_applied", False):
         return False
@@ -218,32 +420,87 @@ def apply_chroma_envelope_gain(field):
     if video is None or "demod_burst" not in video:
         return False
 
-    measured = luma_amplitude.measure_amplitude_deviation(field)
+    measured = luma_amplitude.measured_amplitude_deviation(field)
     if measured is None:
         return False
-    deviation, carrier_hz = measured
+    deviation, carrier_hz = measured.deviation, measured.carrier_hz
+
+    debug_plot = getattr(rf, "debug_plot", None)
+    if debug_plot and debug_plot.is_plot_requested("luma_noise"):
+        # The profile the chroma is actually scaled by, kept for the plot so it
+        # can be shown against the luma it was supposed to be freed of, along
+        # with the response model it was measured against.
+        field.chroma_envelope_deviation = deviation
+        field.chroma_envelope_response = measured.response
 
     # How far the measurement can be trusted at this track width.
     track_width = decoder_params.get("video_track_width", REFERENCE_TRACK_WIDTH)
     trust = track_width / (track_width + HALF_COUPLING_TRACK_WIDTH)
 
+    # Belief is withdrawn per sample where the carrier was sweeping too fast
+    # for the path to follow. The measurement also reports how its own noise
+    # varies across the carrier's range (`noise_scale`), which is a real
+    # property of the path - but scaling the trust weight by it changes nothing
+    # measurable here, so it is left for whatever else reads the measurement.
+    belief = measured.steadiness
+
     gain = _envelope_gain_from_deviation(
         deviation,
         carrier_hz,
+        belief,
         decoder_params["color_under_carrier"],
         WAVELENGTH_INDEPENDENT_NOISE,
         trust,
         rf.dod_options.dod_threshold_p,
     )
 
-    _scale_color_under(
-        video["demod_burst"], gain, np.float32(rf.options.chroma_env_gain)
+    # The band the color-under can carry amplitude modulation in at all. Beyond
+    # it a gain does not correct the chroma, it modulates chroma out of its own
+    # band for the final band pass to discard.
+    half_width_hz = (
+        decoder_params["chroma_bpf_upper"] - decoder_params["color_under_carrier"]
     )
+    # A format whose two chroma parameters do not describe a color-under band -
+    # they mean something else there - has no modulation range to shape within,
+    # and is left as it was.
+    if half_width_hz > 0.0:
+        # Kept per head: the two differ, and pooling them averages a real
+        # distinction away. Same split, and the same reason, as the chroma gain.
+        history = rf.field_averages.chroma_transfer_for(field.isFirstField)
+        counters = rf.__dict__.setdefault("_chroma_transfer_fields", {})
+        seen = counters.get(field.isFirstField, 0)
+        counters[field.isFirstField] = seen + 1
+        # Measured on every field until the average has something to say, on a
+        # stride after that.
+        if len(history) < TRANSFER_BANDS or seen % TRANSFER_MEASURE_STRIDE == 0:
+            measured = _measure_transfer_response(field, deviation, half_width_hz)
+            if measured is not None:
+                history.append(measured)
+        if history:
+            # Every field answers on the same grid, so this is a plain mean.
+            band_hz = history[-1][0]
+            band_response = np.mean([response for _, response in history], axis=0)
+        else:
+            # Nothing measurable yet - band limit to what the color-under can
+            # carry and leave the shape alone.
+            band_hz = np.array([0.0, half_width_hz])
+            band_response = np.array([1.0, 1.0])
+        _shape_gain(gain, band_hz, band_response, rf.freq_hz, half_width_hz)
+
+        if debug_plot and debug_plot.is_plot_requested("luma_noise"):
+            field.chroma_envelope_transfer = (band_hz, band_response)
+
+    amount = np.float32(rf.options.chroma_env_gain)
+
+    if debug_plot and debug_plot.is_plot_requested("luma_noise"):
+        # What actually multiplies the color-under, wet/dry mix included. The
+        # scaling below applies this without materialising it, so it is built
+        # here only when something is going to look at it.
+        field.chroma_envelope_correction = 1.0 + (gain - 1.0) * amount
+
+    _scale_color_under(video["demod_burst"], gain, amount)
     field.chroma_envelope_gain_applied = True
     return True
-
-
-BURST_START_LINE=10
 
 
 @njit(cache=True, nogil=True, fastmath=True)

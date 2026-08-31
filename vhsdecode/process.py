@@ -17,7 +17,7 @@ import numpy.fft as npfft
 import lddecode.utils as lddu
 import vhsdecode.utils as utils
 from vhsdecode.utils import StackableMA, filtfft
-from vhsdecode.chroma import chroma_color_under_filter
+from vhsdecode.chroma import chroma_color_under_filter, TRANSFER_AVERAGE_FIELDS
 
 import vhsdecode.formats as vhs_formats
 
@@ -43,6 +43,7 @@ from vhsdecode.compute_video_filters import (
     gen_bpf_supergauss,
     gen_fm_audio_notch_params,
     NONLINEAR_AMP_LPF_FREQ_DEFAULT,
+    ENVELOPE_LPF_FREQ_DEFAULT,
     CHROMA_AUDIO_NOTCH_Q,
 )
 from vhsdecode import compute_video_filters as cvf
@@ -763,6 +764,7 @@ class VHSRFDecode(ldd.RFDecode):
                 "chroma_offset",
                 "cagc_fields",
                 "chroma_env_gain",
+                "luma_deviation",
                 "cti_mix",
                 "cti_width",
                 "ire0_adjust",
@@ -810,6 +812,7 @@ class VHSRFDecode(ldd.RFDecode):
             int(self.DecoderParams.get("chroma_offset", 5) * (self.freq / 40.0)),
             rf_options.get("cagc_fields", 0),
             rf_options.get("chroma_env_gain", 0),
+            rf_options.get("luma_deviation", False),
             rf_options.get("cti_mix", 1),
             rf_options.get("cti_width", 2),
             ire0_adjust,
@@ -981,7 +984,8 @@ class VHSRFDecode(ldd.RFDecode):
             ), StackableMA(window_average=self.SysParams["FPS"] / 2)
 
         self._field_averages = FieldAverage(
-            self._options.cagc_fields
+            self._options.cagc_fields,
+            TRANSFER_AVERAGE_FIELDS,
         )
 
         # TODO: This should be managed elsewhere.
@@ -1209,7 +1213,10 @@ class VHSRFDecode(ldd.RFDecode):
         # sections and thus do the filtering in sngle precision.
         # On higher order filters this is not viable as it tends to alter the filter too much.
         self.Filters["FEnvPost"] = sps.butter(
-            1, 700000 / self.freq_hz_half, btype="lowpass", output="sos"
+            1,
+            DP.get("envelope_lpf_freq", ENVELOPE_LPF_FREQ_DEFAULT) / self.freq_hz_half,
+            btype="lowpass",
+            output="sos",
         )
 
         self.Filters["NLAmplitudeLPF"] = gen_nonlinear_amplitude_lpf(
@@ -1306,18 +1313,21 @@ class VHSRFDecode(ldd.RFDecode):
         # Applies RF filters
         indata_fft *= self.Filters["RFVideo"]
 
-        raw_filtered = npfft.ifft(indata_fft * self.Filters["hilbert"]).real.astype(
+        # The hilbert mask makes an analytic signal, so its magnitude is the
+        # instantaneous carrier amplitude directly. Taking the magnitude of the
+        # real part instead is a full wave rectification, which carries a
+        # component at twice the carrier that the filter below then has to
+        # remove rather than merely band limiting the envelope. No delay is
+        # introduced either way - every filter in this chain is zero phase - so
+        # there is none to compensate for.
+        raw_env = np.abs(npfft.ifft(indata_fft * self.Filters["hilbert"])).astype(
             np.single
         )
 
-        # Calculate an evelope with signal strength using absolute of hilbert transform.
-        # Roll this a bit to compensate for filter delay, value eyballed for now.
-        np.abs(raw_filtered, out=raw_filtered)
-        raw_env = np.roll(raw_filtered, 4)
-        del raw_filtered
         # Downconvert to single precision for some possible speedup since we don't need
         # super high accuracy for the dropout detection.
-        env = sosfiltfilt_rust(self.Filters["FEnvPost"], raw_env)
+        # env = sosfiltfilt_rust(self.Filters["FEnvPost"], raw_env)
+        env = raw_env
 
         del raw_env
         env_mean = np.mean(env)
@@ -1469,7 +1479,7 @@ class VHSRFDecode(ldd.RFDecode):
             out_video = demod
 
         # demod_burst is a bit misleading, but keeping the naming for compatability.
-        if self.options.chroma_env_gain > 0:
+        if self.options.chroma_env_gain > 0 or self.options.luma_deviation:
             # The color-under amplitude correction models the carrier amplitude
             # as a function of the instantaneous carrier frequency, so it needs
             # the demodulated frequency before de-emphasis - the de-emphasised

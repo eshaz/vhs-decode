@@ -14,6 +14,9 @@ from vhsdecode.utils import filtfft
 from vhsdecode.addons.FMdeemph import FMDeEmphasisB, gen_shelf
 
 NONLINEAR_AMP_LPF_FREQ_DEFAULT = 700000
+
+# Band limit applied to the detected RF envelope.
+ENVELOPE_LPF_FREQ_DEFAULT = 700000
 NONLINEAR_STATIC_FACTOR_DEFAULT = None
 CHROMA_AUDIO_NOTCH_Q = 10
 

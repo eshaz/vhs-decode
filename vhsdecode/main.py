@@ -339,6 +339,16 @@ def main(args=None, use_gui=False):
             "\n  The luma FM carrier and the color-under chroma were written by the same head at the same instant, so head-to-medium separation loss is shared between them and scales with wavelength. The luma envelope therefore measures, at full sample rate, the intra-line amplitude profile that the once-per-line color burst cannot see, and restores saturation through dropouts and modulation noise. Amplifies chroma noise in the regions it corrects."
         ),
     )
+    parser.add_argument(
+        "--luma_deviation",
+        dest="luma_deviation",
+        action="store_true",
+        default=False,
+        help=(
+            "Carry the luma FM carrier's amplitude deviation as an extra video channel."
+            "\n  An FM carrier is recorded at constant amplitude, so every departure from constant is the path's, not the signal's. The channel holds the measured amplitude divided by the amplitude the carrier's own instantaneous frequency predicts, on the RF sample grid, so unity means the carrier is where the model puts it. Intended for downstream analysis; nothing in the decoder reads it."
+        ),
+    )
     chroma_group.add_argument(
         "--cti_mix",
         dest="cti_mix",
@@ -658,6 +668,7 @@ def main(args=None, use_gui=False):
     rf_options["cafc"] = args.cafc
     rf_options["cagc_fields"] = args.cagc_fields
     rf_options["chroma_env_gain"] = args.chroma_env_gain
+    rf_options["luma_deviation"] = args.luma_deviation
     rf_options["disable_right_hsync"] = args.disable_right_hsync
     rf_options["fallback_vsync"] = args.fallback_vsync
     rf_options["relaxed_line0"] = args.relaxed_line0
