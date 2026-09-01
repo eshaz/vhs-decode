@@ -37,14 +37,6 @@ class FieldAverage:
         return self._chroma_level_odd
 
     # measured luma-to-color-under amplitude transfer, per head
-    @property
-    def chroma_transfer_even(self):
-        return self._chroma_transfer_even
-
-    @property
-    def chroma_transfer_odd(self):
-        return self._chroma_transfer_odd
-
     def chroma_transfer_for(self, is_first_field):
         return self._chroma_transfer_odd if is_first_field else self._chroma_transfer_even
 

@@ -128,6 +128,20 @@ def detect_dropouts_rf(field, dod_options):
             field.rf.dod_options.dod_threshold_p,
         )
 
+    if debug_plot and debug_plot.is_plot_requested("luma_averaging"):
+        from vhsdecode.debug_plot import plot_luma_averaging
+
+        # Accumulated over the decode rather than measured on this field, so
+        # what it draws improves as fields go by. Nothing here feeds back.
+        rf = field.rf
+        plot_luma_averaging(
+            {
+                "luma": rf.__dict__.get("_luma_averaging_probe", {}),
+                "chroma": rf.__dict__.get("_chroma_amount_probe", {}),
+            },
+            rf.dod_options.dod_threshold_p,
+        )
+
     return map_dropouts_rf_to_tbc(dropouts_rf, start_line, end_line, field.linelocs, field.outlinelen, field.lineoffset)
 
 def map_dropouts_rf_to_tbc(errlist, start_line_idx, end_line_idx, linelocs, outlinelen, lineoffset):

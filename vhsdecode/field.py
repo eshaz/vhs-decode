@@ -1141,6 +1141,14 @@ class FieldShared:
         if self.rf.options.luma_deviation:
             luma_amplitude.attach_luma_deviation(self)
 
+        # The path's own frequency response, taken back out of the RF before
+        # the next field is demodulated. Fitted here because this is where the
+        # head is known, and applied a field later because that is the soonest
+        # a demodulator running ahead of field assembly can be told which head
+        # is coming.
+        if self.rf.options.luma_eq != 0:
+            luma_amplitude.update_luma_equalizer(self, self.rf.options.luma_eq)
+
         # required to trigger the chroma downscaling to happen again (if this is run after scaling for some reason)
         self.chroma_tbc_buffer = None
         (

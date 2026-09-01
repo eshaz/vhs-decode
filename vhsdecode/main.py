@@ -32,6 +32,7 @@ from vhsdecode.cmdcommons import (
     test_input_file,
     test_output_file,
 )
+from vhsdecode import luma_amplitude
 from vhsdecode.formats import TAPE_SPEEDS
 from vhsd_rust import check_debug
 
@@ -340,6 +341,20 @@ def main(args=None, use_gui=False):
         ),
     )
     parser.add_argument(
+        "--luma_eq",
+        dest="luma_eq",
+        metavar="amount",
+        nargs="?",
+        type=float,
+        default=0,
+        const=luma_amplitude.LUMA_EQ_AMOUNT,
+        help=(
+            "Shape the luma RF against the frequency response measured from the carrier's own amplitude, before demodulation."
+            "\n  It acts at TRANSITIONS. On a carrier that is not sweeping the demodulator discards the amplitude change entirely, so steady content passes through the response untouched - measured as exactly zero on a synthetic carrier. What it changes is the shape of edges, and it pushes rises and falls in OPPOSITE directions, so it suits material whose edges are balanced or whose rises dominate. Steady content does still move a little, indirectly: sharper sync edges shift where the time base correction lands each line, worth 0.09-0.16 IRE rms in proportion to the amount. Applied after the envelope is taken, so the color-under correction and dropout detection still read the tape as it was."
+            "\n  Add the flag with no value for the default. 0 disables. The best amount is not a constant of the format - measured against a record-side reference it is 0.5 on one pattern, 1.05 on the same pattern at a slower speed and 1.58 on another - so 0.75 is used, being the amount whose worst showing across those is strongest. Past about 1.1 one of them turns harmful."
+        ),
+    )
+    parser.add_argument(
         "--luma_deviation",
         dest="luma_deviation",
         action="store_true",
@@ -428,7 +443,16 @@ def main(args=None, use_gui=False):
             " some of the chroma processing."
         ),
     )
-    plot_options = "demodblock, deemphasis, raw_pulses, line_locs, rf_luma, vsync_levels, luma_noise"
+    plot_options = (
+        "demodblock, "
+        " deemphasis, "
+        " raw_pulses, "
+        " line_locs, "
+        " rf_luma, "
+        " vsync_levels, " # shows the vsync levels and debugging information
+        " luma_noise," # shows the measured noise and frequency response on the luma carrier
+        " luma_averaging" # shows the frequency response of the luma's carrier per video head
+    )
     debug_group.add_argument(
         "--dp",
         "--debug_plot",
@@ -668,6 +692,7 @@ def main(args=None, use_gui=False):
     rf_options["cafc"] = args.cafc
     rf_options["cagc_fields"] = args.cagc_fields
     rf_options["chroma_env_gain"] = args.chroma_env_gain
+    rf_options["luma_eq"] = args.luma_eq
     rf_options["luma_deviation"] = args.luma_deviation
     rf_options["disable_right_hsync"] = args.disable_right_hsync
     rf_options["fallback_vsync"] = args.fallback_vsync

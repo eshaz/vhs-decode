@@ -5,12 +5,14 @@ constant. Every deviation from that constant is imposed by the tape, and is
 measurable on the raw RF, before the time base correction has run and before
 any scaling has been applied.
 
-The amplitude is taken as the decoder's own envelope channel, which is
-band limited to 700 kHz by the demodulator's envelope detector - a single pole
-applied forward and backward, so 12 dB per octave. Nothing here narrows it
-further: no smoothing, no additional band limit, no windowing. The tape imposes
-its amplitude noise at whatever rate it imposes it, and a filter here would
-decide in advance which of that the correction is allowed to see.
+The amplitude is taken as the decoder's own envelope channel, at the full
+bandwidth the demodulator produced it in. Nothing narrows it: no smoothing, no
+band limit, no windowing. The tape imposes its amplitude noise at whatever rate
+it imposes it, and a filter would decide in advance which of that the correction
+is allowed to see. The dropout detector low passes the same channel for its own
+purposes, in `doc.py`, because a wide envelope crosses a threshold repeatedly
+inside one damaged region - but that is the detector's business and it is not
+imposed here.
 
 Two causes of amplitude change, only one of them noise
 ------------------------------------------------------
@@ -61,16 +63,14 @@ from scipy.ndimage import maximum_filter1d
 # frequency conditioned the same way the deviation was measured against, so a
 # consumer scaling by wavelength uses the frequency that actually applies.
 # `steadiness` withdraws belief where the carrier is sweeping too fast for the
-# path to follow. `noise_scale` is what a consumer's own Wiener weight should be
-# multiplied by at this sample: the measurement is not equally noisy across the
-# carrier's range, and this carries how far it departs from its average there.
+# path to follow.
 #
-# Both are single precision, which is what the demodulator produced them in;
-# widening them here would cost two full copies of the field per field and buy
-# no precision that was ever recorded.
+# All are single precision, which is what the demodulator produced them in;
+# widening them here would cost a full copy of the field per field and buy no
+# precision that was ever recorded.
 AmplitudeDeviation = namedtuple(
     "AmplitudeDeviation",
-    ["deviation", "carrier_hz", "steadiness", "noise_scale", "response"],
+    ["deviation", "carrier_hz", "steadiness", "response"],
 )
 
 
@@ -103,10 +103,22 @@ AmplitudeDeviation = namedtuple(
 # what the model IS, so it is what a plot should be judged against; the median
 # of every sample is a different population and the two are not expected to
 # agree where a level is reached mostly in passing.
+# The fields from `described_hz` onward are the accumulated dense response, and
+# there is none of it until a head has been seen at least once - the first field
+# of a decode, and the second, describe nothing yet. They default to empty rather
+# than being filled in at the one place the model is built, so that how many of
+# them there are stays the field list's own business: this arity has already
+# gone wrong once, when the dense response grew a third component and the
+# construction site still passed two.
+_RESPONSE_FIELDS = [
+    "separation", "residual_hz", "residual",
+    "described_hz", "described", "described_weight",
+]
 ResponseModel = namedtuple(
     "ResponseModel",
-    ["separation", "residual_hz", "residual", "residual_population",
-     "described_hz", "described"],
+    _RESPONSE_FIELDS,
+    defaults=(np.zeros(0),)
+    * (len(_RESPONSE_FIELDS) - _RESPONSE_FIELDS.index("described_hz")),
 )
 
 
@@ -153,33 +165,13 @@ CURVE_SAMPLES_PER_POINT = 4096
 CURVE_MINIMUM_POPULATION = 64
 
 
-# Stands in for the noise profile when nothing has asked for it, so the
-# per-sample loop needs no second code path.
-_UNIT_TABLE = np.ones(1, dtype=np.float32)
-
-# How much of the field is steady enough to describe the response.
-#
-# A sweeping carrier's amplitude has collapsed through the path's own band
-# limit rather than through anything the path does at that frequency, and it
-# lands in whatever level bin the transition happened to cross. Left in, it is
-# what makes a dense fit fail: measured against the record reference, a dense
-# per-head response fitted from everything costs +0.056 on 75bars, and the same
-# fit gated here gains -0.083. The gate is what separates the two.
-#
-# The value is empirical, and far tighter than the sweep loss alone would ask
-# for - a threshold set where the transient's contribution reaches the
-# deviation's own noise would keep most of the field - so the gate is evidently
-# rejecting samples whose binning is unreliable for other reasons too. At this
-# fraction some forty bins and ten thousand samples still describe the
-# response.
-# Expressed as the fraction of the field that survives, not as a steadiness
-# value, so it means the same thing at every tape speed. An absolute threshold
-# does not: EP's narrower RF passband gives a smaller knee, so the same number
-# rejects nearly everything there and starves the fit entirely.
-CURVE_DENSE_SAMPLE_FRACTION = 0.16
-
 # Points the accumulated response needs before it stands in for the line.
 CURVE_DENSE_MINIMUM_POINTS = 8
+
+
+# Natural log amplitude to decibels, so the instrumentation reports in the unit
+# the rest of the signal path is stated in.
+_LOG_TO_DB = 20.0 / np.log(10.0)
 
 # How far past the nominal deviation range the curve is measured, in IRE. The
 # carrier does not stay between sync tip and peak white: sync edges undershoot
@@ -292,19 +284,36 @@ def carrier_frequency_bins(sys_params, rf):
     One bin per IRE because that is the video standard's own quantization of
     level, and the carrier frequency is a linear function of level.
 
-    Anchored at sync tip - the format's own fixed reference, the one level that
-    is defined rather than pictorial - and taken from the decoder's running
-    parameters, so the anchor sits at the sync tip the signal actually has
-    rather than the one the specification nominates.
+    Anchored on the format's specified carrier frequencies, not on the levels
+    the decoder has measured. This measurement is taken on the raw RF - the
+    carrier's own envelope against its own instantaneous frequency - and the
+    decoder's running `ire0` and `hz_ire` are derived from sync tip and
+    blanking levels found in the DEMODULATED luma, which is downstream of here.
+    Anchoring on them imports a later, level-tracked estimate into an earlier
+    measurement and makes the frequency axis move field to field.
+
+    Measured, it moves a long way: on a second-generation tape decoded with
+    `--ire0_adjust`, the running anchor put the whole scale 36 IRE from the
+    specified one (`ire0` 3.4277 MHz against 3.6857 MHz), so a bin meant a
+    different frequency in every field and the accumulation averaged unlike
+    with unlike.
+
+    What the specified anchor buys is that it is CONSTANT, not that it is
+    right. A deck or a tape whose carrier sits off the nominal deviation simply
+    uses a different part of the range, and nothing downstream cares: the
+    response is divided out of the amplitude that measured it, so every
+    quantity here is relative to itself and a fixed offset cancels. The margin
+    either side is what absorbs the offset. A moving anchor is the only thing
+    that does real damage, because it is what stops a bin meaning one
+    frequency.
 
     Samples outside this range are dropped rather than clipped into the end
-    bins; see `measure_amplitude_by_frequency`. The range itself stays fixed, so
-    the curve means the same thing from one field to the next - letting it
-    follow the highest sample instead lets a single demodulator excursion set
-    the axis, and the fit is then conditioned differently in every field.
+    bins; see `measure_amplitude_by_frequency`.
     """
-    sync_tip_hz = rf.iretohz(sys_params["vsync_ire"] - CURVE_RANGE_MARGIN_IRE)
-    peak_white_hz = rf.iretohz(100 + CURVE_RANGE_MARGIN_IRE)
+    sync_tip_hz = rf.iretohz(
+        sys_params["vsync_ire"] - CURVE_RANGE_MARGIN_IRE, spec=True
+    )
+    peak_white_hz = rf.iretohz(100 + CURVE_RANGE_MARGIN_IRE, spec=True)
     span_ire = (peak_white_hz - sync_tip_hz) / sys_params["hz_ire"]
     bin_count = int(round(span_ire / RESPONSE_CURVE_RESOLUTION_IRE))
     return sync_tip_hz, peak_white_hz, max(bin_count, CURVE_INDEPENDENT_POINTS)
@@ -424,10 +433,9 @@ def response_curve(levels, population, centre_hz):
 
     One component, because one is all the measurement supports. In the
     logarithm it is a straight line against carrier frequency - about
-    -0.4 per MHz on this deck. The binned medians are what the line is fitted
-    through, a median because amplitude noise is not symmetric and dropouts sit
-    in the low tail, so it tracks the level the carrier normally holds at that
-    frequency rather than the average of level and damage.
+    -0.4 per MHz on this deck, fitted through the binned medians
+    `measure_amplitude_by_frequency` returns - a median because amplitude noise
+    is not symmetric and dropouts sit in the low tail.
 
     What the slope physically is remains open. Separation loss would give
     exactly this shape - exp(-2*pi*d/lambda) with the recorded wavelength going
@@ -504,11 +512,17 @@ def _inverse_response_table(response, frequency_step, curve, dense=None):
     grid_hz = np.arange(len(response), dtype=np.float64) * frequency_step
     log_level = level + slope * (grid_hz - centre_hz)
     if dense is not None:
-        # Inside the frequencies actually measured, the accumulated response
-        # itself; outside them the line carries on, as it must.
-        described_hz, described = dense
+        # Shrunk towards the line by how much evidence each point stands on.
+        # `CURVE_MINIMUM_POPULATION` is the weight at which a bin is believed
+        # half on its own measurement and half on the line, so a point with far
+        # more than that is essentially its own measurement and a point with far
+        # less is essentially the line.
+        described_hz, described, described_weight = dense
         inside = (grid_hz >= described_hz[0]) & (grid_hz <= described_hz[-1])
-        log_level[inside] = np.interp(grid_hz[inside], described_hz, described)
+        measured = np.interp(grid_hz[inside], described_hz, described)
+        confidence = np.interp(grid_hz[inside], described_hz, described_weight)
+        share = confidence / (confidence + CURVE_MINIMUM_POPULATION)
+        log_level[inside] = share * measured + (1.0 - share) * log_level[inside]
 
     with np.errstate(over="ignore", under="ignore", divide="ignore", invalid="ignore"):
         modelled = response * np.exp(log_level)
@@ -523,18 +537,16 @@ def _inverse_response_table(response, frequency_step, curve, dense=None):
 
 @njit(cache=True, nogil=True, fastmath=True)
 def _deviation_from_inverse_response(
-    amplitude, carrier_hz, inverse_response, noise_table, frequency_step, low, high
+    amplitude, carrier_hz, inverse_response, frequency_step, low, high
 ):
-    """How far the amplitude departs from the response modelled for it, and how
-    noisy the measurement is where it was taken.
+    """How far the amplitude departs from the response modelled for it.
 
     One pass over the field, and no transcendental in it: the modelled response
-    was inverted where it was tabulated, so what is left per sample is two
-    interpolations off the same index, a multiply and a bound.
+    was inverted where it was tabulated, so what is left per sample is one
+    interpolation off a computed index, a multiply and a bound.
     """
     count = len(amplitude)
     deviation = np.empty(count, dtype=np.float32)
-    noise_scale = np.empty(count, dtype=np.float32)
     last = len(inverse_response) - 1
     one = np.float32(1.0)
     zero = np.float32(0.0)
@@ -542,20 +554,13 @@ def _deviation_from_inverse_response(
         position = carrier_hz[i] / frequency_step
         if position <= zero:
             inverse = inverse_response[0]
-            scale = noise_table[0]
         elif position >= last:
             inverse = inverse_response[last]
-            scale = noise_table[len(noise_table) - 1]
         else:
             lower = np.int32(position)
             fraction = position - np.float32(lower)
             base = inverse_response[lower]
             inverse = base + (inverse_response[lower + 1] - base) * fraction
-            if lower + 1 < len(noise_table):
-                base = noise_table[lower]
-                scale = base + (noise_table[lower + 1] - base) * fraction
-            else:
-                scale = noise_table[len(noise_table) - 1]
         ratio = amplitude[i] * inverse
         if ratio <= zero:
             # no measurement here, or no usable model - leave the sample alone
@@ -565,68 +570,7 @@ def _deviation_from_inverse_response(
         elif ratio > high:
             ratio = high
         deviation[i] = ratio
-        noise_scale[i] = scale
-    return deviation, noise_scale
-
-
-def _noise_scale_table(rf, sampled_flattened, sampled_carrier_hz, curve, frequency_step, points):
-    """How the measurement's own noise varies across the carrier's range.
-
-    The track-width Wiener weight already says how much of the luma's deviation
-    belongs on the color-under, but as one number for the whole sweep. The
-    measurement is not equally noisy across it: taken as the robust spread of
-    the deviation in each frequency bin, it varies by 1.4 to 2.2 times within a
-    single decode.
-
-    That variation is the path's and not the picture's, which is what makes it
-    safe to act on where the residual mean is not. Measured across two patterns
-    and two tape speeds, the profile's shape agrees at r = +0.81 between
-    different pictures on the same tape, and only +0.31 between the same picture
-    at two speeds - the exact reverse of the residual, which follows the picture.
-
-    Returned as the factor the trust weight scales by. Writing the weight as
-    S / (S + N) with S the shared loss and N the measurement's noise, a global
-    trust fixes S = trust * sigma_bar^2, so at a frequency where the spread is
-    sigma the weight becomes trust * (sigma_bar / sigma)^2. Nothing is fitted:
-    the spread is measured and the rest is the weight the module already uses.
-    """
-    total = getattr(rf, "_luma_noise_total", None)
-    if total is None or len(total) != points:
-        total = np.zeros(points)
-        rf._luma_noise_total = total
-        rf._luma_noise_weight = np.zeros(points)
-    weight = rf._luma_noise_weight
-
-    centre, level, slope = curve
-    keep = sampled_flattened > 0.0
-    if np.count_nonzero(keep) > 256:
-        residual = np.log(sampled_flattened[keep]) - (
-            level + slope * (sampled_carrier_hz[keep] - centre)
-        )
-        index = np.clip(
-            (sampled_carrier_hz[keep] / frequency_step).astype(np.int64), 0, points - 1
-        )
-        order = np.argsort(index)
-        index, residual = index[order], residual[order]
-        edges = np.flatnonzero(np.diff(index)) + 1
-        for lo, hi in zip(np.r_[0, edges], np.r_[edges, len(index)]):
-            if hi - lo < 64:
-                continue
-            segment = residual[lo:hi]
-            spread = np.median(np.abs(segment - np.median(segment))) * 1.4826
-            if spread > 0.0:
-                total[index[lo]] += spread * (hi - lo)
-                weight[index[lo]] += hi - lo
-
-    seen = weight > 0.0
-    if np.count_nonzero(seen) < 8:
-        return np.ones(points, dtype=np.float32)
-    profile = total[seen] / weight[seen]
-    mean_spread = float((profile * weight[seen]).sum() / weight[seen].sum())
-    grid = np.arange(points, dtype=np.float64)
-    spread = np.interp(grid, grid[seen], profile)
-    return ((mean_spread * mean_spread) / (spread * spread)).astype(np.float32)
-
+    return deviation
 
 
 @njit(cache=True, nogil=True, fastmath=True)
@@ -651,7 +595,7 @@ def _static_response(carrier_hz, response, frequency_step, out):
     return out
 
 
-def _predicted_sweep_collapse(rf, carrier_hz):
+def _predicted_sweep_collapse(rf, carrier_hz, stride):
     """The amplitude a constant carrier loses purely by MOVING, predicted.
 
     The channel is specified - `Filters["RFVideo"]` is built from the format's
@@ -667,6 +611,12 @@ def _predicted_sweep_collapse(rf, carrier_hz):
     squaring it costs 4.6 dB at the bottom of the range and nothing at the top.
     What is left is unity for a stationary carrier and below it for a moving one.
 
+    Returned on `stride`, which is the grid the caller reads it on. The
+    transforms have to span the whole field - the trajectory is what it is - but
+    nothing after them does, so the magnitude, the static response divided out
+    of it and the median that normalises the pair all run on one sample in
+    `stride`. That still leaves tens of thousands of samples behind the median.
+
     Worth -0.0122 on the record-referenced 75bars SP metric and -0.0125 at EP
     against gating alone, both resolved; +0.0005 on chromanoise, which has few
     transients for it to act on. Removing the collapse does NOT make the gate
@@ -675,17 +625,23 @@ def _predicted_sweep_collapse(rf, carrier_hz):
     response with. Correcting without gating is measurably worse than gating
     without correcting (-0.036 against -0.125 on 75bars SP).
     """
-    magnitude = np.abs(rf.Filters["RFVideo"])
-    half = len(magnitude) // 2
-    band = magnitude[:half]
-    step = rf.freq_hz / len(magnitude)
+    # The same band and grid `_flatten_by_response` divides out, which is held
+    # on the decoder rather than rebuilt from the filter every field.
+    band, step = rf_path_response(rf)
     count = len(carrier_hz)
 
-    cached = getattr(rf, "_luma_sweep_response", None)
-    if cached is None or len(cached) != count // 2 + 1:
+    # Keyed on the length it was built for. Fields are not all the same length,
+    # and a cache that only remembers the last one rebuilds a few hundred
+    # thousand interpolated points every time the length changes - which on real
+    # content is most fields. A handful of lengths recur, so a few are kept.
+    cache = rf.__dict__.setdefault("_luma_sweep_response", {})
+    cached = cache.get(count)
+    if cached is None:
         cached = np.interp(np.fft.rfftfreq(count, 1.0 / rf.freq_hz),
-                           np.arange(half) * step, band, left=band[0], right=0.0)
-        rf._luma_sweep_response = cached
+                           np.arange(len(band)) * step, band, left=band[0], right=0.0)
+        if len(cache) >= 8:
+            cache.clear()
+        cache[count] = cached
 
     decoder = getattr(rf, "decoder", None)
     workers = max(int(getattr(decoder, "numthreads", 1) or 1), 1)
@@ -702,16 +658,117 @@ def _predicted_sweep_collapse(rf, carrier_hz):
         np.concatenate([spectrum * 2.0, np.zeros(count - len(spectrum))]),
         workers=workers,
     )
-    predicted = np.abs(analytic)
+    predicted = np.abs(analytic[::stride])
 
-    static = _static_response(
-        np.asarray(carrier_hz, dtype=np.float64), band, step, np.empty(count)
-    )
+    sampled_hz = np.asarray(carrier_hz[::stride], dtype=np.float64)
+    static = _static_response(sampled_hz, band, step, np.empty(len(sampled_hz)))
     alive = static > 0.0
-    collapse = np.zeros(count)
+    collapse = np.zeros(len(static))
     np.divide(predicted, static, out=collapse, where=alive)
     reference = np.median(collapse[alive]) if alive.any() else 0.0
     return collapse / reference if reference > 0 else None
+
+
+def wants_averaging_probe(rf):
+    """Whether anything is going to read the averaging instrumentation.
+
+    The probes below and their opposite numbers in `chroma.py` cost several
+    walks of the field between them, and feed one debug plot.
+    """
+    debug_plot = getattr(rf, "debug_plot", None)
+    return bool(debug_plot) and debug_plot.is_plot_requested("luma_averaging")
+
+
+def _instrument_averaging(
+    rf, key, curve, dense, deviation, levels, population, bin_count, clamp_low, clamp_high
+):
+    """Report what the averaging is doing, without changing what it does.
+
+    Only run when `--debug_plot luma_averaging` asked for it: this walks the
+    whole field several more times - a mask, a widening, a logarithm and two
+    comparisons - and everything it produces is read by that plot and by
+    nothing else.
+
+    Four things are measured here and none of them is acted on. They exist
+    because the accumulation makes claims that have never been checked against
+    the decode it runs on:
+
+    - the step the model takes at the two edges of the described range, which
+      is what the blend leaves behind when the dense term carries a decode
+      average level and the line outside it carries this field's;
+    - the shrinkage actually in force, against the constant that is supposed to
+      set it;
+    - whether the response is stationary, which is what an unbounded running
+      mean assumes, measured as the lag one autocovariance of the field to
+      field difference - a quantity a variance alone cannot separate;
+    - how often the deviation reaches its clamps.
+
+    Everything is accumulated per head, because the heads differ.
+    """
+    probe = rf.__dict__.setdefault("_luma_averaging_probe", {})
+    state = probe.setdefault(
+        key,
+        {
+            "fields": 0,
+            "edge_low_db": [],
+            "edge_high_db": [],
+            "deviation_db": [],
+            "clamp_low": [],
+            "clamp_high": [],
+            "previous": None,
+            "previous_population": None,
+            "previous_difference": None,
+            "difference_square": np.zeros(bin_count),
+            "difference_lag": np.zeros(bin_count),
+            "difference_count": np.zeros(bin_count),
+        },
+    )
+    if len(state["difference_square"]) != bin_count:
+        return
+    state["fields"] += 1
+
+    # The deviation's own spread, as the scale everything else is read against.
+    alive = deviation > 0.0
+    if np.count_nonzero(alive) > 0:
+        spread = float(np.std(np.log(np.asarray(deviation[alive], dtype=np.float64))))
+        state["deviation_db"].append(_LOG_TO_DB * spread)
+    state["clamp_low"].append(float(np.count_nonzero(deviation <= clamp_low)) / len(deviation))
+    state["clamp_high"].append(float(np.count_nonzero(deviation >= clamp_high)) / len(deviation))
+
+    # The step at each edge of the described range: what the blend puts there
+    # and what stands one bin outside it are two different statements, and this
+    # is how far apart they are.
+    if dense is not None:
+        described_hz, described, described_weight = dense
+        centre_of_line, level_of_line, slope_of_line = curve
+        share = described_weight / (described_weight + CURVE_MINIMUM_POPULATION)
+        line = level_of_line + slope_of_line * (described_hz - centre_of_line)
+        step = share * (described - line)
+        state["edge_low_db"].append(_LOG_TO_DB * float(step[0]))
+        state["edge_high_db"].append(_LOG_TO_DB * float(step[-1]))
+        state["share"] = share
+        state["share_hz"] = described_hz
+
+    # Stationary or drifting. The field to field difference of a bin's level is
+    # a moving average of order one if the level itself is a random walk plus
+    # measurement noise, so its lag one autocovariance is minus the measurement
+    # variance and its own variance is the walk's step plus twice that. A
+    # variance alone cannot separate the two; the lag term is what does.
+    described_now = (population >= CURVE_MINIMUM_POPULATION) & (levels > 0)
+    current = np.where(described_now, np.log(np.maximum(levels, 1e-30)), 0.0)
+    previous, previous_population = state["previous"], state["previous_population"]
+    if previous is not None:
+        both = described_now & (previous_population >= CURVE_MINIMUM_POPULATION)
+        difference = np.where(both, current - previous, 0.0)
+        earlier = state["previous_difference"]
+        if earlier is not None:
+            paired = both & (earlier != 0.0)
+            state["difference_lag"][paired] += difference[paired] * earlier[paired]
+        state["difference_square"][both] += difference[both] * difference[both]
+        state["difference_count"][both] += 1.0
+        state["previous_difference"] = difference
+    state["previous"] = current
+    state["previous_population"] = np.where(described_now, population, 0.0)
 
 
 def measure_amplitude_deviation(field):
@@ -824,32 +881,32 @@ def measure_amplitude_deviation(field):
         level_of_line + slope_of_line * (residual_hz - centre_of_line)
     )
 
-    # Nothing in the decoder reads the noise profile, and building it costs a
-    # sort and a robust spread per bin, so it is measured only when something
-    # has asked to see it.
-    wants_noise_scale = bool(getattr(rf.options, "luma_deviation", False))
     # The response read off the measurement itself, accumulated per head across
     # the decode. A single field determines it far too poorly - that is why
     # fitting densely per field loses - but a decode's worth of one head's
     # fields determines it well, and the two heads genuinely differ.
     #
-    # Binned again, from the steadiest samples only. The line above keeps every
-    # sample: it has two parameters, a transient barely moves it, and it must
-    # never fail to fit or there is no correction at all. The dense response is
-    # the opposite - it follows whatever it is shown, so it is shown only
-    # carriers that are barely moving.
-    steady_sample = steadiness[::stride]
-    threshold = np.quantile(steady_sample, 1.0 - CURVE_DENSE_SAMPLE_FRACTION)
-    gated = sampled_flattened * (steady_sample >= threshold)
-    # The sweep collapse taken off first, so what the gate then selects on is a
-    # carrier already compensated for moving.
-    collapse = _predicted_sweep_collapse(rf, carrier_hz)
-    if collapse is not None:
-        sampled_collapse = collapse[::stride]
+    # Binned a second time, from every sample, with the sweep collapse divided
+    # out first so a carrier that was moving contributes the amplitude it would
+    # have had standing still. What comes back is the amplitude's own median
+    # against carrier frequency - the curve the debug plot draws as "carrier
+    # amplitude / median" - and it is used as the model directly.
+    #
+    # A steadiness gate stood here for a long time and is measurably better on
+    # the bar patterns - about 0.11 on 75bars SP and 0.10 at EP against the
+    # record reference, and nothing on chromanoise, which has few transitions
+    # for it to act on. It is absent by decision: the gate makes the model
+    # describe a sub-population rather than the amplitude, and on real content
+    # the deviation is then not flat where it should be.
+    compensated = sampled_flattened
+    sampled_collapse = _predicted_sweep_collapse(rf, carrier_hz, stride)
+    if sampled_collapse is not None:
         alive = sampled_collapse > 0.05
-        gated = np.where(alive, gated / np.where(alive, sampled_collapse, 1.0), 0.0)
-    steady_levels, steady_population, steady_centre_hz = measure_amplitude_by_frequency(
-        gated,
+        compensated = np.where(
+            alive, compensated / np.where(alive, sampled_collapse, 1.0), 0.0
+        )
+    dense_levels, dense_population, dense_centre_hz = measure_amplitude_by_frequency(
+        compensated,
         sampled_carrier_hz,
         sync_tip_hz,
         sys_params["hz_ire"] * RESPONSE_CURVE_RESOLUTION_IRE,
@@ -858,59 +915,373 @@ def measure_amplitude_deviation(field):
     )
     store = rf.__dict__.setdefault("_luma_dense_response", {})
     key = bool(field.isFirstField)
-    total, weight = store.setdefault(key, (np.zeros(bin_count), np.zeros(bin_count)))
+    total, weight, centre_total = store.setdefault(
+        key, (np.zeros(bin_count), np.zeros(bin_count), np.zeros(bin_count))
+    )
     # Every bin that saw anything contributes, weighted by how much it saw, and
     # the population test is applied to the ACCUMULATED weight rather than to
     # each field's share of it. Testing per field defeats the accumulation: a
-    # bin holding thirty steady samples a field never qualifies, though thirty
-    # fields of them would describe it well. That is what starved the ends of
-    # the range, where the model then fell back on the line - and the line is a
-    # poor description exactly there, because the amplitude arches rather than
-    # falls monotonically.
-    described = (steady_population > 0.0) & (steady_levels > 0)
-    total[described] += np.log(steady_levels[described]) * steady_population[described]
-    weight[described] += steady_population[described]
+    # bin holding thirty samples a field never qualifies, though thirty fields
+    # of them would describe it well. That is what starved the ends of the
+    # range, where the model then fell back on the line - and the line is a poor
+    # description exactly there, because the amplitude arches rather than falls
+    # monotonically.
+    described = (dense_population > 0.0) & (dense_levels > 0)
+    _measure_reliability(rf, key, dense_levels, dense_population, described,
+                         total, weight)
+    total[described] += np.log(dense_levels[described]) * dense_population[described]
+    weight[described] += dense_population[described]
+    # The frequency each bin stands at is accumulated the same way its level is,
+    # weighted by how many samples went into it. Taking it from THIS field's
+    # centres instead - which is what happened - puts a zero wherever a bin
+    # accumulated enough from earlier fields but the picture did not visit it
+    # this time. The frequencies then stop ascending, `np.interp` reads them as
+    # nonsense, and the model swings by 2.5x where the amplitude it describes
+    # varies by 1.14x. It bites on material whose levels roam rather than sit at
+    # a few discrete bars, which is most real content.
+    centre_total[described] += (
+        dense_centre_hz[described] * dense_population[described]
+    )
+    # Only frequencies with real evidence describe themselves, and the test is
+    # on the ACCUMULATED weight. Bins the carrier barely touched - the far
+    # undershoot below sync tip, the overshoot past peak white - are left to the
+    # line, which extrapolates through them along the slope it measured where
+    # the picture actually was. Admitting them instead, on whatever handful of
+    # samples they hold, stretches the interpolation over uncorrelated
+    # excursions and drags the model away from the amplitude it follows.
+    #
+    # Past that admission there is no second threshold: `_inverse_response_table`
+    # blends each admitted point towards the line by its own weight, so a bin
+    # with little behind it is mostly line and one with a decode's worth of
+    # evidence stands on its own measurement. That is what stops one field's
+    # sparse accumulation producing a model that swings 3x where the amplitude
+    # it describes varies 1.2x, which is what the early fields of a decode used
+    # to get.
     accumulated = weight >= CURVE_MINIMUM_POPULATION
     dense = (
-        (steady_centre_hz[accumulated], total[accumulated] / weight[accumulated])
+        (
+            centre_total[accumulated] / weight[accumulated],
+            total[accumulated] / weight[accumulated],
+            weight[accumulated],
+        )
         if np.count_nonzero(accumulated) >= CURVE_DENSE_MINIMUM_POINTS
         else None
     )
 
     dropout_fraction = rf.dod_options.dod_threshold_p
-    deviation, noise_scale = _deviation_from_inverse_response(
+    deviation = _deviation_from_inverse_response(
         amplitude,
         centred_hz,
         _inverse_response_table(response, frequency_step, curve, dense),
-        _noise_scale_table(
-            rf,
-            sampled_flattened,
-            sampled_carrier_hz,
-            curve,
-            frequency_step,
-            len(response),
-        )
-        if wants_noise_scale
-        else _UNIT_TABLE,
         np.float32(frequency_step),
         np.float32(dropout_fraction),
         np.float32(1.0 / dropout_fraction),
     )
 
+    if wants_averaging_probe(rf):
+        _instrument_averaging(
+            rf,
+            key,
+            curve,
+            dense,
+            deviation,
+            levels,
+            population,
+            bin_count,
+            np.float32(dropout_fraction),
+            np.float32(1.0 / dropout_fraction),
+        )
+
     return AmplitudeDeviation(
         deviation,
         carrier_hz,
         steadiness,
-        noise_scale,
         ResponseModel(
             curve,
             residual_hz,
             residual,
-            population[measured],
-            *(dense if dense is not None else (np.zeros(0), np.zeros(0))),
+            *(dense if dense is not None else ()),
         ),
     )
 
+
+# How much of the measured path response the equalizer takes out.
+#
+# There is no single right answer and this is not one. A correction's benefit
+# against the amount applied is `2a - a^2 (1 + rho)`, peaking at `1/(1 + rho)`
+# and reaching zero at twice that, where rho is the noise-to-signal ratio of
+# the estimate driving it. Measured against the record reference, that optimum
+# is not a constant of the format: 0.5 on 75bars SP, 1.05 on the same pattern
+# at EP, 1.58 on chromanoise - a factor of three.
+#
+# Nor can it be derived per decode. rho is set by MODEL error, and model error
+# is invisible to any resampling of the data the model was fitted from: on this
+# very correction, split-half returns rho = 0.00 where the truth is 2.47.
+#
+# So this is chosen to maximise the WORST case rather than any average, over
+# the three conditions where the optimum is known. As a fraction of each
+# condition's own best: 0.5 gives 100/75/52%, this gives 97/94/74%, 1.0 gives
+# 54/100/88%, and 1.5 costs -146% on 75bars SP, which turns harmful past about
+# 1.1. Three quarters is the amount whose weakest showing is strongest, and it
+# stays clear of the one condition that has a near harm threshold.
+#
+# A lead, not yet a law: the optimum ranks in the same order as the fraction of
+# the response that is head-specific rather than shared (0.26 -> 0.50,
+# 0.32 -> 1.05, 0.52 -> 1.58). Three points, so one chance in six of ordering
+# that way by luck. If it holds over more material this constant can be
+# replaced by a measurement.
+LUMA_EQ_AMOUNT = 0.75
+
+
+def luma_path_equalizer(rf, curve, amount, dense=None):
+    """The inverse of the measured path response, on the RF filter's own grid.
+
+    Despite the name, this does not equalize the response that steady content
+    experiences - it cannot. Measured on a synthetic constant-amplitude carrier
+    through a known sloped magnitude, the induced frequency error is EXACTLY
+    ZERO wherever the carrier is not sweeping: the demodulator is a limiter, so
+    an amplitude change on a steady carrier is discarded before it can reach the
+    picture. Everything this stage does, it does at transitions, where the
+    carrier's sidebands are wide enough for a sloped magnitude to weight them
+    asymmetrically and convert some frequency modulation into phase.
+
+    Steady content still moves, but through TIMING rather than through the
+    response. Measured on real decode pairs the change concentrates at
+    transitions as the synthetic law predicts - transition-span rms 5.3 times
+    the steady-span rms, both linear in amount - and yet the steady floor is
+    0.09 to 0.16 IRE rms rather than zero. The path is the time base: this stage
+    sharpens the sync edges, about 7 and 6 samples down to 6 and 5, the line
+    location refinement then lands differently, and the whole line resamples on
+    a slightly shifted grid. It is a cross-coupling into timing rather than a
+    response the demodulator passed, and it is neither harm nor benefit in
+    itself - but it means nothing here is confined to the transitions it acts on.
+
+    That conversion follows the SIGN of the sweep, so a rise and a fall are
+    pushed opposite ways - measured at +4.73 kHz against -2.87 kHz on a quarter
+    microsecond edge, and falling as roughly edge^-3.4 as edges soften. Being
+    linear and time invariant, this stage applies the same magnitude to both and
+    so cannot have the right sign for both at once. It improves whichever
+    direction it happens to suit and degrades the other, which is why the best
+    amount is a property of the PICTURE - the balance of rises and falls in the
+    content - rather than of the path, and why no measurement of the path can
+    derive it.
+
+    Those two kHz figures are from a BARE sloped magnitude, with neither
+    `Filters["RFVideo"]` nor the pre/de-emphasis round trip in the chain, and
+    they overstate how one-sided the effect is. Simulated over the whole chain
+    against the measured per-head response - a rise and a fall over the same two
+    levels, each divided by its own signed step - the part that is linear in
+    sweep rate runs 0.29 to 0.48 of the part that RECTIFIES, on cd, pnb and home
+    head A, rising toward parity as edges soften. The argument above survives:
+    a linear time invariant stage still cannot suit both directions. But the
+    asymmetry it trades on is the minority of what the response does to a
+    transient, which is worth knowing before reading too much into the amount.
+
+    `Filters["RFVideo"]` is already a frequency domain multiply over the same
+    block, so this costs one more multiply of an array that is built once.
+
+    The accumulated dense response is inverted, not just the line. Its
+    departure from the line is the path's own shape, measured: across two
+    different pictures on the same tape it reproduces at r = +0.87 and +0.89 on
+    one head and +0.54 and +0.77 on the other, while across the same picture at
+    two tape speeds - a different path - it falls to +0.57 and +0.53. High
+    between pictures and lower between paths is the signature this module
+    already uses to admit a component.
+
+    The often-quoted +0.24 between pictures is the PER-FIELD residual, which is
+    a different object: one field's binned medians against one field's line.
+    Accumulating per head across a decode is what separates them, and it is
+    worth 0.17 to 0.29 dB rms of real shape.
+
+    Each point is still shrunk toward the line by its own accumulated evidence,
+    so a bin the carrier barely visited contributes almost nothing rather than
+    contributing noise.
+
+    Held flat outside the range the carrier visits, because a line is not a
+    measurement where nothing was measured: at -3 dB/MHz, extrapolated across
+    the whole RF band, it would reach tens of dB. Full strength over the
+    format's nominal deviation range and tapering to flat across the margin
+    either side, which is the region the curve already treats as thinly
+    evidenced. The taper is a raised cosine rather than a step because a step
+    in a magnitude response rings in the time domain, which is the opposite of
+    the point.
+    """
+    sys_params = rf.SysParams
+    inner_low = rf.iretohz(sys_params["vsync_ire"], spec=True)
+    inner_high = rf.iretohz(100, spec=True)
+    outer_low = rf.iretohz(sys_params["vsync_ire"] - CURVE_RANGE_MARGIN_IRE, spec=True)
+    outer_high = rf.iretohz(100 + CURVE_RANGE_MARGIN_IRE, spec=True)
+
+    length = len(rf.Filters["RFVideo"])
+    half = length // 2
+    frequency = np.arange(half, dtype=np.float64) * (rf.freq_hz / length)
+
+    centre_hz, level, slope = curve
+    reference_hz = 0.5 * (inner_low + inner_high)
+    log_level = slope * (frequency - reference_hz)
+    if dense is not None:
+        described_hz, described, described_weight = dense
+        inside = (frequency >= described_hz[0]) & (frequency <= described_hz[-1])
+        measured = np.interp(frequency[inside], described_hz, described)
+        confidence = np.interp(frequency[inside], described_hz, described_weight)
+        share = confidence / (confidence + CURVE_MINIMUM_POPULATION)
+        # Both are absolute log levels, so the line's own level comes back in
+        # before they are mixed, and the result is stated against the middle of
+        # the range so the equalizer carries no overall gain.
+        line_here = level + slope * (frequency[inside] - centre_hz)
+        blended = share * measured + (1.0 - share) * line_here
+        log_level[inside] = blended - (level + slope * (reference_hz - centre_hz))
+
+    weight = np.zeros(half)
+    weight[(frequency >= inner_low) & (frequency <= inner_high)] = 1.0
+    for low, high, rising in ((outer_low, inner_low, True),
+                              (inner_high, outer_high, False)):
+        edge = (frequency > low) & (frequency < high)
+        position = (frequency[edge] - low) / max(high - low, 1.0)
+        cosine = np.cos(np.pi * position)
+        weight[edge] = 0.5 * (1.0 - cosine) if rising else 0.5 * (1.0 + cosine)
+
+    correction = np.exp(-amount * weight * log_level)
+    # The stored filter mirrors the negative frequencies above Nyquist.
+    return np.concatenate((correction, np.flip(correction)))[:length]
+
+
+def update_luma_equalizer(field, amount):
+    """Fit the next field's equalizer from this head's accumulated response.
+
+    Fields come off the tape alternating between the two heads, so once this
+    field is placed the next one's head is known - which is what makes a
+    per-head correction possible at all in a demodulator that runs before
+    fields are assembled. A break in the alternation means a field was lost, to
+    a gap in the recording or a dropout large enough to swallow one. The
+    equalizer holds what it has for that field rather than rebuilding on a
+    prediction the signal has just contradicted, and `rf._luma_eq_breaks`
+    counts how often that happened - a decode with many breaks is one where
+    the head assignment, and so a per-head correction, should not be trusted.
+
+    The response is accumulated per head across the decode. One field
+    determines the line well enough (its slope's standard deviation is under
+    1% of the slope) but accumulating costs nothing and rides out a bad field.
+    """
+    measured = measured_amplitude_deviation(field)
+    if measured is None or measured.response is None:
+        return
+    rf = field.rf
+    store = rf.__dict__.setdefault("_luma_eq_lines", {})
+    head = bool(field.isFirstField)
+    centre_hz, level, slope = measured.response.separation
+    total, weight = store.get(head, (np.zeros(3), 0.0))
+    store[head] = (total + np.array([centre_hz, level, slope]), weight + 1.0)
+
+    expected = rf.__dict__.get("_luma_eq_expected")
+    rf._luma_eq_expected = not head
+    if expected is not None and expected != head:
+        # The alternation just failed, so the basis for naming the next
+        # field's head has failed with it. Whatever filter is in place
+        # stays there for this field rather than being rebuilt on a
+        # prediction the signal has just contradicted.
+        rf._luma_eq_breaks = rf.__dict__.get("_luma_eq_breaks", 0) + 1
+        return
+
+    # Both heads pooled, deliberately, rather than the head the next field
+    # will come from.
+    #
+    # The demodulator runs in its own thread and ahead of field assembly, so a
+    # filter swapped in here reaches whichever blocks that thread happens not
+    # to have started yet. With two different filters alternating, which one a
+    # block gets is a matter of scheduling, and the decode stops being
+    # reproducible - measured, two identical runs produced different output
+    # and the correction's size moved by about a tenth of itself.
+    #
+    # Pooling costs nothing measurable: the two heads' lines differ by about
+    # 7%, and a per-head filter was measured to give the same result as a
+    # pooled one to within the noise. What is left varying is successive
+    # versions of one filter as the response converges, which is a far smaller
+    # difference than between two heads.
+    total = sum(entry[0] for entry in store.values())
+    weight = sum(entry[1] for entry in store.values())
+    # Held back where the response cannot be trusted. On a tape whose
+    # measurement is noise-dominated an equalizer built from it was measured
+    # to make the picture worse at every amount, so the correction is scaled
+    # by how well the response describes itself. The weaker of the two heads
+    # decides, because one pooled filter is applied to both.
+    trust = rf.__dict__.get("_luma_eq_trust", 1.0)
+    rf.Filters["LumaPathEQ"] = luma_path_equalizer(
+        rf,
+        tuple(total / weight),
+        amount * trust,
+        _pooled_dense(rf),
+    ).astype(np.float64)
+
+
+
+def _measure_reliability(rf, head, levels, population, seen, total, weight):
+    """How far this head's response can be trusted, from the data alone.
+
+    Two failures have to be caught and neither statistic catches both.
+
+    A head whose response is noise rather than shape shows it in the SLOPE of
+    each new field regressed on the model built without it: consistent shape
+    regresses at one, noise regresses low. And a head whose response is real but
+    poorly determined shows it in the SCATTER about that regression, which is
+    the measurement's own noise against the shape it is trying to describe.
+    Measured on the one tape where an equalizer built from this was found to
+    harm the picture, the slope caught one head (0.28) and the scatter caught
+    the other (a noise-to-signal of 0.32); on four tapes where it helped, both
+    read unity and near zero.
+
+    The noise floor is pooled across the heads because it is a property of the
+    RF chain rather than of either head, so both estimates rest on twice the
+    evidence.
+
+    Leaves the factor on the decoder as `_luma_eq_trust` - one where the
+    response is solid, below one where it is not.
+    """
+    probe = rf.__dict__.setdefault("_luma_eq_reliability", {})
+    state = probe.setdefault(head, {"num": 0.0, "den": 0.0, "resid": 0.0, "weight": 0.0})
+    prior = weight >= CURVE_MINIMUM_POPULATION
+    both = prior & seen
+    if np.count_nonzero(both) >= CURVE_INDEPENDENT_POINTS * 2:
+        model = total[both] / weight[both]
+        observed = np.log(np.maximum(levels[both], 1e-30))
+        mass = population[both]
+        model = model - np.average(model, weights=mass)
+        observed = observed - np.average(observed, weights=mass)
+        state["num"] += float(np.sum(mass * model * observed))
+        state["den"] += float(np.sum(mass * model * model))
+        slope = state["num"] / max(state["den"], 1e-30)
+        departure = observed - slope * model
+        state["resid"] += float(np.sum(mass * departure * departure))
+        state["weight"] += float(np.sum(mass))
+    if state["den"] <= 0.0 or state["weight"] <= 0.0:
+        return
+    slope = state["num"] / state["den"]
+    floor = sum(s["resid"] for s in probe.values()) / max(
+        sum(s["weight"] for s in probe.values()), 1e-30
+    )
+    signal = state["den"] / state["weight"]
+    noise_to_signal = floor / max(signal, 1e-30)
+    state["trust"] = float(np.clip(slope / (1.0 + noise_to_signal), 0.0, 1.0))
+    rf._luma_eq_trust = min(
+        entry.get("trust", 1.0) for entry in probe.values()
+    )
+
+def _pooled_dense(rf):
+    """Both heads' accumulated responses together, on the model's contract."""
+    store = rf.__dict__.get("_luma_dense_response")
+    if not store:
+        return None
+    total = sum(entry[0] for entry in store.values())
+    weight = sum(entry[1] for entry in store.values())
+    centre_total = sum(entry[2] for entry in store.values())
+    described = weight >= CURVE_MINIMUM_POPULATION
+    if np.count_nonzero(described) < CURVE_DENSE_MINIMUM_POINTS:
+        return None
+    return (
+        centre_total[described] / weight[described],
+        total[described] / weight[described],
+        weight[described],
+    )
 
 def attach_luma_deviation(field):
     """Carry the carrier's amplitude deviation as a video channel.
@@ -946,3 +1317,5 @@ def measured_amplitude_deviation(field):
         cached = measure_amplitude_deviation(field)
         field._luma_amplitude_measured = cached
     return cached
+
+

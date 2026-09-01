@@ -75,11 +75,6 @@ REFERENCE_TRACK_WIDTH = 58.0
 # kept well above what a roll-off needs.
 TRANSFER_BANDS = 12
 
-# A band is used only where it stands this many standard errors clear of zero.
-# Below that it carries no information about the response and the isotonic fit
-# spans it instead.
-TRANSFER_MIN_SIGMA = 3.0
-
 # Fields the measured response is averaged over. The regression is noisy in a
 # single field - the color-under's own picture content is the larger part of
 # what it sees - but the transfer is a property of the head and the tape, so it
@@ -249,6 +244,44 @@ def _isotonic(values, weight):
     return np.repeat(np.array(level), count)
 
 
+def _amount_probe(field, **measured):
+    """Record what the transfer regression saw, without acting on any of it.
+
+    Gated by the caller on the plot that reads it, since assembling this is
+    several arrays and a second isotonic fit per measurement.
+
+    The regression already produces, per field and per head, the level of the
+    transfer and its standard error - the very number the track width model
+    predicts - and then normalises it away. This keeps a copy so the two can be
+    compared, and counts how often the measurement fails to resolve at all,
+    which is how often the unshaped fallback is reached.
+    """
+    probe = field.rf.__dict__.setdefault("_chroma_amount_probe", {})
+    state = probe.setdefault(bool(field.isFirstField), [])
+    state.append(measured)
+
+
+def _project_level(transfer, error, shape):
+    """The transfer's level along a shape, and the variance of that level.
+
+    Inverse variance weighted least squares of the measured band transfers on
+    the shape they are supposed to follow, which is the level the shape is
+    normalised by before it is stored. Taken over every band that could be
+    measured rather than over the bands that passed a significance test:
+    selecting bands on the size of their own estimate and then reading a level
+    off the survivors biases the level upward by the selection.
+    """
+    usable = (error > 0.0) & (shape > 0.0)
+    if np.count_nonzero(usable) < 2:
+        return float("nan"), float("nan")
+    precision = 1.0 / (error[usable] * error[usable])
+    denominator = float((shape[usable] * shape[usable] * precision).sum())
+    if not denominator > 0.0:
+        return float("nan"), float("nan")
+    level = float((transfer[usable] * shape[usable] * precision).sum()) / denominator
+    return level, 1.0 / denominator
+
+
 def _measure_transfer_response(field, deviation, half_width_hz):
     """How much of the modelled transfer survives, band by band.
 
@@ -320,21 +353,80 @@ def _measure_transfer_response(field, deviation, half_width_hz):
     centre = 0.5 * (edges[:-1] + edges[1:])
     response = np.zeros(TRANSFER_BANDS)
     weight = np.zeros(TRANSFER_BANDS)
+    raw_transfer = np.zeros(TRANSFER_BANDS)
+    raw_error = np.zeros(TRANSFER_BANDS)
+    band_sxx = np.zeros(TRANSFER_BANDS)
+    band_sxy = np.zeros(TRANSFER_BANDS)
+    band_syy = np.zeros(TRANSFER_BANDS)
+    band_coherence = np.zeros(TRANSFER_BANDS)
+    # The transform's frequencies ascend, so which band a bin belongs to is a
+    # position in them rather than a mask over all of them.
+    bounds = np.searchsorted(frequency, edges)
     for b in range(TRANSFER_BANDS):
-        inside = (frequency >= edges[b]) & (frequency < edges[b + 1])
-        a, c, d = sxx[inside].sum(), sxy[inside].sum(), syy[inside].sum()
+        low, high = bounds[b], bounds[b + 1]
+        a, c, d = sxx[low:high].sum(), sxy[low:high].sum(), syy[low:high].sum()
         if not (a > 0.0 and d > 0.0):
             continue
         transfer = c / a
         coherence = transfer * transfer * a / d
-        samples = max(int(np.count_nonzero(inside)) * count - 1, 1)
+        samples = max(int(high - low) * count - 1, 1)
         error = np.sqrt(max((d / a) * (1.0 - coherence), 0.0) / samples)
-        if transfer > TRANSFER_MIN_SIGMA * error:
-            response[b] = transfer
-            weight[b] = 1.0 / (error * error)
+        raw_transfer[b] = transfer
+        raw_error[b] = error
+        band_sxx[b], band_sxy[b], band_syy[b] = a, c, d
+        band_coherence[b] = coherence
+        response[b] = transfer
+        weight[b] = 1.0 / (error * error)
 
+    # Every band that could be measured takes part, carrying the weight of how
+    # well it was measured. There is no significance test in front of this, and
+    # removing it is what makes the level below usable.
+    #
+    # A band that resolves nothing already contributes almost nothing: the fit
+    # is inverse-variance weighted, so its weight is its own precision. The
+    # test that used to stand here dropped it entirely instead, which cost two
+    # ways. It discarded a usable shape - measured, 75bars EP and home.flac
+    # never once cleared three sigma in three bands, so the transfer never
+    # resolved at all and every field fell back on no roll-off with the whole
+    # amount applied wideband. And selecting bands on the size of their own
+    # estimate, then reading a level off the survivors, biases that level
+    # upward by the selection - which matters now that the level is read.
     used = weight > 0.0
-    if np.count_nonzero(used) < 3:
+    if luma_amplitude.wants_averaging_probe(field.rf):
+        # What the same bands say with no significance gate in front of them,
+        # and what the gate then leaves. Reported only - the gate still decides.
+        measurable = raw_error > 0.0
+        ungated_shape = np.zeros(TRANSFER_BANDS)
+        if np.count_nonzero(measurable) >= 2:
+            pooled = _isotonic(
+                raw_transfer[measurable], 1.0 / (raw_error[measurable] ** 2)
+            )
+            if pooled[0] > 0.0:
+                ungated_shape[measurable] = np.clip(pooled / pooled[0], 0.0, 1.0)
+        ungated_level, ungated_var = _project_level(
+            raw_transfer, raw_error, ungated_shape
+        )
+        _amount_probe(
+            field,
+            resolved=bool(np.count_nonzero(used) >= 2),
+            measurable=int(np.count_nonzero(measurable)),
+            # How many bands would have stood three standard errors clear on
+            # their own. Reported so the gate's removal can be seen, not used.
+            passing=int(np.count_nonzero(raw_transfer > 3.0 * raw_error)),
+            band_hz=centre.copy(),
+            raw_transfer=raw_transfer.copy(),
+            raw_error=raw_error.copy(),
+            ungated_level=ungated_level,
+            ungated_var=ungated_var,
+            model_exponent=float(
+                getattr(field, "chroma_model_exponent", float("nan"))
+            ),
+            sxx=band_sxx.copy(),
+            sxy=band_sxy.copy(),
+            syy=band_syy.copy(),
+            coherence=band_coherence.copy(),
+        )
+    if np.count_nonzero(used) < 2:
         return None
 
     fitted = _isotonic(response[used], weight[used])
@@ -437,11 +529,9 @@ def apply_chroma_envelope_gain(field):
     track_width = decoder_params.get("video_track_width", REFERENCE_TRACK_WIDTH)
     trust = track_width / (track_width + HALF_COUPLING_TRACK_WIDTH)
 
-    # Belief is withdrawn per sample where the carrier was sweeping too fast
-    # for the path to follow. The measurement also reports how its own noise
-    # varies across the carrier's range (`noise_scale`), which is a real
-    # property of the path - but scaling the trust weight by it changes nothing
-    # measurable here, so it is left for whatever else reads the measurement.
+    # Belief is withdrawn per sample where the carrier was sweeping too fast for
+    # the path to follow, since the amplitude there is reporting the path rather
+    # than the tape.
     belief = measured.steadiness
 
     gain = _envelope_gain_from_deviation(
@@ -453,6 +543,30 @@ def apply_chroma_envelope_gain(field):
         trust,
         rf.dod_options.dod_threshold_p,
     )
+
+    # The amount the model asks for, kept so the regression's own level can be
+    # read against it. Recomputed on a stride rather than captured from the
+    # exponent above, which `np.power` has already overwritten in place - and
+    # only where the plot that reads it was asked for.
+    if luma_amplitude.wants_averaging_probe(rf):
+        probe_stride = 64
+        probe_carrier = np.asarray(carrier_hz[::probe_stride], dtype=np.float64)
+        probe_deviation = np.asarray(deviation[::probe_stride], dtype=np.float64)
+        probe_belief = np.asarray(belief[::probe_stride], dtype=np.float64)
+        half = float(rf.dod_options.dod_threshold_p) ** 2
+        squared = probe_deviation * probe_deviation
+        confidence = squared * (1.0 + half) / (squared + half) * probe_belief
+        ratio = decoder_params["color_under_carrier"] / np.maximum(probe_carrier, 1.0)
+        field.chroma_model_exponent = float(
+            np.mean(
+                (
+                    WAVELENGTH_INDEPENDENT_NOISE
+                    + (1.0 - WAVELENGTH_INDEPENDENT_NOISE) * ratio
+                )
+                * trust
+                * confidence
+            )
+        )
 
     # The band the color-under can carry amplitude modulation in at all. Beyond
     # it a gain does not correct the chroma, it modulates chroma out of its own
@@ -473,21 +587,49 @@ def apply_chroma_envelope_gain(field):
         # Measured on every field until the average has something to say, on a
         # stride after that.
         if len(history) < TRANSFER_BANDS or seen % TRANSFER_MEASURE_STRIDE == 0:
-            measured = _measure_transfer_response(field, deviation, half_width_hz)
-            if measured is not None:
-                history.append(measured)
+            resolved = _measure_transfer_response(field, deviation, half_width_hz)
+            if resolved is not None:
+                history.append(resolved)
+        # This head's own measured shape, or the other head's until it has one.
+        #
+        # A field contributes nothing unless its fitted transfer has a positive
+        # part, which is right - a field whose measurement says the coupling
+        # runs the wrong way carries no usable shape. But that test turns on the
+        # sign of the lowest band, and on difficult material that sign is not
+        # resolved: measured on an off-air tape, band zero came out positive on
+        # 71% of one head's fields and 10% of the other's, at 0.6 and 1.6 sigma.
+        # One head was then shaped on every field and the other on a fifth of
+        # them, from a distinction the data does not support.
+        #
+        # The two heads' transfers differ by about 15% of the transfer's own
+        # level, so standing in for one with the other is far closer than the
+        # alternative, which is applying no correction at all.
+        borrowed = False
+        if not history:
+            history = rf.field_averages.chroma_transfer_for(not field.isFirstField)
+            borrowed = bool(history)
         if history:
             # Every field answers on the same grid, so this is a plain mean.
             band_hz = history[-1][0]
             band_response = np.mean([response for _, response in history], axis=0)
+            _shape_gain(gain, band_hz, band_response, rf.freq_hz, half_width_hz)
+            field.chroma_envelope_shaped = True
+            field.chroma_envelope_borrowed = borrowed
         else:
-            # Nothing measurable yet - band limit to what the color-under can
-            # carry and leave the shape alone.
-            band_hz = np.array([0.0, half_width_hz])
-            band_response = np.array([1.0, 1.0])
-        _shape_gain(gain, band_hz, band_response, rf.freq_hz, half_width_hz)
+            # Neither head has resolved yet, so there is nothing to shape by and
+            # the correction is not applied. Holding the shape flat instead -
+            # band limiting only - applies the whole amount across the whole
+            # band on the strength of a transfer that was never measured, and
+            # measured, that is worse than leaving the color-under alone.
+            gain[:] = np.float32(1.0)
+            field.chroma_envelope_shaped = False
+            field.chroma_envelope_borrowed = False
 
-        if debug_plot and debug_plot.is_plot_requested("luma_noise"):
+        if (
+            history
+            and debug_plot
+            and debug_plot.is_plot_requested("luma_noise")
+        ):
             field.chroma_envelope_transfer = (band_hz, band_response)
 
     amount = np.float32(rf.options.chroma_env_gain)

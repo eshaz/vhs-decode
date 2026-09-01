@@ -716,11 +716,18 @@ def plot_luma_noise(
             # own RF path and the separation loss fitted on top of it. Each
             # curve is shown against its own mean, so what is comparable is the
             # shape rather than a level.
+            # The model, on the SAME reference as the carrier amplitude above:
+            # `before` is A(f)/median and `after` is A(f)/model(f), so their
+            # ratio is model(f)/median directly. Nothing further is normalised
+            # into it - the point of drawing it is that the blue trace divided
+            # by this one IS the red trace, and any extra scaling here would
+            # break that relationship and hide where the model departs from the
+            # amplitude it is supposed to describe.
             removed_total = np.asarray(before) / np.maximum(np.asarray(after), 1e-9)
             ax_resp.plot(
-                centres, removed_total / removed_total.mean(), color="tab:cyan",
+                centres, removed_total, color="tab:cyan",
                 linestyle="-", linewidth=1.2,
-                label="response removed (total, measured)",
+                label="response removed (blue / this = red)",
             )
             if response is not None and len(getattr(response, "described", ())):
                 # What the model is actually fitted from: the steadiest samples
@@ -728,11 +735,34 @@ def plot_luma_noise(
                 # is every sample, which is a different population - they are
                 # not expected to agree where a level is only passed through.
                 described_ire = hz_to_ire(np.asarray(response.described_hz, dtype=float))
-                described = np.exp(np.asarray(response.described, dtype=float))
+                # Drawn as what it is fitted from DIVIDED BY what the model
+                # made of it, so unity means the correction followed its own
+                # measurement and a departure marks a frequency where something
+                # else won. Its own scale would not answer that: this is the
+                # FLATTENED response, with the decoder's RF filter already
+                # divided out, so against blue and cyan - which still carry that
+                # filter - it shares no reference and its shape is mostly the
+                # filter's, not the path's.
+                #
+                # Every point is `share * described + (1 - share) * line`, so
+                # the ratio is exactly `exp((1 - share) * (described - line))`:
+                # the line's pull, and nothing else, since inside this range the
+                # model has no other term.
+                from vhsdecode.luma_amplitude import CURVE_MINIMUM_POPULATION
+
+                centre_hz, level_at_centre, slope = response.separation
+                line = level_at_centre + slope * (
+                    np.asarray(response.described_hz, dtype=float) - centre_hz
+                )
+                weight = np.asarray(response.described_weight, dtype=float)
+                share = weight / (weight + CURVE_MINIMUM_POPULATION)
+                followed = np.exp(
+                    (1.0 - share) * (np.asarray(response.described, dtype=float) - line)
+                )
                 ax_resp.plot(
-                    described_ire, described / np.median(described),
+                    described_ire, followed,
                     color="tab:green", linewidth=1.1, alpha=0.8,
-                    label="what the model is fitted from (steadiest samples)",
+                    label="model / what it is fitted from (1 = followed)",
                 )
             if response is not None:
                 # And the fitted part of it on its own. Separation loss is
@@ -752,8 +782,17 @@ def plot_luma_noise(
         ax_resp.set_ylabel("relative amplitude")
         ax_resp.set_title(
             f"Response removal - {'head A' if is_first_field else 'head B'}"
-            "\nflat means no luma left in it"
         )
+        # Sync tip and blanking, the format's own two fixed levels, so the
+        # curves can be read against something that is defined rather than
+        # pictorial.
+        for level, name in ((-40.0, "sync tip"), (0.0, "blanking")):
+            ax_resp.axvline(level, color="tab:grey", linestyle="-.", linewidth=1,
+                            alpha=0.7)
+            ax_resp.annotate(name, xy=(level, 0.0), xycoords=("data", "axes fraction"),
+                             xytext=(2, 3), textcoords="offset points",
+                             fontsize="x-small", color="tab:grey",
+                             rotation=90, va="bottom", ha="left")
         if centres:
             # How much of the level-dependent swing the fit actually took out.
             # Peak to peak rather than a slope, because what is left is not
@@ -780,13 +819,12 @@ def plot_luma_noise(
         ax_resp.grid(alpha=0.3)
 
     if ax_model is not None:
-        # What the one-component model does not carry, and what the noise does.
-        # These look alike on the trace above and are not the same thing: the
-        # residual follows the PICTURE (it survives a change of tape speed but
-        # not a change of material, because a sweeping carrier's amplitude has
-        # collapsed through the path's band limit and lands in whatever level
-        # bin the picture's transitions crossed), while the noise follows the
-        # PATH. Only the second is a property of the tape.
+        # Not what the correction leaves behind - that is the deviation, drawn
+        # in red above. This is the departure of the measurement from the LINE,
+        # which is exactly the part the dense fit supplies on top of it, so it
+        # shows how much of the response a straight line would have missed.
+        # Beside it, how noisy the measurement is at each level, which is a
+        # property of the path rather than of the picture.
         if centres:
             noise_db = np.asarray(noise) * 8.686
             ax_model.plot(
@@ -807,7 +845,7 @@ def plot_luma_noise(
                     residual_ire[inside],
                     np.asarray(response.residual, dtype=float)[inside] * 8.686,
                     color="tab:orange", linewidth=0.9,
-                    label="residual about the line - follows the picture",
+                    label="what the dense fit adds to the line",
                 )
                 twin.axhline(0.0, color="tab:grey", linestyle=":", linewidth=1)
                 twin.set_ylabel("residual (dB)")
@@ -822,8 +860,11 @@ def plot_luma_noise(
                 ax_model.legend(loc="upper left", fontsize="small")
         low, high = ax_model.get_ylim()
         ax_model.set_ylim(low, high + 0.42 * (high - low))
+        for level in (-40.0, 0.0):
+            ax_model.axvline(level, color="tab:grey", linestyle="-.", linewidth=1,
+                             alpha=0.7)
         ax_model.set_xlabel("luma level (IRE)")
-        ax_model.set_title("What the line leaves behind", fontsize="medium")
+        ax_model.set_title("What the line alone would miss", fontsize="medium")
         ax_model.grid(alpha=0.3)
 
     for start, end in dropouts or []:
@@ -836,3 +877,169 @@ def plot_luma_noise(
     ax_env.set_xlim(start_rf, end_rf)
     fig.tight_layout()
     plt.show()
+
+
+def plot_luma_averaging(probe, dod_threshold_p, source="", show=True):
+    """What the response model's averaging is actually doing, per head.
+
+    Six panels, one per open question, all measured with the correction running
+    unchanged - nothing here feeds back into the decode. Read together they say
+    whether the accumulation's assumptions hold on the material being decoded
+    rather than on the material they were designed against.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    log_to_db = 20.0 / np.log(10.0)
+    figure, axes = plt.subplots(2, 3, figsize=(16, 9))
+    figure.suptitle(
+        f"Response model averaging{(' - ' + source) if source else ''}"
+        f"   (dropout threshold {dod_threshold_p:g})"
+    )
+    colours = {True: "tab:blue", False: "tab:red"}
+    names = {True: "head A", False: "head B"}
+
+    # 1. The shrinkage in force. It cannot fall below a half: the range gate
+    #    admits a bin only at the same population that sets the blend's knee.
+    ax = axes[0][0]
+    for head, state in sorted(probe["luma"].items()):
+        if "share" not in state:
+            continue
+        ax.plot(state["share_hz"] / 1e6, state["share"], color=colours[head],
+                linewidth=1.1, label=f"{names[head]} ({state['fields']} fields)")
+    ax.axhline(0.5, color="tab:grey", linestyle=":", linewidth=1)
+    ax.annotate("floor of the range gate", xy=(0.02, 0.5), xycoords=("axes fraction", "data"),
+                fontsize="x-small", color="tab:grey", va="bottom")
+    ax.set_xlabel("carrier frequency (MHz)")
+    ax.set_ylabel("share of the measurement")
+    ax.set_title("1. Shrinkage actually in force")
+    ax.set_ylim(0.0, 1.05)
+    ax.legend(fontsize="x-small")
+    ax.grid(alpha=0.3)
+
+    # 2. The step the model takes where the described range ends, against the
+    #    deviation's own spread - the scale at which a step matters at all.
+    ax = axes[0][1]
+    for head, state in sorted(probe["luma"].items()):
+        if not state["edge_low_db"]:
+            continue
+        deviation = float(np.mean(state["deviation_db"]))
+        for values, style, edge in ((state["edge_low_db"], "-", "low"),
+                                    (state["edge_high_db"], "--", "high")):
+            ax.plot(values, style, color=colours[head], linewidth=1.1,
+                    label=f"{names[head]} {edge} edge")
+        ax.axhline(deviation, color=colours[head], linestyle=":", linewidth=1)
+        ax.axhline(-deviation, color=colours[head], linestyle=":", linewidth=1)
+    ax.axhline(0.0, color="tab:grey", linewidth=0.8)
+    ax.set_xlabel("field")
+    ax.set_ylabel("step (dB)")
+    ax.set_title("2. Step at the edges of the described range\n(dotted = that head's deviation rms)")
+    ax.legend(fontsize="x-small")
+    ax.grid(alpha=0.3)
+
+    # 3. Stationary or drifting. A bin's field-to-field difference is a moving
+    #    average of order one under a random walk plus measurement noise, so the
+    #    lag-one term separates the walk from the noise where a variance cannot.
+    ax = axes[0][2]
+    for head, state in sorted(probe["luma"].items()):
+        count = state["difference_count"]
+        seen = count >= 3
+        if not seen.any():
+            continue
+        variance = state["difference_square"][seen] / count[seen]
+        lag = state["difference_lag"][seen] / np.maximum(count[seen] - 1, 1)
+        noise = np.maximum(-lag, 0.0)
+        walk = np.maximum(variance - 2.0 * noise, 0.0)
+        ax.scatter(log_to_db * np.sqrt(noise), log_to_db * np.sqrt(walk),
+                   s=8, alpha=0.5, color=colours[head],
+                   label=f"{names[head]} ({int(seen.sum())} bins)")
+    limit = max(ax.get_xlim()[1], ax.get_ylim()[1])
+    ax.plot([0, limit], [0, limit], color="tab:grey", linestyle=":", linewidth=1)
+    ax.annotate("walk = noise", xy=(limit * 0.55, limit * 0.6), fontsize="x-small",
+                color="tab:grey", rotation=45)
+    ax.set_xlabel("measurement noise per field (dB)")
+    ax.set_ylabel("drift step per field (dB)")
+    ax.set_title("3. Drift against noise, per bin\n(above the line: an unbounded mean is wrong)")
+    ax.legend(fontsize="x-small")
+    ax.grid(alpha=0.3)
+
+    # 4. Whether the deviation ever reaches the bounds the dropout threshold
+    #    sets for it.
+    ax = axes[1][0]
+    width = 0.35
+    for offset, (head, state) in enumerate(sorted(probe["luma"].items())):
+        low = 100.0 * float(np.mean(state["clamp_low"]))
+        high = 100.0 * float(np.mean(state["clamp_high"]))
+        ax.bar([offset - width / 2, offset + width / 2], [low, high], width,
+               color=[colours[head], colours[head]], alpha=[0.9, 0.45][0])
+        ax.bar([offset + width / 2], [high], width, color=colours[head], alpha=0.45)
+        ax.annotate(f"{low:.4f}%", xy=(offset - width / 2, low), ha="center",
+                    va="bottom", fontsize="x-small")
+        ax.annotate(f"{high:.4f}%", xy=(offset + width / 2, high), ha="center",
+                    va="bottom", fontsize="x-small")
+    ax.set_xticks(range(len(probe["luma"])))
+    ax.set_xticklabels([f"{names[h]}\nlow / high" for h, _ in sorted(probe["luma"].items())],
+                       fontsize="x-small")
+    ax.set_ylabel("samples at the clamp (%)")
+    ax.set_title(f"4. Deviation clamp [{dod_threshold_p:g}, {1.0 / dod_threshold_p:.2f}]")
+    ax.grid(alpha=0.3, axis="y")
+
+    # 5. The amount the regression measures, against the amount the track-width
+    #    model asks for. Unity means the two agree.
+    ax = axes[1][1]
+    for head, records in sorted(probe["chroma"].items()):
+        level = np.array([r["ungated_level"] for r in records])
+        variance = np.array([r["ungated_var"] for r in records])
+        model = np.array([r["model_exponent"] for r in records])
+        good = np.isfinite(level) & np.isfinite(variance) & (variance > 0.0)
+        if not good.any():
+            continue
+        amount = level[good] / (2.0 * model[good])
+        error = np.sqrt(variance[good]) / (2.0 * model[good])
+        ax.errorbar(np.arange(good.sum()), amount, yerr=error, fmt="o", markersize=3,
+                    color=colours[head], alpha=0.7, linewidth=0.8,
+                    label=f"{names[head]}")
+        precision = 1.0 / variance[good]
+        pooled = float((level[good] * precision).sum() / precision.sum()) / (
+            2.0 * float(np.mean(model[good]))
+        )
+        ax.axhline(pooled, color=colours[head], linestyle="--", linewidth=1.1)
+        ax.annotate(f"{pooled:.3f}", xy=(0.99, pooled), xycoords=("axes fraction", "data"),
+                    ha="right", va="bottom", fontsize="x-small", color=colours[head])
+    ax.axhline(1.0, color="tab:grey", linestyle=":", linewidth=1)
+    ax.annotate("what the model applies", xy=(0.02, 1.0), xycoords=("axes fraction", "data"),
+                fontsize="x-small", color="tab:grey", va="bottom")
+    ax.set_xlabel("measurement")
+    ax.set_ylabel("measured amount / model amount")
+    ax.set_title("5. The amount, measured against the model")
+    ax.legend(fontsize="x-small")
+    ax.grid(alpha=0.3)
+
+    # 6. How often the transfer resolves at all. Where it does not, the shaping
+    #    falls back to no roll-off and the whole amount is applied wideband.
+    ax = axes[1][2]
+    for offset, (head, records) in enumerate(sorted(probe["chroma"].items())):
+        resolved = 100.0 * float(np.mean([r["resolved"] for r in records]))
+        passing = float(np.mean([r["passing"] for r in records]))
+        measurable = float(np.mean([r["measurable"] for r in records]))
+        ax.bar([offset - width / 2], [resolved], width, color=colours[head],
+               label=f"{names[head]} resolved")
+        ax.bar([offset + width / 2], [100.0 * passing / max(measurable, 1.0)], width,
+               color=colours[head], alpha=0.45)
+        ax.annotate(f"{resolved:.0f}%", xy=(offset - width / 2, resolved), ha="center",
+                    va="bottom", fontsize="x-small")
+        ax.annotate(f"{passing:.1f}/{measurable:.0f}\nbands",
+                    xy=(offset + width / 2, 100.0 * passing / max(measurable, 1.0)),
+                    ha="center", va="bottom", fontsize="x-small")
+    ax.set_xticks(range(len(probe["chroma"])))
+    ax.set_xticklabels([f"{names[h]}\nresolved / bands" for h, _ in sorted(probe["chroma"].items())],
+                       fontsize="x-small")
+    ax.set_ylabel("per cent")
+    ax.set_ylim(0, 110)
+    ax.set_title("6. Transfer resolution\n(0% = unshaped fallback every field)")
+    ax.grid(alpha=0.3, axis="y")
+
+    figure.tight_layout()
+    if show:
+        plt.show()
+    return figure
