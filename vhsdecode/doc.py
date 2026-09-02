@@ -4,6 +4,7 @@ from numba import njit
 import math
 
 import vhsdecode.formats as vhs_formats
+from vhsdecode import head_switch
 from vhsdecode.rust_utils import sosfiltfilt_rust
 
 
@@ -106,7 +107,54 @@ def detect_dropouts_rf(field, dod_options):
 
     debug_plot = getattr(field.rf, "debug_plot", None)
     if debug_plot and debug_plot.is_plot_requested("luma_noise"):
+
         from vhsdecode.debug_plot import plot_luma_noise
+
+        # Per-head wow panel: the per-line line-period deviation measured on
+        # the carrier's own sync-edge trace.  Only fields decoded under a
+        # flag that keeps the demod_raw channel can measure it; the trace of
+        # the most recent opposite-parity field is kept on the rf object -
+        # display state only, nothing reads it back - so the panel shows the
+        # two heads side by side.
+        wow_trace = None
+        if field.rf.options.carrier_tbc != 0 or field.rf.options.head_switch != 0:
+            from vhsdecode.luma_amplitude import sync_edge_trace
+
+            trace = sync_edge_trace(field)
+            if trace is not None and trace[1] > 0:
+                edges, period = trace
+                # The period between lines i and i+1, as a percentage
+                # deviation from the trace's own median period, plotted at
+                # line i; pairs broken by an unmeasured line stay NaN and
+                # draw as gaps rather than interpolations.
+                deviation = np.full(len(edges), np.nan)
+                consecutive = (edges[:-1] > 0) & (edges[1:] > 0)
+                deviation[:-1][consecutive] = (
+                    np.diff(edges)[consecutive] / period - 1.0
+                ) * 100.0
+                # The trace's own hygiene, as the correction applies it: a
+                # crossing latched on the wrong feature (a serration edge at
+                # the field boundary, typically) reads tens of samples off,
+                # which no physical wow does.  Bound at the extreme-value
+                # tail of the series' own robust scale so honest flutter is
+                # never touched, and blank what fails - the panel shows
+                # measurements, not latch failures.
+                finite = np.isfinite(deviation)
+                values = deviation[finite]
+                if len(values) > 2:
+                    median = np.median(values)
+                    sigma = 1.4826 * np.median(np.abs(values - median))
+                    if sigma > 0:
+                        bound = sigma * np.sqrt(2.0 * np.log(2.0 * len(values)))
+                        deviation[finite & (np.abs(deviation - median) > bound)] = np.nan
+                parity = bool(field.isFirstField)
+                store = field.rf.__dict__.setdefault("_wow_panel_traces", {})
+                store[parity] = deviation
+                wow_trace = {
+                    "head": parity,
+                    "deviation": deviation,
+                    "other_head": store.get(not parity),
+                }
 
         video = field.data["video"]
         plot_luma_noise(
@@ -126,6 +174,33 @@ def detect_dropouts_rf(field, dod_options):
             field.linelocs,
             field.rf.hztoire,
             field.rf.dod_options.dod_threshold_p,
+            # Present only where `--luma_eq` is running and this plot asked
+            # `demodblock` to keep it.
+            demod_noeq=video.get("demod_noeq"),
+            # What the color-under beat correction took out of the luma, where
+            # it ran and this plot asked for it to be kept. It is made on the
+            # time base corrected grid, so it comes with the RF sample position
+            # of each of its samples - the same mapping the downscale itself
+            # used - and lands on the shared axis with everything else.
+            beat=getattr(field, "luma_beat", None),
+            beat_locs=beat_sample_locations(field),
+            # What the head switch correction subtracted, carried as a video
+            # channel so it arrives already on this plot's sample grid; the
+            # switch itself is located from the field's own deviation (its
+            # sustained offset never shows in the applied trace - the phase
+            # kernel nulls DC by design); the format says how many switch
+            # events a field should hold.
+            head_switch=video.get("head_switch"),
+            head_switch_regions=(
+                head_switch.locate(field)
+                if field.rf.options.head_switch != 0
+                else None
+            ),
+            head_switch_expected=field.rf.SysParams.get("head_switches_per_field", 1),
+            # The specified carrier frequencies, which is the anchor the
+            # response model is binned on - see `carrier_frequency_bins`.
+            ire_to_hz=lambda ire: field.rf.iretohz(ire, spec=True),
+            wow_trace=wow_trace,
         )
 
     if debug_plot and debug_plot.is_plot_requested("luma_averaging"):
@@ -196,3 +271,21 @@ def map_dropouts_rf_to_tbc(errlist, start_line_idx, end_line_idx, linelocs, outl
 
     return rv_lines, rv_starts, rv_ends
 
+
+def beat_sample_locations(field):
+    """Where each sample of the beat correction sits on the RF sample grid.
+
+    The correction is made after the chroma is processed, so it is on the time
+    base corrected picture's grid while the rest of the plot is on the RF one.
+    `computewow_scaled` already holds the mapping between them - it is what the
+    downscale interpolated against - and caches it on the field, so reading it
+    back costs nothing and cannot disagree with where the samples actually came
+    from.
+    """
+    if getattr(field, "luma_beat", None) is None:
+        return None
+    locations = getattr(field, "interpolated_pixel_locs", None)
+    if locations is None:
+        locations = field.computewow_scaled()[0]
+    start = (field.lineoffset + 1) * field.outlinelen
+    return locations[start: start + len(field.luma_beat)]

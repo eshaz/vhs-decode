@@ -291,6 +291,28 @@ def main(args=None, use_gui=False):
         const=1.5,
         help="Enable y comb filter, optionally specifying IRE limit.",
     )
+    luma_group.add_argument(
+        "--inverse_eq",
+        type=int,
+        default=-1,
+        help=(
+            "Number of fields to average when applying sync pulse inverse equalization (i.e. de-ringing based on the sync pulse)"
+            "\n  Default is -1 (disabled). Use `--inverse_eq 4` to enable with the standard averaging horizon. 0 disables averaging."
+        ),
+    )
+    luma_group.add_argument(
+        "--lti_gain",
+        type=float,
+        default=None,
+        help=(
+            "Sets the amount of Luma Transient Improvement to apply. `--inverse_eq` is required to be enabled for this to take effect."
+            "\n  This performs a subtle sharpening of the luma transients based on data gathered by the inverse eq process."
+            "\n  * (omitted) auto (default)"
+            "\n  * 0         disabled"
+            "\n  * 0.5       half"
+            "\n  * 1         full"
+        ),
+    )
     chroma_group = parser.add_argument_group("Chroma decoding options")
     chroma_group.add_argument(
         "--cagc",
@@ -355,13 +377,59 @@ def main(args=None, use_gui=False):
         ),
     )
     parser.add_argument(
-        "--luma_deviation",
-        dest="luma_deviation",
-        action="store_true",
-        default=False,
+        "--luma_transient",
+        dest="luma_transient",
+        metavar="amount",
+        nargs="?",
+        type=float,
+        default=0,
+        const=luma_amplitude.LUMA_EQ_AMOUNT,
         help=(
-            "Carry the luma FM carrier's amplitude deviation as an extra video channel."
-            "\n  An FM carrier is recorded at constant amplitude, so every departure from constant is the path's, not the signal's. The channel holds the measured amplitude divided by the amplitude the carrier's own instantaneous frequency predicts, on the RF sample grid, so unity means the carrier is where the model puts it. Intended for downstream analysis; nothing in the decoder reads it."
+            "Correct the luma path's TRANSIENT artifact, on the time base corrected field. (Experimental feature)"
+            "\n  The path's frequency response does nothing to steady content - the demodulator is a limiter - so all of its effect is at transitions, and it pushes rises and falls in OPPOSITE directions. `--luma_eq` inverts that response as one filter and therefore cannot suit both: measured in the ring band it removes 4-7%% from active picture while injecting 13-21%% at the sync fall. This corrects each transition instead, by where it lands and which way it goes, from a model synthesised from the tape's own measured response."
+            "\n  Add the flag with no value for the default. 0 disables. Detection runs on the demodulated luma before de-emphasis, because the sub-de-emphasis stage is nonlinear on LP, EP and PAL and a model derived before it would not compose with a correction applied after."
+        ),
+    )
+    parser.add_argument(
+        "--luma_beat",
+        dest="luma_beat",
+        metavar="amount",
+        nargs="?",
+        type=float,
+        default=0,
+        const=1.0,
+        help=(
+            "Cancel the color-under beat in the demodulated luma. (Experimental feature)"
+            "\n  The color-under amplitude modulates the luma FM carrier - measurable as a component at the color-under frequency in the carrier's own envelope, which a recording with nothing in the chroma band does not show. Most of it dies in the demodulator; what survives arrives by AM-to-PM conversion and lands in the picture at the color-under frequency, where it is energy uncorrelated with the luma's image. The subcarrier trap does not reach it: it is tuned to fsc, which on a color-under format is not where this sits."
+            "\n  Add the flag with no value for the whole measured amount. 0 disables. The color-under is QAM, so its amplitude is the picture's saturation, and the beat grows with it faster than in proportion - measured across a colour bar field the coupling runs 2.4x from the least saturated bar to the most. The correction is therefore one complex gain scaled by saturation, fitted after the chroma is processed because that is the only place the decoded saturation exists, and refined field by field until it settles. It runs only where the decoder's own color killer says the field carries color-under, so a monochrome recording is left alone. Measured on the picture it removes 74%% of the beat on 75%% bars and 83%% on a chroma noise pattern."
+        ),
+    )
+    parser.add_argument(
+        "--head_switch",
+        dest="head_switch",
+        metavar="amount",
+        nargs="?",
+        type=float,
+        default=0,
+        const=1.0,
+        help=(
+            "Cancel AM-induced phase noise in the demodulated luma, self-calibrated against the decode itself. (Experimental feature)"
+            "\n  The luma carrier is recorded at constant amplitude, so whatever amplitude the fitted frequency response cannot explain is the path misbehaving: tape modulation noise, the DC step the head amplifiers put on the carrier at every head switch, the collapses at dropout edges. A real amplitude disturbance converts to a phase artifact through the asymmetry of the RF band-pass about the carrier - a computable property of the decoder's own filter, made level-exact by the measured sync reference levels - and this cancels that predicted artifact from the demodulated luma, before de-emphasis and every other correction. How much of the prediction truly appears in the signal is measured per frequency band as the decode runs, so the cancellation takes what is coherently there and no more: head switch and dropout transients are removed as its strongest coherent components, and the phase share of plain additive noise, which the envelope cannot see, is left alone by the measurement itself."
+            "\n  Add the flag with no value to apply the measured gain in full; fractions scale it, 0 disables. Inert until the amplitude measurement has seen its first field, and nearly inert while calibration evidence is thin, so the first frames are corrected gently. `--debug_plot luma_noise` marks the located head switch and what was removed."
+        ),
+    )
+    parser.add_argument(
+        "--carrier_tbc",
+        dest="carrier_tbc",
+        metavar="amount",
+        nargs="?",
+        type=float,
+        default=0,
+        const=1.0,
+        help=(
+            "Refine the time base correction from the luma carrier itself, correcting line timing and brightness together. (Experimental feature)"
+            "\n  A playback speed error time-warps each line and shifts every demodulated level at once, because frequency is level after FM demodulation - so the decoder already derives both corrections from one spline of the measured line positions. This re-measures each line's 50%% sync crossing on the demodulated carrier frequency, a channel amplitude events cannot move; the refined positions feed the very same spline, in addition to the sync-pulse-derived measurements, so the resample timing and the wow level adjust improve together. The refinement corrects the wow-and-flutter band - at and below the head drum's rotation rate, where the carrier trace is the measurably better instrument and where the sync time base's own smoothing loses the flutter - and the level adjust's smoothing is shortened to let that band through."
+            "\n  Add the flag with no value to apply the whole measured deviation; fractions scale it, 0 disables. The field's absolute alignment, including the color burst lock, stays where the sync-pulse time base put it, and any stretch of lines the carrier trace could not measure cleanly keeps its sync-derived positions outright. `--debug_plot luma_noise` gains a per-head panel of the measured line-period deviation."
         ),
     )
     chroma_group.add_argument(
@@ -450,6 +518,7 @@ def main(args=None, use_gui=False):
         " line_locs, "
         " rf_luma, "
         " vsync_levels, " # shows the vsync levels and debugging information
+        " hsync_model, " # shows the hsync artifact model's measurement and correction (needs --inverse_eq)
         " luma_noise," # shows the measured noise and frequency response on the luma carrier
         " luma_averaging" # shows the frequency response of the luma's carrier per video head
     )
@@ -693,7 +762,12 @@ def main(args=None, use_gui=False):
     rf_options["cagc_fields"] = args.cagc_fields
     rf_options["chroma_env_gain"] = args.chroma_env_gain
     rf_options["luma_eq"] = args.luma_eq
-    rf_options["luma_deviation"] = args.luma_deviation
+    rf_options["luma_transient"] = args.luma_transient
+    rf_options["luma_beat"] = args.luma_beat
+    rf_options["head_switch"] = args.head_switch
+    rf_options["carrier_tbc"] = args.carrier_tbc
+    rf_options["inverse_eq"] = args.inverse_eq
+    rf_options["lti_gain"] = args.lti_gain
     rf_options["disable_right_hsync"] = args.disable_right_hsync
     rf_options["fallback_vsync"] = args.fallback_vsync
     rf_options["relaxed_line0"] = args.relaxed_line0

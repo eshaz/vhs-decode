@@ -17,6 +17,9 @@ import lddecode.utils as lddu
 import vhsdecode.utils as utils
 from vhsdecode.utils import StackableMA, filtfft
 from vhsdecode.chroma import chroma_color_under_filter, TRANSFER_AVERAGE_FIELDS
+from vhsdecode import head_switch
+from vhsdecode import luma_amplitude
+from vhsdecode import luma_transient
 
 import vhsdecode.formats as vhs_formats
 
@@ -197,7 +200,24 @@ class VHSDecode(ldd.LDdecode):
         # For tape, it is recommended to use `--ire0_adjust` to fix brightness variations between lines
         # This method usually gives false positives for noisy signals, so smooth the correction out by an entire field to avoid banding
         if self.wow_level_adjust_smoothing is None:
-            self.wow_level_adjust_smoothing = self.rf.SysParams["frame_lines"] / 2
+            if self.rf.options.carrier_tbc != 0:
+                # With the carrier-refined time base the wow estimate is clean
+                # enough that the level adjust may follow the drum-rate
+                # flutter instead of averaging it away.  A two-head helical
+                # drum lays one field per head pass, so it revolves once per
+                # FRAME and the flutter's fundamental period is frame_lines
+                # output lines.  The level adjust is smoothed by a single-pole
+                # IIR whose time constant is this value in lines, and a
+                # single pole's -3 dB corner sits at 1/(2*pi*tau) - so
+                # tau = frame_lines/(2*pi) puts the passband edge exactly at
+                # the drum fundamental: drum-rate flutter passes while
+                # line-rate estimation noise, hundreds of times above the
+                # corner, is still attenuated by the same factor.
+                self.wow_level_adjust_smoothing = self.rf.SysParams[
+                    "frame_lines"
+                ] / (2 * np.pi)
+            else:
+                self.wow_level_adjust_smoothing = self.rf.SysParams["frame_lines"] / 2
 
         # Needs to be overridden since this is overwritten for 405-line.
         # self.output_lines = (self.rf.SysParams["frame_lines"] // 2) + 1
@@ -573,8 +593,30 @@ class VHSDecode(ldd.LDdecode):
                             self.rf.DecoderParams["hz_ire"] = hz_ire
                             self.rf.DecoderParams["vsync_ire"] = vsync_ire
 
+                # One-shot re-demodulation once the amplitude stage's block
+                # model first exists: the demod prefetch ran ~4 fields ahead
+                # of the first measured field, so every block so far was
+                # demodulated before the head switch correction could act -
+                # the first field came out uncorrected and its debug trace
+                # empty. Redo this first field from re-demodulated blocks
+                # (FFTs are cached, only the demod is repaid) and reset the
+                # correction's calibration so redone blocks do not vote
+                # twice.
+                if (
+                    self.rf.options.head_switch != 0
+                    and not self.rf.__dict__.get("_head_switch_redone", False)
+                    and luma_amplitude.block_model(self.rf) is not None
+                ):
+                    self.rf.__dict__["_head_switch_redone"] = True
+                    self.rf.__dict__.pop("_head_switch_cal", None)
+                    if not redo:
+                        redo = self.fdoffset - offset
+
                 if adjusted is False and redo:
-                    self.demodcache.flush_demod()
+                    # No direct flush_demod() here: decodefield passes the
+                    # redo offset as forceredo, and read() performs the
+                    # flush under the cache lock - the unlocked flush this
+                    # branch used to make raced against the worker.
                     adjusted = True
                     self.fdoffset = redo
                 else:
@@ -763,8 +805,13 @@ class VHSRFDecode(ldd.RFDecode):
                 "chroma_offset",
                 "cagc_fields",
                 "chroma_env_gain",
-                "luma_deviation",
+                "luma_transient",
+                "luma_beat",
                 "luma_eq",
+                "head_switch",
+                "carrier_tbc",
+                "inverse_eq",
+                "lti_gain",
                 "cti_mix",
                 "cti_width",
                 "ire0_adjust",
@@ -812,8 +859,13 @@ class VHSRFDecode(ldd.RFDecode):
             int(self.DecoderParams.get("chroma_offset", 5) * (self.freq / 40.0)),
             rf_options.get("cagc_fields", 0),
             rf_options.get("chroma_env_gain", 0),
-            rf_options.get("luma_deviation", False),
+            rf_options.get("luma_transient", 0),
+            rf_options.get("luma_beat", 0),
             rf_options.get("luma_eq", 0),
+            rf_options.get("head_switch", 0),
+            rf_options.get("carrier_tbc", 0),
+            rf_options.get("inverse_eq", -1),
+            rf_options.get("lti_gain", None),
             rf_options.get("cti_mix", 1),
             rf_options.get("cti_width", 2),
             ire0_adjust,
@@ -1292,86 +1344,22 @@ class VHSRFDecode(ldd.RFDecode):
         self.delays["video_sync"] = 0
         self.delays["video_white"] = 0
 
-    def demodblock(
-        self, data=None, mtf_level=0, fftdata=None, cut=False, thread_benchmark=False
-    ):
-        rv = {}
-        demod_block_debug = False
-        demod_start_time = time.time()
-        if fftdata is not None:
-            indata_fft = fftdata
-        elif data is not None:
-            indata_fft = npfft.fft(data[: self.blocklen])
-        else:
-            raise Exception("demodblock called without raw or FFT data")
+    def _demodulate_to_video(self, hilbert, envelope=None, calibrate=True):
+        """Analytic RF to de-emphasised video - the whole post-demodulation chain.
 
-        if data is None:
-            data = npfft.ifft(indata_fft).real
+        Factored out so it can be run a second time on the signal as it was
+        BEFORE `--luma_eq` shaped it, when a debug plot asks to see what that
+        stage changed. Both passes then go through the same spike replacement,
+        video equalizer, chroma trap and de-emphasis stages, so what separates
+        the two results is the equalizer and nothing else.
 
-        if self.debug_plot and self.debug_plot.is_plot_requested("demodblock"):
-            demod_block_debug = True
-            # If we're doing a plot make a copy of the input to be able to plot it since we
-            # are modifying the data in place.
-            indata_fft_copy = indata_fft.copy()
+        `envelope` is the pre-equalization carrier amplitude, handed in where
+        `--head_switch` wants its residual measured against the raw RF.
 
-        if self._notch is not None:
-            indata_fft *= self.Filters["FVideoNotchF"]
-
-        # Applies RF filters
-        indata_fft *= self.Filters["RFVideo"]
-
-        # The hilbert mask makes an analytic signal, so its magnitude is the
-        # instantaneous carrier amplitude directly. Taking the magnitude of the
-        # real part instead is a full wave rectification, which carries a
-        # component at twice the carrier that the envelope would then have to be
-        # filtered to remove. No delay is introduced either way - every filter in
-        # this chain is zero phase - so there is none to compensate for.
-        #
-        # This is the same analytic signal the demodulator runs on, so it is kept
-        # rather than transformed a second time. It is rebuilt further down only
-        # if something between here and there has written to `indata_fft`.
-        hilbert = npfft.ifft(indata_fft * self.Filters["hilbert"])
-
-        # Single precision: the envelope drives dropout detection and the
-        # color-under amplitude correction, and neither needs more.
-        env = np.abs(hilbert).astype(np.single)
-        env_mean = np.mean(env)
-
-        # Boost high frequencies in areas where the signal is weak to reduce missed zero crossings
-        # on sharp transitions. Using filtfilt to avoid phase issues.
-        boosted = False
-        if env.min() > 0:  # checks for zeroes on env
-            if self._high_boost is not None:
-                data_filtered = npfft.ifft(indata_fft).real
-                high_part = sosfiltfilt_rust(self.Filters["RFTop"], data_filtered) * (
-                    (env_mean * 0.9) / env
-                )
-                del data_filtered
-                indata_fft += npfft.fft(high_part * self._high_boost)
-                boosted = True
-        else:
-            ldd.logger.warning("RF signal is weak. Is your deck tracking properly?")
-
-        # The luma path's own equalization, applied here and not with the RF
-        # filters above, so that the envelope has already been taken from the
-        # uncorrected signal. The envelope is a MEASUREMENT of the tape - it is
-        # what the color-under correction reads the head-to-tape loss from, and
-        # what dropout detection thresholds against - so a correction applied to
-        # the luma must not reach it. Measured, folding this in with `RFVideo`
-        # instead costs 17% of the chroma correction's benefit to buy 1.8% on
-        # the luma.
-        luma_eq = self.Filters.get("LumaPathEQ")
-        if luma_eq is not None:
-            indata_fft = indata_fft * luma_eq
-
-        # Only the two branches above can have moved `indata_fft` since the
-        # analytic signal was taken; where neither did, it still holds.
-        if boosted or luma_eq is not None:
-            hilbert = npfft.ifft(indata_fft * self.Filters["hilbert"])
-
-        if not demod_block_debug:
-            del indata_fft
-
+        Returns the de-emphasised video, the raw demodulated frequency, the
+        latter's spectrum (which the caller needs for the half-bandwidth
+        copy), and what the head switch correction subtracted, for the plot.
+        """
         # FM demodulator
         # test1 = np.angle(hilbert)
         # from vhsd_rust import complex_angle_py
@@ -1379,6 +1367,27 @@ class VHSRFDecode(ldd.RFDecode):
         # print(test1 - test2)
         # np.savez_compressed("hilbert_data", data=hilbert)
         demod = unwrap_hilbert(hilbert, self.freq_hz)
+
+        # The phase partner of the carrier amplitude residual - AM-induced
+        # noise, with head switch steps and dropout edges as its coherent
+        # extremes - cancelled first of all: the artifact is introduced
+        # after the tape is read, so it is removed before every stage that
+        # corrects what lies underneath it. See `head_switch`.
+        head_switch_trace = None
+        if self.options.head_switch != 0:
+            head_switch_trace = head_switch.correct(
+                self, demod, envelope, self.options.head_switch,
+                calibrate=calibrate,
+            )
+
+        # The luma path's transient artifact, taken out where it is created and
+        # before anything else has touched the signal. Everything below this
+        # point - the spike replacement, the video equalizer, the chroma trap,
+        # the de-emphasis stages - either reshapes the artifact or, in the case
+        # of the nonlinear sub-de-emphasis, stops a model derived here from
+        # composing at all. See `luma_transient`.
+        if self.options.luma_transient != 0:
+            luma_transient.correct(self, demod, self.options.luma_transient)
 
         # If there are obviously out of bounds values, do an extra demod on a diffed waveform and
         # replace the spikes with data from the diffed demod. (Which in practice is an extra EQed signal)
@@ -1449,6 +1458,115 @@ class VHSRFDecode(ldd.RFDecode):
                 self.Filters["fsc_notch"][0], self.Filters["fsc_notch"][1], out_video
             )
 
+        return out_video, demod, demod_fft, head_switch_trace
+
+    def demodblock(
+        self, data=None, mtf_level=0, fftdata=None, cut=False, thread_benchmark=False
+    ):
+        rv = {}
+        demod_block_debug = False
+        demod_start_time = time.time()
+        if fftdata is not None:
+            indata_fft = fftdata
+        elif data is not None:
+            indata_fft = npfft.fft(data[: self.blocklen])
+        else:
+            raise Exception("demodblock called without raw or FFT data")
+
+        if data is None:
+            data = npfft.ifft(indata_fft).real
+
+        if self.debug_plot and self.debug_plot.is_plot_requested("demodblock"):
+            demod_block_debug = True
+            # If we're doing a plot make a copy of the input to be able to plot it since we
+            # are modifying the data in place.
+            indata_fft_copy = indata_fft.copy()
+
+        if self._notch is not None:
+            indata_fft *= self.Filters["FVideoNotchF"]
+
+        # Applies RF filters
+        indata_fft *= self.Filters["RFVideo"]
+
+        # The hilbert mask makes an analytic signal, so its magnitude is the
+        # instantaneous carrier amplitude directly. Taking the magnitude of the
+        # real part instead is a full wave rectification, which carries a
+        # component at twice the carrier that the envelope would then have to be
+        # filtered to remove. No delay is introduced either way - every filter in
+        # this chain is zero phase - so there is none to compensate for.
+        #
+        # This is the same analytic signal the demodulator runs on, so it is kept
+        # rather than transformed a second time. It is rebuilt further down only
+        # if something between here and there has written to `indata_fft`.
+        hilbert = npfft.ifft(indata_fft * self.Filters["hilbert"])
+
+        # Single precision: the envelope drives dropout detection and the
+        # color-under amplitude correction, and neither needs more.
+        env = np.abs(hilbert).astype(np.single)
+        env_mean = np.mean(env)
+
+        # Boost high frequencies in areas where the signal is weak to reduce missed zero crossings
+        # on sharp transitions. Using filtfilt to avoid phase issues.
+        boosted = False
+        if env.min() > 0:  # checks for zeroes on env
+            if self._high_boost is not None:
+                data_filtered = npfft.ifft(indata_fft).real
+                high_part = sosfiltfilt_rust(self.Filters["RFTop"], data_filtered) * (
+                    (env_mean * 0.9) / env
+                )
+                del data_filtered
+                indata_fft += npfft.fft(high_part * self._high_boost)
+                boosted = True
+        else:
+            ldd.logger.warning("RF signal is weak. Is your deck tracking properly?")
+
+        # The luma path's own equalization, applied here and not with the RF
+        # filters above, so that the envelope has already been taken from the
+        # uncorrected signal. The envelope is a MEASUREMENT of the tape - it is
+        # what the color-under correction reads the head-to-tape loss from, and
+        # what dropout detection thresholds against - so a correction applied to
+        # the luma must not reach it. Measured, folding this in with `RFVideo`
+        # instead costs 17% of the chroma correction's benefit to buy 1.8% on
+        # the luma.
+        luma_eq = self.Filters.get("LumaPathEQ")
+        unequalized = None
+        if luma_eq is not None:
+            if self.debug_plot and self.debug_plot.is_plot_requested("luma_noise"):
+                # The spectrum the equalizer is about to shape, demodulated
+                # separately below so the plot can show what it changed. Taken
+                # after the high frequency boost, if that fired, so the two
+                # differ by the equalizer alone.
+                unequalized = (
+                    npfft.ifft(indata_fft * self.Filters["hilbert"])
+                    if boosted
+                    else hilbert
+                )
+            indata_fft = indata_fft * luma_eq
+
+        # Only the two branches above can have moved `indata_fft` since the
+        # analytic signal was taken; where neither did, it still holds.
+        if boosted or luma_eq is not None:
+            hilbert = npfft.ifft(indata_fft * self.Filters["hilbert"])
+
+        if not demod_block_debug:
+            del indata_fft
+
+        out_video, demod, demod_fft, head_switch_trace = self._demodulate_to_video(
+            hilbert, envelope=env
+        )
+
+        # The same field as it would have been without the equalizer, for the
+        # plot that draws the two against each other. Built only where that
+        # plot asked `unequalized` to be kept. It receives the same head
+        # switch correction as the main pass, so the difference between the
+        # two stays the equalizer's alone - but it must not feed the
+        # correction's calibration: a differently equalized channel voting
+        # in the same regression would bias the measured gain.
+        if unequalized is not None:
+            unequalized = self._demodulate_to_video(
+                unequalized, envelope=env, calibrate=False
+            )[0]
+
         out_video05 = npfft.irfft(demod_fft * self.Filters["FVideo05"]).real
         out_video05 = np.roll(out_video05, -self.Filters["F05_offset"])
 
@@ -1503,8 +1621,14 @@ class VHSRFDecode(ldd.RFDecode):
         # demod_burst is a bit misleading, but keeping the naming for compatability.
         if (
             self.options.chroma_env_gain > 0
-            or self.options.luma_deviation
             or self.options.luma_eq != 0
+            or self.options.luma_transient != 0
+            # --head_switch consumes the amplitude stage's block model, which
+            # is fed by the field-level measurement, which needs this channel.
+            or self.options.head_switch != 0
+            # --carrier_tbc refines the time base from the carrier's own
+            # sync-edge trace, which is measured on this channel.
+            or self.options.carrier_tbc != 0
         ):
             # The color-under amplitude correction models the carrier amplitude
             # as a function of the instantaneous carrier frequency, so it needs
@@ -1528,6 +1652,29 @@ class VHSRFDecode(ldd.RFDecode):
                 "demod_burst": out_chroma,
                 "envelope": env,
             }
+
+        if unequalized is not None:
+            # Carried as a channel so it is cut and assembled with the rest and
+            # arrives at the plot on the same sample grid as `demod`.
+            video_out["demod_noeq"] = unequalized
+
+        if (
+            self.options.head_switch != 0
+            and self.debug_plot
+            and self.debug_plot.is_plot_requested("luma_noise")
+        ):
+            # What the head switch correction subtracted, in IRE. A channel
+            # for the same reason as `demod_noeq`: it is cut and assembled
+            # with the rest, so the plot draws it against the very samples it
+            # corrected. Every block must carry it once the flag and the plot
+            # are on - the block assembly concatenates by name - so a block
+            # where nothing was subtracted (or the model does not exist yet)
+            # carries zeros.
+            video_out["head_switch"] = (
+                head_switch_trace
+                if head_switch_trace is not None
+                else np.zeros(len(out_video), dtype=np.single)
+            )
 
         rv["video"] = (
             {

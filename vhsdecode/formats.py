@@ -21,6 +21,14 @@ MAX_WOW = 1.06
 SysParams_NTSC["analog_audio"] = False
 SysParams_PAL["analog_audio"] = False
 
+# How many head switch pulses a field carries. A two-head helical drum makes
+# one revolution per frame with one head per field, so the switch between
+# heads happens exactly once per field - the default for every format here.
+# Formats whose transport switches more often (quadruplex sweeps several
+# head passes per field) override this in their own definition.
+SysParams_NTSC["head_switches_per_field"] = 1
+SysParams_PAL["head_switches_per_field"] = 1
+
 TAPE_SPEEDS = {"sp": 0, "lp": 1, "ep": 2, "slp": 2, "vp": 3}
 
 

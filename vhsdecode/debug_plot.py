@@ -531,6 +531,14 @@ def plot_luma_noise(
     linelocs,
     hz_to_ire,
     dropout_fraction,
+    demod_noeq=None,
+    ire_to_hz=None,
+    beat=None,
+    beat_locs=None,
+    head_switch=None,
+    head_switch_regions=None,
+    head_switch_expected=1,
+    wow_trace=None,
 ):
     """Luma carrier amplitude beside the luma it was demodulated from.
 
@@ -558,6 +566,37 @@ def plot_luma_noise(
     Shaded spans are the dropouts the decoder detected from this same envelope,
     so the plot shows both what the threshold caught and the shallower
     excursions it did not.
+
+    Where `--luma_beat` is running, a panel carries what the color-under beat
+    correction took out. The color-under amplitude modulates the luma FM
+    carrier, and what survives the demodulator lands in the picture at the
+    color-under's own frequency, where it is energy that has nothing to do with
+    the luma's image. It is drawn against the color-under beside it, because the
+    two should rise and fall together - the beat is the chroma, arriving where
+    it does not belong.
+
+    Where `--luma_eq` is running, the luma panel carries the demodulated field
+    twice - once as the equalizer left it and once as it would have been
+    without - and a panel below gives the difference. Both come from the same
+    post-demodulation chain, so what separates them is the equalizer alone.
+
+    Where `--head_switch` is running, the switch is LOCATED on the field's
+    own amplitude deviation - the sustained per-head offset, the signature
+    the phase kernel deliberately nulls and the applied trace can therefore
+    never show - and drawn as a span with a dashed entry line across the
+    shared axes. A panel below carries what the correction subtracted - the
+    phase artifact predicted from the carrier amplitude residual, in IRE -
+    so the located region and the removed transient are judged against the
+    envelope step and the luma beside them.
+
+    Where the carrier's sync-edge trace is available (`--carrier_tbc` or
+    `--head_switch` carries the channel it needs), a panel gives the
+    per-line line-period deviation that trace measured - the wow and
+    flutter itself, per head: this field's head beside the most recent
+    field the other head wrote, never averaged, because the two heads'
+    paths differ and an average would describe a machine that does not
+    exist. It is the one panel drawn against line number rather than RF
+    sample, so it alone does not pan with the others.
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -593,26 +632,70 @@ def plot_luma_noise(
 
     correction_window = slice_of(correction)
     deviation_window = slice_of(deviation)
+    luma_window = hz_to_ire(np.asarray(demod, dtype=float)[start_rf:end_rf])
+    noeq_window = (
+        hz_to_ire(np.asarray(demod_noeq, dtype=float)[start_rf:end_rf])
+        if demod_noeq is not None
+        else None
+    )
     has_correction = correction_window is not None
     can_score = deviation_window is not None and carrier_hz is not None
 
-    rows = 4 if has_correction else 3
+    # The modelled beat, already in IRE. It is made on the time base corrected
+    # picture's grid rather than this one, because that is the only place the
+    # decoded saturation it scales with exists - so it arrives with the RF
+    # sample position of each of its samples and is drawn against those, which
+    # puts it on the same axis as everything else.
+    beat_window = np.asarray(beat, dtype=float) if beat is not None else None
+    beat_at = np.asarray(beat_locs, dtype=float) if beat_locs is not None else None
+    if beat_window is not None and (
+        beat_at is None or len(beat_at) != len(beat_window)
+    ):
+        beat_window = None
+
+    switch_window = slice_of(head_switch)
+
+    # One row per panel, tallest where the detail is. Named rather than
+    # indexed: the arithmetic that did this broke every time a panel was added.
+    panels = [("env", 3), ("luma", 3), ("conf", 1)]
+    if deviation_window is not None:
+        panels.insert(1, ("delta", 2))
+    if has_correction:
+        panels.insert(0, ("corr", 2))
+    if noeq_window is not None:
+        panels.insert(panels.index(("conf", 1)), ("eqdelta", 2))
+    if beat_window is not None:
+        panels.insert(panels.index(("conf", 1)), ("beat", 2))
+    if switch_window is not None:
+        panels.insert(panels.index(("conf", 1)), ("switch", 2))
+    if wow_trace is not None:
+        panels.insert(panels.index(("conf", 1)), ("wow", 2))
+
     fig = plt.figure(figsize=(16, 9) if can_score else (14, 9))
     grid = fig.add_gridspec(
-        rows,
+        len(panels),
         2 if can_score else 1,
         width_ratios=[3, 1] if can_score else [1],
-        height_ratios=[2, 3, 3, 1] if has_correction else [3, 3, 1],
+        height_ratios=[height for _, height in panels],
     )
-    row = 0
-    ax_corr = None
-    if has_correction:
-        ax_corr = fig.add_subplot(grid[row, 0])
-        row += 1
-    ax_env = fig.add_subplot(grid[row, 0], **({"sharex": ax_corr} if ax_corr else {}))
-    anchor = ax_corr or ax_env
-    ax_luma = fig.add_subplot(grid[row + 1, 0], sharex=anchor)
-    ax_conf = fig.add_subplot(grid[row + 2, 0], sharex=anchor)
+    axes, anchor = {}, None
+    for position, (name, _) in enumerate(panels):
+        # The wow panel is per LINE where every other panel is per RF
+        # sample; sharing an axis across the two units would squash it into
+        # a corner, so it alone keeps its own.
+        share = anchor if name != "wow" else None
+        axes[name] = fig.add_subplot(
+            grid[position, 0], **({"sharex": share} if share is not None else {})
+        )
+        if anchor is None and name != "wow":
+            anchor = axes[name]
+    ax_corr = axes.get("corr")
+    ax_beat = axes.get("beat")
+    ax_switch = axes.get("switch")
+    ax_wow = axes.get("wow")
+    ax_delta = axes.get("eqdelta")
+    ax_departure = axes.get("delta")
+    ax_env, ax_luma, ax_conf = axes["env"], axes["luma"], axes["conf"]
     if can_score:
         right = grid[:, 1].subgridspec(2, 1, height_ratios=[3, 2], hspace=0.35)
         ax_resp = fig.add_subplot(right[0])
@@ -623,7 +706,7 @@ def plot_luma_noise(
     if ax_corr is not None:
         ax_corr.plot(
             samples, correction_window, color="tab:red", linewidth=0.5,
-            label="correction applied to the color-under",
+            label="gain applied to the color-under",
         )
         ax_corr.axhline(1.0, color="tab:grey", linestyle=":", linewidth=1)
         ax_corr.set_ylabel("chroma gain")
@@ -631,12 +714,12 @@ def plot_luma_noise(
 
     ax_env.plot(
         samples, window, color="tab:blue", linewidth=0.5, alpha=0.45,
-        label="carrier amplitude (what the correction measures)",
+        label="carrier amplitude, full bandwidth (drives the correction)",
     )
     if detection_window is not None:
         ax_env.plot(
             samples, detection_window, color="black", linewidth=0.7,
-            label="band limited (what the thresholds act on)",
+            label="band limited (drives dropout detection)",
         )
     ax_env.axhline(
         reference, color="tab:grey", linestyle=":", linewidth=1, label="field median"
@@ -647,7 +730,7 @@ def plot_luma_noise(
     )
     ax_env.axhline(
         threshold * hysteresis, color="tab:orange", linestyle="--", linewidth=1,
-        label="recovery (hysteresis)",
+        label="dropout recovery (hysteresis)",
     )
     ax_env.set_ylabel("carrier amplitude")
     ax_env.legend(loc="lower left", fontsize="small", ncol=2)
@@ -655,161 +738,351 @@ def plot_luma_noise(
     # response's slope, and in its shape - so the parity belongs on the plot.
     head = "first field (head A)" if is_first_field else "second field (head B)"
     (ax_corr or ax_env).set_title(
-        f"Color-under correction, the luma carrier amplitude it came from, "
-        f"detected dropouts, and the demodulated luma    [{head}]"
+        f"Luma carrier amplitude, the color-under correction it drives, "
+        f"and the demodulated luma   [{head}]"
     )
 
+    if ax_departure is not None:
+        # What the carrier amplitude does that the PICTURE does not explain.
+        # The amplitude leans across the field because the path responds to the
+        # carrier's own frequency, and the carrier's frequency is the picture;
+        # divide that out and what is left is the tape's, which is the whole
+        # object the correction acts on. Unity means the carrier sits exactly
+        # where its own frequency says it should.
+        ax_departure.plot(samples, deviation_window, color="tab:red",
+                          linewidth=0.5, label="amplitude with the picture removed")
+        ax_departure.axhline(1.0, color="tab:grey", linestyle=":", linewidth=1)
+        ax_departure.set_ylabel("deviation")
+        ax_departure.legend(loc="lower left", fontsize="small")
+        ax_departure.annotate(
+            f"{100.0 * float(np.std(deviation_window)):.2f}% rms",
+            xy=(0.995, 0.94), xycoords="axes fraction", ha="right", va="top",
+            fontsize="x-small",
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+        )
+
+    if noeq_window is not None:
+        # Drawn first, so the equalized trace sits on top of it.
+        ax_luma.plot(
+            samples, noeq_window, color="tab:grey", linewidth=0.6, alpha=0.8,
+            label="equalizer off",
+        )
     ax_luma.plot(
-        samples, hz_to_ire(demod[start_rf:end_rf]), color="tab:green",
-        linewidth=0.5, label="demodulated luma",
+        samples, luma_window, color="tab:green", linewidth=0.5,
+        label="equalizer on" if noeq_window is not None else "demodulated luma",
     )
     for level in (0, 100):
         ax_luma.axhline(level, color="tab:grey", linestyle=":", linewidth=1)
     ax_luma.set_ylabel("luma (IRE)")
     ax_luma.legend(loc="lower left", fontsize="small")
 
+    if ax_delta is not None:
+        # What the equalizer did, on the same axis as the luma above. It acts
+        # at transitions - on a carrier that is not sweeping the demodulator
+        # discards an amplitude change entirely - so this should sit at zero
+        # across flat content and lift at every edge.
+        delta = luma_window - noeq_window
+        ax_delta.plot(samples, delta, color="tab:red", linewidth=0.5)
+        ax_delta.axhline(0.0, color="tab:grey", linewidth=0.8)
+        ax_delta.set_ylabel("equalizer\ndelta (IRE)")
+        ax_delta.annotate(
+            f"{np.std(delta):.4f} IRE rms, peak {np.max(np.abs(delta)):.3f}",
+            xy=(0.995, 0.94), xycoords="axes fraction", ha="right", va="top",
+            fontsize="x-small",
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+        )
+
+    if ax_beat is not None:
+        # What the color-under put into the luma, and was taken back out. It is
+        # drawn on the luma's own scale so its size can be read directly against
+        # the picture above it.
+        #
+        # The envelope is the diagnostic rather than the waveform: the beat is a
+        # carrier at the color-under's frequency, far too fine to resolve across
+        # a field, and what carries the meaning is how tall it stands. It should
+        # rise on saturated colour and fall to nothing where there is none, and
+        # anywhere it stands tall over neutral content is the model reaching for
+        # something that is not there.
+        ax_beat.plot(beat_at, beat_window, color="tab:green", linewidth=0.4,
+                     alpha=0.55, label="modelled color-under beat")
+        envelope_span = max(len(beat_window) // 400, 8)
+        lifted = np.abs(
+            np.convolve(
+                np.abs(beat_window), np.ones(envelope_span) / envelope_span, mode="same"
+            )
+        ) * (np.pi / 2.0)
+        ax_beat.plot(beat_at, lifted, color="tab:red", linewidth=0.9,
+                     label="its envelope")
+        ax_beat.plot(beat_at, -lifted, color="tab:red", linewidth=0.9)
+        ax_beat.axhline(0.0, color="tab:grey", linewidth=0.8)
+        ax_beat.set_ylabel("beat removed\n(IRE)")
+        ax_beat.legend(loc="lower left", fontsize="small", ncol=2)
+        ax_beat.annotate(
+            f"{np.std(beat_window):.4f} IRE rms, peak {np.max(np.abs(beat_window)):.3f}",
+            xy=(0.995, 0.94), xycoords="axes fraction", ha="right", va="top",
+            fontsize="x-small",
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+        )
+
+    if head_switch_regions:
+        # The switch as LOCATED on the field's own deviation. Its robust
+        # signature is a sustained amplitude offset, which the phase kernel
+        # nulls by design - so the applied trace can never show it, and the
+        # marker must come from the measurement instead. Span and line on
+        # the shared axes so the region reads against the envelope step
+        # above and the luma beside it.
+        for i, (r_start, r_end, _off, _sig) in enumerate(head_switch_regions):
+            for ax in (ax_env, ax_departure, ax_luma, ax_switch):
+                if ax is None:
+                    continue
+                ax.axvspan(r_start, r_end, color="tab:brown", alpha=0.15,
+                           linewidth=0)
+                ax.axvline(
+                    r_start, color="tab:brown", linestyle="--", linewidth=1,
+                    label="head switch" if (i == 0 and ax is ax_env) else None,
+                )
+        ax_env.legend(loc="lower left", fontsize="small")
+
+    if ax_switch is not None:
+        # What the correction subtracted, on the luma's own scale. Zero
+        # wherever the residual sat inside the block's own background; what
+        # stands in it is the transient side of the story, judged against
+        # the located region above.
+        ax_switch.plot(samples, switch_window, color="tab:red", linewidth=0.6,
+                       label="head switch / dropout transient removed")
+        ax_switch.axhline(0.0, color="tab:grey", linewidth=0.8)
+        ax_switch.set_ylabel("switch removed\n(IRE)")
+        ax_switch.legend(loc="lower left", fontsize="small")
+
+        if head_switch_regions:
+            r_start, r_end, off_db, sigma = max(
+                head_switch_regions, key=lambda r: abs(r[2])
+            )
+            lines = np.searchsorted(np.asarray(linelocs, dtype=float),
+                                    [r_start, r_end])
+            found = (
+                f"switch: lines {lines[0]}-{lines[1]}, {off_db:+.2f} dB, "
+                f"{sigma:.0f} sigma; {len(head_switch_regions)} region(s), "
+                f"format expects {head_switch_expected}"
+            )
+        elif head_switch_regions is not None:
+            found = "no switch located on this field's deviation"
+        else:
+            found = f"format expects {head_switch_expected}/field"
+        ax_switch.annotate(
+            f"{found} | removed {np.std(switch_window):.4f} IRE rms, "
+            f"peak {np.max(np.abs(switch_window)) if len(switch_window) else 0.0:.3f}",
+            xy=(0.995, 0.94), xycoords="axes fraction", ha="right", va="top",
+            fontsize="x-small",
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+        )
+
+    if ax_wow is not None:
+        # The per-line line-period deviation off the carrier's sync-edge
+        # trace - the wow and flutter, drawn per head and never averaged.
+        # Same colours and names as `plot_luma_averaging`, so a head keeps
+        # its identity across the two plots.
+        colours = {True: "tab:blue", False: "tab:red"}
+        names = {True: "head A", False: "head B"}
+        head = bool(wow_trace["head"])
+        other = wow_trace.get("other_head")
+        if other is not None:
+            other = np.asarray(other, dtype=float)
+            ax_wow.plot(
+                np.arange(len(other)), other, color=colours[not head],
+                linewidth=0.8, alpha=0.55,
+                label=f"{names[not head]} (previous field)",
+            )
+        current = np.asarray(wow_trace["deviation"], dtype=float)
+        ax_wow.plot(
+            np.arange(len(current)), current, color=colours[head],
+            linewidth=0.9, label=f"{names[head]} (this field)",
+        )
+        ax_wow.axhline(0.0, color="tab:grey", linewidth=0.8)
+        ax_wow.set_ylabel("line period\ndeviation (%)")
+        ax_wow.set_xlabel("line number")
+        ax_wow.legend(loc="lower left", fontsize="small", ncol=2)
+        finite = current[np.isfinite(current)]
+        if len(finite):
+            ax_wow.annotate(
+                f"{np.std(finite):.4f}% rms over {len(finite)} lines",
+                xy=(0.995, 0.94), xycoords="axes fraction", ha="right", va="top",
+                fontsize="x-small",
+                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+            )
+
     ax_conf.plot(samples, confidence, color="tab:purple", linewidth=0.5)
     ax_conf.set_ylim(0, 1.05)
-    ax_conf.set_ylabel("correction\nconfidence")
+    ax_conf.set_ylabel("chroma correction\nconfidence")
     ax_conf.set_xlabel("RF sample")
 
     if ax_resp is not None:
-        # Both quantities against the luma level that produced them. The
-        # response the correction removes shows as a lean in the amplitude;
-        # what is left in the deviation is luma that survived the removal.
+        # Both right hand panels are against the carrier's own FREQUENCY. The
+        # response is a function of frequency and of nothing else, and the luma
+        # level axis these used to carry is that same axis scaled - the carrier
+        # is linear in level - so nothing is lost and the quantity is read where
+        # it lives.
         carrier_window = np.asarray(carrier_hz, dtype=float)[start_rf:end_rf]
-        level = hz_to_ire(carrier_window)
-        edges = np.arange(-40.0, 122.0, 2.0)
-        index = np.digitize(level, edges) - 1
-        centres, before, after, spread = [], [], [], []
-        bin_hz, noise = [], []
+
+        # The format's own reference levels, on the anchor the response model
+        # is binned against - the SPECIFIED carrier frequencies, not the levels
+        # this decode has tracked. `luma_amplitude` anchors there deliberately,
+        # and on a tape decoded with `--ire0_adjust` the two have been measured
+        # 36 IRE apart, so marking the running ones here would put sync tip in a
+        # different place from where the model put it.
+        if ire_to_hz is None:
+            # `hz_to_ire` is affine, so two points invert it exactly.
+            f_low, f_high = 3.4e6, 4.4e6
+            ire_low, ire_high = hz_to_ire(f_low), hz_to_ire(f_high)
+            slope_hz = (f_high - f_low) / (ire_high - ire_low)
+
+            def ire_to_hz(ire):
+                return f_low + (ire - ire_low) * slope_hz
+
+        hz_per_ire = ire_to_hz(1.0) - ire_to_hz(0.0)
+
+        # Binned at twice the module's own resolution - it describes the curve
+        # at one point per IRE, and two at a time leaves each bin enough samples
+        # to take a median of.
+        edges = np.arange(ire_to_hz(-40.0), ire_to_hz(122.0), 2.0 * hz_per_ire)
+        index = np.digitize(carrier_window, edges) - 1
+        centres, before, after, spread, noise, counts = [], [], [], [], [], []
         for b in range(len(edges) - 1):
             sel = index == b
             if np.count_nonzero(sel) < 64:
                 continue
             centres.append((edges[b] + edges[b + 1]) / 2.0)
+            counts.append(np.count_nonzero(sel))
             before.append(np.median(window[sel]) / reference)
             after.append(np.median(deviation_window[sel]))
             lo, hi = np.percentile(deviation_window[sel], (25, 75))
             spread.append((lo, hi))
-            bin_hz.append(np.median(carrier_window[sel]))
             # robust, because dropouts sit in the low tail and would otherwise
             # set the scale
             here = deviation_window[sel]
             noise.append(np.median(np.abs(here - np.median(here))) * 1.4826)
-        if centres:
+
+        centres = np.asarray(centres)
+        before, after = np.asarray(before), np.asarray(after)
+        counts = np.asarray(counts, dtype=float)
+        # The standard error of each bin's own median, 1.2533 sigma / sqrt(n).
+        # Bins differ in population by a factor of a hundred here, so a trace
+        # drawn without this reads its thinnest bin as response when it is
+        # sampling: measured, the best sampled third of the bins is flat to
+        # 0.26% rms where the thinnest third swings 7.5% peak to peak.
+        error = 1.2533 * np.asarray(noise) / np.sqrt(np.maximum(counts, 1.0))
+        model_total = model_line = after_line = None
+        if len(centres):
+            mhz = centres / 1e6
             spread = np.array(spread)
-            ax_resp.fill_between(
-                centres, spread[:, 0], spread[:, 1], color="tab:red", alpha=0.15,
-                linewidth=0, label="deviation, interquartile",
-            )
-            ax_resp.plot(
-                centres, before, color="tab:blue", marker=".",
-                label="carrier amplitude / median",
-            )
-            ax_resp.plot(
-                centres, after, color="tab:red", marker=".",
-                label="deviation (response removed)",
-            )
-            # The whole response that was actually divided out, straight from
-            # the two traces above and needing no model to state: the decoder's
-            # own RF path and the separation loss fitted on top of it. Each
-            # curve is shown against its own mean, so what is comparable is the
-            # shape rather than a level.
-            # The model, on the SAME reference as the carrier amplitude above:
-            # `before` is A(f)/median and `after` is A(f)/model(f), so their
-            # ratio is model(f)/median directly. Nothing further is normalised
-            # into it - the point of drawing it is that the blue trace divided
-            # by this one IS the red trace, and any extra scaling here would
-            # break that relationship and hide where the model departs from the
+
+            # The whole model that was divided out, straight from the two
+            # measured traces and needing nothing else to state it: `before` is
+            # A(f)/median and `after` is A(f)/model(f), so their ratio is
+            # model(f)/median directly. Nothing further is normalised into it -
+            # the point of drawing it is that the measured trace divided by this
+            # one IS the corrected trace, and any extra scaling here would break
+            # that relationship and hide where the model departs from the
             # amplitude it is supposed to describe.
-            removed_total = np.asarray(before) / np.maximum(np.asarray(after), 1e-9)
+            model_total = before / np.maximum(after, 1e-9)
+            roll_off = (
+                f"{response.separation[2] * 1e6:+.2f}/MHz"
+                if response is not None else "fitted"
+            )
+
+            # The roll-off's share of that model. Inside the described range
+            # the model IS the measurement, so the dense term is the departure
+            # itself; dividing it out leaves the line alone, on the same
+            # reference as everything else.
+            model_line = model_total.copy()
+            model_db = None
+            if response is not None and len(getattr(response, "described", ())):
+                from vhsdecode.luma_amplitude import _LOG_TO_DB
+
+                described_hz = np.asarray(response.described_hz, dtype=float)
+                centre_hz, level_at_centre, slope = response.separation
+                line = level_at_centre + slope * (described_hz - centre_hz)
+                described = np.asarray(response.described, dtype=float)
+                # The model in force. Inside the described range it IS the
+                # measurement - nothing is held back - so the two traces below
+                # coincide there by design, and where they part is the edge of
+                # the range, past which the line takes over.
+                departure = described - line
+                dense = departure
+                model_db = _LOG_TO_DB * dense
+                inside = (centres >= described_hz[0]) & (centres <= described_hz[-1])
+                model_line[inside] = model_total[inside] / np.exp(
+                    np.interp(centres[inside], described_hz, dense)
+                )
+            after_line = before / np.maximum(model_line, 1e-9)
+
             ax_resp.plot(
-                centres, removed_total, color="tab:cyan",
-                linestyle="-", linewidth=1.2,
-                label="response removed (blue / this = red)",
+                mhz, before, color="tab:blue", marker=".", markersize=4,
+                label="measured luma frequency response",
+            )
+            ax_resp.plot(
+                mhz, model_line, color="tab:blue", linestyle="--", linewidth=1.2,
+                label=f"fitted roll-off ({roll_off})",
+            )
+            ax_resp.plot(
+                mhz, model_total, color="tab:cyan", linewidth=1.4,
+                # Named for what it is. This curve is the measured trace divided
+                # by the corrected one, so it cannot disagree with them and is
+                # not independent evidence that the model is right.
+                label="model removed (= measured / corrected)",
+            )
+            ax_resp.plot(
+                mhz, after, color="tab:red", marker=".", markersize=4,
+                label="corrected frequency response",
+            )
+            ax_resp.fill_between(
+                mhz, spread[:, 0], spread[:, 1], color="tab:red", alpha=0.13,
+                linewidth=0, label="corrected, interquartile range",
             )
             if response is not None and len(getattr(response, "described", ())):
-                # What the model is actually fitted from: the steadiest samples
-                # only, pooled per head across the decode. The blue trace above
-                # is every sample, which is a different population - they are
-                # not expected to agree where a level is only passed through.
-                described_ire = hz_to_ire(np.asarray(response.described_hz, dtype=float))
-                # Drawn as what it is fitted from DIVIDED BY what the model
-                # made of it, so unity means the correction followed its own
-                # measurement and a departure marks a frequency where something
-                # else won. Its own scale would not answer that: this is the
-                # FLATTENED response, with the decoder's RF filter already
-                # divided out, so against blue and cyan - which still carry that
-                # filter - it shares no reference and its shape is mostly the
-                # filter's, not the path's.
+                # The dense term on its own axis, in dB, because what it
+                # describes is the DEPARTURE from the response's straight line -
+                # and because the measurement it is built from has the decoder's
+                # own RF filter divided out of it, so it shares no reference
+                # with the traces above and laying it over them would compare
+                # two different quantities.
                 #
-                # Every point is `share * described + (1 - share) * line`, so
-                # the ratio is exactly `exp((1 - share) * (described - line))`:
-                # the line's pull, and nothing else, since inside this range the
-                # model has no other term.
-                from vhsdecode.luma_amplitude import CURVE_MINIMUM_POPULATION
-
-                centre_hz, level_at_centre, slope = response.separation
-                line = level_at_centre + slope * (
-                    np.asarray(response.described_hz, dtype=float) - centre_hz
-                )
-                weight = np.asarray(response.described_weight, dtype=float)
-                share = weight / (weight + CURVE_MINIMUM_POPULATION)
-                followed = np.exp(
-                    (1.0 - share) * (np.asarray(response.described, dtype=float) - line)
-                )
-                ax_resp.plot(
-                    described_ire, followed,
-                    color="tab:green", linewidth=1.1, alpha=0.8,
-                    label="model / what it is fitted from (1 = followed)",
-                )
-            if response is not None:
-                # And the fitted part of it on its own. Separation loss is
-                # exp(-2 pi d / wavelength) with the recorded wavelength going
-                # as 1/frequency, so the whole of it is a straight line in the
-                # logarithm - and a line is all that survives contact with the
-                # measurement, because anything freer starts fitting the
-                # picture rather than the path.
-                centre_hz, level_at_centre, slope = response.separation
-                fitted = np.exp(slope * (np.asarray(bin_hz) - centre_hz))
-                ax_resp.plot(
-                    centres, fitted / fitted.mean(), color="tab:blue",
-                    linestyle="--", linewidth=1.2,
-                    label=f"separation loss fitted ({slope * 1e6:+.2f}/MHz)",
-                )
+                # What is drawn is the model the correction APPLIES, beside the
+                # measurement it was built from and the part it left behind. An
+                # echo fit stood here and was removed: it described the ripple
+                # closely and was applied to nothing, which is exactly how a
+                # panel comes to show a model working when it is not.
+                if model_db is not None:
+                    ripple_ax = ax_resp.twinx()
+                    # ONE curve, because inside the described range the model and
+                    # the measurement are the same array - `dense` is `departure`.
+                    # Drawing both put an invisible trace under an identical one
+                    # and invited the reading that they agreed about something.
+                    # If a residual is ever wanted here it has to be computed;
+                    # nothing in this function holds one.
+                    ripple_ax.plot(
+                        described_hz / 1e6, model_db,
+                        color="tab:purple", linewidth=1.4,
+                        label=f"measured departure = model applied, in full "
+                              f"({np.std(model_db):.3f} dB rms)",
+                    )
+                    ripple_ax.set_ylabel("departure (dB)")
+                    ripple_ax.legend(loc="lower left", fontsize="x-small")
         ax_resp.axhline(1.0, color="tab:grey", linestyle=":", linewidth=1)
         ax_resp.set_ylabel("relative amplitude")
-        ax_resp.set_title(
-            f"Response removal - {'head A' if is_first_field else 'head B'}"
-        )
+        ax_resp.set_title("Luma frequency response and the model removed",
+                          fontsize="medium")
         # Sync tip and blanking, the format's own two fixed levels, so the
         # curves can be read against something that is defined rather than
         # pictorial.
-        for level, name in ((-40.0, "sync tip"), (0.0, "blanking")):
-            ax_resp.axvline(level, color="tab:grey", linestyle="-.", linewidth=1,
-                            alpha=0.7)
-            ax_resp.annotate(name, xy=(level, 0.0), xycoords=("data", "axes fraction"),
+        for level, name in ((-40.0, "sync tip"), (0.0, "blanking"), (100.0, "peak white")):
+            ax_resp.axvline(ire_to_hz(level) / 1e6, color="tab:grey",
+                            linestyle="-.", linewidth=1, alpha=0.7)
+            ax_resp.annotate(name, xy=(ire_to_hz(level) / 1e6, 0.0),
+                             xycoords=("data", "axes fraction"),
                              xytext=(2, 3), textcoords="offset points",
                              fontsize="x-small", color="tab:grey",
                              rotation=90, va="bottom", ha="left")
-        if centres:
-            # How much of the level-dependent swing the fit actually took out.
-            # Peak to peak rather than a slope, because what is left is not
-            # necessarily a straight line - a quadratic cannot follow every
-            # shape the path has.
-            swing_before = float(np.ptp(before))
-            swing_after = float(np.ptp(after))
-            removed = 1.0 - swing_after / swing_before if swing_before else 0.0
-            ax_resp.annotate(
-                f"level-dependent swing\n{swing_before * 100:.1f}% -> "
-                f"{swing_after * 100:.1f}% p-p\n{removed * 100:.0f}% removed",
-                xy=(0.03, 0.03),
-                xycoords="axes fraction",
-                fontsize="small",
-                va="bottom",
-                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
-            )
         # Room made for the legend rather than the legend laid over the traces:
         # every curve in here matters and one hidden behind a box is a curve
         # that gets misread.
@@ -818,59 +1091,69 @@ def plot_luma_noise(
         ax_resp.legend(loc="upper right", fontsize="small", framealpha=0.95)
         ax_resp.grid(alpha=0.3)
 
-    if ax_model is not None:
-        # Not what the correction leaves behind - that is the deviation, drawn
-        # in red above. This is the departure of the measurement from the LINE,
-        # which is exactly the part the dense fit supplies on top of it, so it
-        # shows how much of the response a straight line would have missed.
-        # Beside it, how noisy the measurement is at each level, which is a
-        # property of the path rather than of the picture.
-        if centres:
-            noise_db = np.asarray(noise) * 8.686
-            ax_model.plot(
-                centres, noise_db, color="tab:purple", marker=".",
-                label="noise (spread of the deviation) - follows the path",
+    if ax_model is not None and len(centres):
+        # What is left at each stage of the removal. Flat is the objective:
+        # anything sloping here is response the model did not describe, and it
+        # is corrected onto the color-under as though it were tape noise.
+        mhz = centres / 1e6
+        stages = (
+            (before, "tab:grey", "uncorrected"),
+            (after_line, "tab:orange", "after the fitted roll-off"),
+            (after, "tab:red", "after the full model"),
+        )
+        for values, colour, name in stages:
+            if values is None:
+                continue
+            swing = float(np.ptp(values))
+            # Peak to peak is set by the single worst bin, which is reliably the
+            # emptiest one; the population weighted rms is what the response
+            # actually is.
+            centred = values - np.average(values, weights=counts)
+            weighted = float(np.sqrt(np.average(centred ** 2, weights=counts)))
+            ax_model.plot(mhz, values, color=colour, linewidth=1.2, marker=".",
+                          markersize=3,
+                          label=f"{name} ({swing * 100:.1f}% p-p, "
+                                f"{weighted * 100:.2f}% rms by evidence)")
+        if after is not None and len(error) == len(after):
+            ax_model.fill_between(
+                mhz, after - error, after + error, color="tab:red", alpha=0.18,
+                linewidth=0, label="corrected, one standard error of the median",
             )
-            ax_model.set_ylabel("noise (dB)")
-            ax_model.set_ylim(bottom=0.0)
-            if response is not None and len(response.residual):
-                # Held to the levels the panel above covers; beyond them the
-                # picture barely goes and a bin there is one excursion wide.
-                residual_ire = hz_to_ire(
-                    np.asarray(response.residual_hz, dtype=float)
-                )
-                inside = (residual_ire >= min(centres)) & (residual_ire <= max(centres))
-                twin = ax_model.twinx()
-                twin.plot(
-                    residual_ire[inside],
-                    np.asarray(response.residual, dtype=float)[inside] * 8.686,
-                    color="tab:orange", linewidth=0.9,
-                    label="what the dense fit adds to the line",
-                )
-                twin.axhline(0.0, color="tab:grey", linestyle=":", linewidth=1)
-                twin.set_ylabel("residual (dB)")
-                tlow, thigh = twin.get_ylim()
-                twin.set_ylim(tlow, thigh + 0.42 * (thigh - tlow))
-                handles = ax_model.get_legend_handles_labels()[0] + \
-                    twin.get_legend_handles_labels()[0]
-                labels = ax_model.get_legend_handles_labels()[1] + \
-                    twin.get_legend_handles_labels()[1]
-                ax_model.legend(handles, labels, loc="upper left", fontsize="small")
-            else:
-                ax_model.legend(loc="upper left", fontsize="small")
+        ax_model.axhline(1.0, color="tab:grey", linestyle=":", linewidth=1)
+        ax_model.set_ylabel("deviation")
+
+        # Beside it, how noisy the measurement is at each frequency - a property
+        # of the path rather than of the picture, which is what makes it safe to
+        # read where the residual mean is not.
+        twin = ax_model.twinx()
+        twin.plot(mhz, np.asarray(noise) * 8.686, color="tab:purple",
+                  linewidth=0.9, alpha=0.8, label="measurement noise")
+        twin.set_ylabel("noise (dB)")
+        twin.set_ylim(bottom=0.0)
+        tlow, thigh = twin.get_ylim()
+        twin.set_ylim(tlow, thigh + 0.42 * (thigh - tlow))
+
+        handles, labels = ax_model.get_legend_handles_labels()
+        extra = twin.get_legend_handles_labels()
+        ax_model.legend(handles + extra[0], labels + extra[1],
+                        loc="upper left", fontsize="small", framealpha=0.95)
         low, high = ax_model.get_ylim()
-        ax_model.set_ylim(low, high + 0.42 * (high - low))
-        for level in (-40.0, 0.0):
-            ax_model.axvline(level, color="tab:grey", linestyle="-.", linewidth=1,
-                             alpha=0.7)
-        ax_model.set_xlabel("luma level (IRE)")
-        ax_model.set_title("What the line alone would miss", fontsize="medium")
+        ax_model.set_ylim(low, high + 0.30 * (high - low))
+        for level in (-40.0, 0.0, 100.0):
+            ax_model.axvline(ire_to_hz(level) / 1e6, color="tab:grey",
+                             linestyle="-.", linewidth=1, alpha=0.7)
+        ax_model.set_xlabel("carrier frequency (MHz)")
+        ax_model.set_title("Deviation from the instantaneous frequency",
+                           fontsize="medium")
         ax_model.grid(alpha=0.3)
 
     for start, end in dropouts or []:
         if end < 0:
             end = end_rf
-        for ax in (ax_corr, ax_env, ax_luma, ax_conf):
+        for ax in (
+            ax_corr, ax_env, ax_departure, ax_luma, ax_beat, ax_switch,
+            ax_delta, ax_conf,
+        ):
             if ax is not None:
                 ax.axvspan(start, end, color="tab:red", alpha=0.3, linewidth=0)
 
@@ -899,21 +1182,26 @@ def plot_luma_averaging(probe, dod_threshold_p, source="", show=True):
     colours = {True: "tab:blue", False: "tab:red"}
     names = {True: "head A", False: "head B"}
 
-    # 1. The shrinkage in force. It cannot fall below a half: the range gate
-    #    admits a bin only at the same population that sets the blend's knee.
+    # 1. How much evidence stands behind each described bin. A graded shrinkage
+    #    was drawn here and is gone with the blend it measured - admission is
+    #    the only gate now, so what matters is which bins clear it and by how
+    #    far, not a share that is always one.
     ax = axes[0][0]
+    from vhsdecode.luma_amplitude import CURVE_MINIMUM_POPULATION
+
     for head, state in sorted(probe["luma"].items()):
-        if "share" not in state:
+        if "evidence" not in state:
             continue
-        ax.plot(state["share_hz"] / 1e6, state["share"], color=colours[head],
-                linewidth=1.1, label=f"{names[head]} ({state['fields']} fields)")
-    ax.axhline(0.5, color="tab:grey", linestyle=":", linewidth=1)
-    ax.annotate("floor of the range gate", xy=(0.02, 0.5), xycoords=("axes fraction", "data"),
+        ax.semilogy(state["evidence_hz"] / 1e6, np.maximum(state["evidence"], 1.0),
+                    color=colours[head], linewidth=1.1,
+                    label=f"{names[head]} ({state['fields']} fields)")
+    ax.axhline(CURVE_MINIMUM_POPULATION, color="tab:grey", linestyle=":", linewidth=1)
+    ax.annotate("admission gate", xy=(0.02, CURVE_MINIMUM_POPULATION),
+                xycoords=("axes fraction", "data"),
                 fontsize="x-small", color="tab:grey", va="bottom")
     ax.set_xlabel("carrier frequency (MHz)")
-    ax.set_ylabel("share of the measurement")
-    ax.set_title("1. Shrinkage actually in force")
-    ax.set_ylim(0.0, 1.05)
+    ax.set_ylabel("samples accumulated")
+    ax.set_title("1. Evidence behind each described bin")
     ax.legend(fontsize="x-small")
     ax.grid(alpha=0.3)
 
@@ -970,8 +1258,11 @@ def plot_luma_averaging(probe, dod_threshold_p, source="", show=True):
     for offset, (head, state) in enumerate(sorted(probe["luma"].items())):
         low = 100.0 * float(np.mean(state["clamp_low"]))
         high = 100.0 * float(np.mean(state["clamp_high"]))
-        ax.bar([offset - width / 2, offset + width / 2], [low, high], width,
-               color=[colours[head], colours[head]], alpha=[0.9, 0.45][0])
+        # Drawn as two bars rather than one call with a list of alphas -
+        # matplotlib takes a scalar there, so `[0.9, 0.45][0]` silently gave
+        # both bars the same shade and the high bar was then redrawn over
+        # itself to correct it.
+        ax.bar([offset - width / 2], [low], width, color=colours[head], alpha=0.9)
         ax.bar([offset + width / 2], [high], width, color=colours[head], alpha=0.45)
         ax.annotate(f"{low:.4f}%", xy=(offset - width / 2, low), ha="center",
                     va="bottom", fontsize="x-small")

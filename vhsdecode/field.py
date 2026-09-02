@@ -10,7 +10,13 @@ import matplotlib.pyplot as plt
 import vhsdecode.sync as sync
 import vhsdecode.formats as formats
 from vhsdecode.doc import detect_dropouts_rf
+from vhsdecode import carrier_tbc
 from vhsdecode import luma_amplitude
+from vhsdecode import luma_transient
+from vhsdecode.addons import ringing_cancellation
+from vhsdecode.addons.ringing_cancellation import (
+    apply_adaptive_luma_transient_improvement,
+)
 from vhsdecode.chroma import (
     apply_chroma_envelope_gain,
     decode_chroma,
@@ -1028,6 +1034,18 @@ class FieldShared:
         elif self.rf.color_system == "819":
             self.linecount = 410 if self.isFirstField else 409
 
+        # Feed the luma amplitude model on every valid field, whether or not
+        # the chroma path (which normally triggers the measurement) runs -
+        # the demodulator-side consumers read it through
+        # `luma_amplitude.block_model`, and a luma-only decode must feed it
+        # too. Memoized, so a field is never measured twice.
+        if (
+            getattr(self.rf.options, "luma_eq", 0)
+            or getattr(self.rf.options, "luma_transient", 0)
+            or getattr(self.rf.options, "head_switch", 0)
+        ) and getattr(self, "valid", False):
+            luma_amplitude.measured_amplitude_deviation(self)
+
     def hz_to_output(self, input):
         if type(input) is np.ndarray:
             if self.rf.options.export_raw_tbc:
@@ -1039,7 +1057,17 @@ class FieldShared:
                 if input.size == self.outlinecount * self.outlinelen:
                     ire0_adjust_padding = 4  # 4fsc, prevents noise around the hsync transitions from interfering with this measurement
 
-                    if "backporch" in self.rf.options.ire0_adjust:
+                    measured_porch = None
+                    if (
+                        "backporch" in self.rf.options.ire0_adjust
+                        or "hsync" in self.rf.options.ire0_adjust
+                    ):
+                        # The porch is measured whenever either mode needs
+                        # it: "backporch" re-anchors ire0 with it, and
+                        # "hsync" needs it for the GAIN - a scale derived
+                        # from one measured level and one assumed anchor is
+                        # not a measurement (the hsync-alone mode long
+                        # mixed the spec ire0 with the measured tip).
                         backporch_start = self.ire0_backporch[0] + ire0_adjust_padding
                         backporch_end = self.ire0_backporch[1] - ire0_adjust_padding
                         blank_levels = np.sort(
@@ -1054,10 +1082,12 @@ class FieldShared:
                                 for i in range(0, self.outlinecount)
                             ]
                         )
-                        ire0 = np.mean(
+                        measured_porch = np.mean(
                             blank_levels[self.outlinecount // 3 : (self.outlinecount * 2) // 3]
                         )
 
+                    if "backporch" in self.rf.options.ire0_adjust:
+                        ire0 = measured_porch
                         ldd.logger.debug("calculated ire0: %.02f", ire0)
 
                     if "hsync" in self.rf.options.ire0_adjust:
@@ -1080,8 +1110,11 @@ class FieldShared:
                             hsync_levels[self.outlinecount // 3 : (self.outlinecount * 2) // 3]
                         )
 
-                        # calculate scaling based difference between hsync pulse and ire0
-                        hz_ire = (ire0 - hsync_level) / -self.rf.DecoderParams["vsync_ire"]
+                        # calculate scaling from the difference between two
+                        # MEASURED levels: the porch and the hsync tip
+                        hz_ire = (measured_porch - hsync_level) / -self.rf.DecoderParams[
+                            "vsync_ire"
+                        ]
 
                         ldd.logger.debug("calculated hz_ire: %.02f", hz_ire)
 
@@ -1136,11 +1169,6 @@ class FieldShared:
         # having to be compensated for one afterwards.
         apply_chroma_envelope_gain(self)
 
-        # An extra channel for downstream analysis, when it was asked for. The
-        # measurement is shared with the correction above rather than repeated.
-        if self.rf.options.luma_deviation:
-            luma_amplitude.attach_luma_deviation(self)
-
         # The path's own frequency response, taken back out of the RF before
         # the next field is demodulated. Fitted here because this is where the
         # head is known, and applied a field later because that is the soonest
@@ -1148,6 +1176,13 @@ class FieldShared:
         # is coming.
         if self.rf.options.luma_eq != 0:
             luma_amplitude.update_luma_equalizer(self, self.rf.options.luma_eq)
+
+        # The transient correction is applied in the demodulator, which cannot
+        # know which head wrote the block it holds. What it needs from here is
+        # the line its model is stated against, taken once where the
+        # measurement has been made.
+        if self.rf.options.luma_transient != 0:
+            luma_transient.observe(self)
 
         # required to trigger the chroma downscaling to happen again (if this is run after scaling for some reason)
         self.chroma_tbc_buffer = None
@@ -1167,6 +1202,23 @@ class FieldShared:
         self.track_phase_set = True
 
     def downscale(self, final=False, *args, **kwargs):
+        if self.rf.options.carrier_tbc != 0 and not getattr(
+            self, "_carrier_tbc_applied", False
+        ):
+            # Carrier-refined time base: swap the refined line locations in
+            # BEFORE the parent downscale so `computewow_scaled` splines
+            # them - the resample map (timing) and the wowfactors (level
+            # adjust) improve together from the one spline.  The
+            # sync-derived array is stashed for inspection; where the trace
+            # is absent or fails its gates the field keeps it outright.
+            # See `carrier_tbc` for the physics and the gating.
+            refined = carrier_tbc.refine_linelocs(self)
+            if refined is not None:
+                self._linelocs_hsync = self.linelocs
+                self.linelocs = refined
+            # One-shot per field: a second downscale of the same field must
+            # not measure deltas against already-refined locations.
+            self._carrier_tbc_applied = True
         dsout, dsaudio, dsefm = super(FieldShared, self).downscale(final=False, *args, **kwargs)
 
         # hpf = utils.filter_simple(dsout, self.rf.Filters["NLHighPass"])
@@ -1176,6 +1228,71 @@ class FieldShared:
             dsout = y_comb(dsout, self.outlinelen, y_comb_value)
 
         if final:
+            # Horizontal-sync-interval artifact measurement, modeling and
+            # correction (ghost / ringing / smear - see
+            # ringing_cancellation).  Measures every field's sync
+            # intervals before correcting it, fits the artifact model,
+            # and inverts the modeled artifacts across the whole field.
+            # This replaces the older inverse-equalization pipeline.
+            # The hsync_model debug plot is available WITHOUT enabling
+            # the correction: with --debug_plot hsync_model alone the
+            # model is measured and shown per field while the output
+            # stays untouched (measure-only mode).
+            _ringing_enabled = self.rf.options.inverse_eq > -1
+            _ringing_plot = bool(
+                self.rf.debug_plot
+                and self.rf.debug_plot.is_plot_requested("hsync_model")
+            )
+            if _ringing_enabled or _ringing_plot:
+                dsout, lti_params = ringing_cancellation.process_field(
+                    dsout,
+                    ringing_cancellation.build_geometry(
+                        self.rf.SysParams,
+                        self.rf.DecoderParams,
+                        self.outlinelen,
+                        self.lineoffset,
+                        self.linecount,
+                    ),
+                    self.rf.DecoderParams["ire0"]
+                    + self.rf.DecoderParams["vsync_ire"] * self.rf.DecoderParams["hz_ire"],
+                    self.rf.DecoderParams["ire0"],
+                    shared_state=self.rf.__dict__.setdefault(
+                        "_ringing_state", {}
+                    ),
+                    average_fields=(
+                        self.rf.options.inverse_eq
+                        if _ringing_enabled
+                        else 4
+                    ),
+                    head_parity=bool(self.isFirstField),
+                    debug=_ringing_plot,
+                    apply_correction=_ringing_enabled,
+                )
+
+            # FEED FORWARD of the trained de-emphasis corner is BUILT BUT
+            # NOT ENABLED, and must not be until it has an observable
+            # that works. The tuner can only read the blanking interval
+            # (rule 1), and the sync tip disagrees with the picture about
+            # where the optimum is: on the same record-pin capture, the
+            # tip residual minimises at 1.30 us of RC while a
+            # flat-by-construction bar top minimises at 1.45-1.50 us.
+            # A linear shelf cannot satisfy both, which is itself the
+            # finding - VHS emphasis is non-linear, so the mismatch is
+            # not a single RC and the non-linear stage is the real knob.
+            # Enabling this drove the corner to its bound in the WRONG
+            # direction (tau 0.646 us).
+            #     self.rf.retune_deemphasis(lti_params['deemph_mid'])
+
+            # run luma transient improvement that restores sharp edges
+            # measurements in group delay correction can inform parameters so no artificial sharpening happens, and only the original slope is restored
+            if self.rf.options.inverse_eq > -1 and self.rf.options.lti_gain != 0:
+                lti_gain = self.rf.options.lti_gain if self.rf.options.lti_gain is not None else lti_params['gain']
+                apply_adaptive_luma_transient_improvement(
+                    dsout,
+                    gain=lti_gain,
+                    threshold=lti_params['threshold']
+                )
+
             dsout = self.hz_to_output(dsout)
             self.dspicture = dsout
 
@@ -1858,9 +1975,15 @@ class FieldShared:
             # TODO: make into a user facing option to enable / disable vsync levels
             self._refine_levels_from_vsync(line0loc, meanlinelen)
 
-            # Apply outputs to decoder parameters
+            # Apply outputs to decoder parameters. ire0 is the BLANKING
+            # level by definition; writing the sync tip here (as this line
+            # long did) displaced the running axis by the whole sync depth
+            # - the measured "36 IRE" mystery - for every consumer of the
+            # running parameters (sync thresholds, dropout ranges, the
+            # ringing model's anchors), while the picture escaped only
+            # because hz_to_output re-measures the porch per field.
             if "backporch" in self.rf.options.ire0_adjust:
-                self.rf.DecoderParams["ire0"] = self.sync_tip_level
+                self.rf.DecoderParams["ire0"] = self.blanking_level
             if "hsync" in self.rf.options.ire0_adjust:
                 self.rf.DecoderParams["hz_ire"] = (self.blanking_level - self.sync_tip_level) / -self.rf.DecoderParams["vsync_ire"]
 

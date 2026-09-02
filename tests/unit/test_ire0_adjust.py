@@ -79,6 +79,46 @@ def test_degenerate_field_falls_back_to_the_global_hz_ire():
     np.testing.assert_array_equal(guarded, backporch_only)
 
 
+def test_hsync_alone_derives_gain_from_two_measured_levels():
+    """The hsync submode's gain must come from measured-minus-measured.
+
+    Historically, requesting hsync without backporch mixed the assumed
+    DecoderParams ire0 with the measured hsync level - a scale that is not a
+    measurement. Now the porch is measured for the gain whenever hsync is
+    requested, so hsync-alone and backporch,hsync agree on hz_ire; they
+    differ only in whether ire0 is re-anchored.
+    """
+    inp = _flat_input()
+    for line in range(OUTLINECOUNT):
+        base = line * OUTLINELEN
+        inp[base : base + 74] = 4_000_000.0
+
+    from lddecode.utils import hz_to_output_array
+
+    f = _field("hsync")
+    out = FieldShared.hz_to_output(f, inp)
+    # measured porch 5e6, measured hsync 4e6 -> hz_ire 25000; ire0 stays the
+    # decoder parameter because re-anchoring was not requested.
+    expected = hz_to_output_array(
+        inp,
+        f.rf.DecoderParams["ire0"],
+        (5_000_000.0 - 4_000_000.0) / 40.0,
+        f.rf.SysParams["outputZero"],
+        f.rf.DecoderParams["vsync_ire"],
+        f.out_scale,
+    )
+    np.testing.assert_array_equal(out, expected)
+
+
+def test_hsync_alone_degenerate_field_still_guarded():
+    """The zero/non-finite gain guard covers the measured-measured path too."""
+    out = FieldShared.hz_to_output(_field("hsync"), _flat_input())
+    reference = FieldShared.hz_to_output(
+        _field("doesnotmatch"), _flat_input()
+    )
+    np.testing.assert_array_equal(out, reference)
+
+
 def test_healthy_field_still_uses_its_own_hz_ire():
     """The guard must not disturb a field whose windows read different levels.
 

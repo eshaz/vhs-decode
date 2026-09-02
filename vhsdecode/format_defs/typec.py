@@ -198,7 +198,12 @@ def get_rfparams_pal_quad(rfparams_pal):
 
 
 def get_sysparams_pal_quad(sysparams_pal):
-    return get_sysparams_pal_typec(sysparams_pal)
+    sysparams_pal = get_sysparams_pal_typec(sysparams_pal)
+    # Quadruplex: four heads on a transverse drum at 250 rev/s (50 Hz
+    # standards), so 4 * 250 / 50 = 20 head passes - and switches - land in
+    # every field, evenly spaced, rather than the helical formats' one.
+    sysparams_pal["head_switches_per_field"] = (4 * 250) // 50
+    return sysparams_pal
 
 
 def get_sysparams_819line_quad(sysparams_pal):

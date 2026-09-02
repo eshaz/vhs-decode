@@ -93,6 +93,10 @@ SysParams_NTSC = {
     "hsyncPulseUS": 4.7,
     "eqPulseUS": 2.3,
     "vsyncPulseUS": 27.1,
+    # SMPTE 170M-2004 table 1: front porch (blanking level before sync) 1.5 us,
+    # sync rise/fall time (10-90%) 0.140 us +-0.020
+    "frontPorchUS": 1.5,
+    "syncTransitionUS": 0.140,
     # What 0 IRE/0V should be in 16-bit digital output
     "outputZero": 1024,
     "fieldPhases": 4,
@@ -151,6 +155,10 @@ SysParams_PAL = {
     "hsyncPulseUS": 4.7,
     "eqPulseUS": 2.35,
     "vsyncPulseUS": 27.3,
+    # ITU-R BT.470 (System B/G) figure/table for 625-line: front porch 1.65 us,
+    # sync edge duration 0.2 us +-0.1
+    "frontPorchUS": 1.65,
+    "syncTransitionUS": 0.2,
     # What 0 IRE/0V should be in digitaloutput
     "outputZero": 256,
     "fieldPhases": 8,

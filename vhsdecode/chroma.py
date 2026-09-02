@@ -6,6 +6,7 @@ import scipy.signal as sps
 import scipy.fft as sps_fft
 from vhsdecode.rust_utils import sosfiltfilt_rust
 from vhsdecode import luma_amplitude
+from vhsdecode import luma_beat
 
 import numba
 from numba import njit
@@ -74,6 +75,13 @@ REFERENCE_TRACK_WIDTH = 58.0
 # The response is read off these rather than fitted through them, so they are
 # kept well above what a roll-off needs.
 TRANSFER_BANDS = 12
+
+# Burst amplitude below which the color killer decides the field carries no
+# color-under at all. It is the decoder's one definition of "is there a burst",
+# and anything that needs to ask reads it here rather than measuring its own.
+#
+# TODO Expose as option, possible this needs to be relative to the sync pulse and level detection
+BURST_MAGNITUDE_THRESHOLD = 2.5e4
 
 # Fields the measured response is averaged over. The regression is noisy in a
 # single field - the color-under's own picture content is the larger part of
@@ -1313,8 +1321,6 @@ def get_phase_rotation_sequence(
     track_change_threshold = 90
     burst_check_skip_lines = 16
 
-    # TODO Expose as option, possible this needs to be relative to the sync pulse and level detection
-    burst_magnitude_threshold = 2.5e4
 
     end = linesout + lineoffset
 
@@ -1426,7 +1432,7 @@ def get_phase_rotation_sequence(
                     # broadcasters would sometime turn on the burst mid-field, so attempt to detect that transition here
                     if (
                         prev_burst_detected_line == -1 # previous field had color killer activated
-                        and burst_detected_line == 0 and burst.magnitude > burst_magnitude_threshold # first burst that exceeds threshold
+                        and burst_detected_line == 0 and burst.magnitude > BURST_MAGNITUDE_THRESHOLD # first burst that exceeds threshold
                     ):
                         # first burst that exceeds threshold
                         # color killer will be active until this line, then it deactivates
@@ -1443,7 +1449,7 @@ def get_phase_rotation_sequence(
     burst_magnitude_avg /= avg_count
 
     if enable_color_killer:
-        if burst_magnitude_avg < burst_magnitude_threshold:
+        if burst_magnitude_avg < BURST_MAGNITUDE_THRESHOLD:
             # (re)activate color killer for the entire field
             burst_detected_line = -1
 
@@ -2462,6 +2468,27 @@ def filter_chroma_fft(
     return chroma_padded[pad_left : pad_left + N_raw]
 
 
+def luma_beat_wanted(field):
+    """Whether the color-under beat correction should run on this field.
+
+    Gated on the decoder's own burst detection rather than on a test of its own.
+    The color killer already decides whether a field carries color-under, and
+    where it does not there is no beat to cancel - only luma that leaked through
+    the chroma band pass, which is the one thing the fit must not lock onto.
+    Measured on this deck the burst stands at 26k to 33k on recordings with
+    colour and at 595 on one recorded without it, so the killer's own threshold
+    separates them by a wide margin.
+
+    `burst_magnitude_avg` is measured on every field whether or not `--ck` is
+    given, so this holds without it. With `--ck` the killer stops the chroma
+    earlier still, and the two agree.
+    """
+    return (
+        field.rf.options.luma_beat != 0
+        and getattr(field, "burst_magnitude_avg", 0.0) >= BURST_MAGNITUDE_THRESHOLD
+    )
+
+
 def process_chroma(
     field,
     disable_deemph=False,
@@ -2581,6 +2608,12 @@ def process_chroma(
         # this uses the burst measurements to interpolate the correct phase of the color under heterodyne
         # phase issues are corrected continiously for each sample using a linear spline interpolated from the burst measurements
         # the mixing is performed on the upsampled signal to avoid aliasing introduced from the up-heterodyne mixing product
+        if luma_beat_wanted(field):
+            # The color-under as the time base correction leaves it, before the
+            # up-conversion rewrites its phase. The beat in the luma carries the
+            # phase the TAPE held, which the burst-locked interpolation below is
+            # about to replace with a target one.
+            field.chroma_under_tbc = np.array(chroma, dtype=np.float64)
         upconvert_chroma_phase_comp(
             chroma, # modifies this in place
             lineoffset,
@@ -2791,6 +2824,7 @@ def chroma_transient_improvement(
                 chroma_data[idx] = i_curr + (current_mix * gate_mask) * (i_target - i_curr)
 
 
+
 def decode_chroma(field, do_chroma_deemphasis=False):
     if field.rf.options.write_chroma:
         """Do track detection if needed and upconvert the chroma signal"""
@@ -2803,6 +2837,17 @@ def decode_chroma(field, do_chroma_deemphasis=False):
             do_chroma_deemphasis=do_chroma_deemphasis,
         )
         field.uphet_temp = uphet
+        # The color-under's beat in the luma, taken out here because this is the
+        # first point the DECODED chroma exists - and its amplitude is the
+        # saturation the beat scales with. See `luma_beat`.
+        if luma_beat_wanted(field):
+            beat = luma_beat.correct(field, uphet, field.rf.options.luma_beat)
+            field.chroma_under_tbc = None
+            debug_plot = getattr(field.rf, "debug_plot", None)
+            if debug_plot and debug_plot.is_plot_requested("luma_noise"):
+                # Kept for the plot only. Dropout detection, which draws it,
+                # runs after this point.
+                field.luma_beat = beat
         # Release to avoid keeping this im memory - should do this in a cleaner manner.
         field.chroma_tbc_buffer = None
         return chroma_to_u16(uphet)
