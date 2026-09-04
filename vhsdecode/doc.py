@@ -197,10 +197,47 @@ def detect_dropouts_rf(field, dod_options):
                 else None
             ),
             head_switch_expected=field.rf.SysParams.get("head_switches_per_field", 1),
+            # THE OTHER HEAD's accumulated response, so the two can be read
+            # against each other. The heads differ measurably - in level, in
+            # the response's slope and in its shape - and a panel that shows
+            # only the field's own head cannot show that. Same convention as
+            # the wow panel directly below it: this field's head solid, the
+            # other faint, both named.
+            other_head_response=_other_head_response(field),
+            expected_response=_expected_response(field),
+            # What the baseband equalizer changed, in IRE at the raw
+            # demodulated site, for the folded sync-interval view.
+            baseband_eq=video.get("baseband_eq"),
             # The specified carrier frequencies, which is the anchor the
             # response model is binned on - see `carrier_frequency_bins`.
             ire_to_hz=lambda ire: field.rf.iretohz(ire, spec=True),
             wow_trace=wow_trace,
+        )
+
+    export_path = getattr(field.rf, "_head_switch_export", None)
+    if export_path and field.rf.options.head_switch != 0:
+        # The measured transfer as of this field, for offline reconciliation.
+        head_switch.export_measured_transfer(field.rf, export_path)
+
+    if debug_plot and debug_plot.is_plot_requested("sync_step_fold"):
+        from vhsdecode.debug_plot import plot_sync_step_fold
+
+        # The decoded line folded over the field's lines against the
+        # level-adjusted specified sync pulse, with what the baseband
+        # equalizer changed (zeros when it is not running) - the residual
+        # against the ideal is the measurement the equalizer's closed loop
+        # refines on.
+        video = field.data["video"]
+        plot_sync_step_fold(
+            video["demod"],
+            video.get("baseband_eq"),
+            field.linelocs,
+            start_rf,
+            end_rf,
+            field.rf.hztoire,
+            field.rf.SysParams,
+            field.rf.freq_hz,
+            field.isFirstField,
         )
 
     if debug_plot and debug_plot.is_plot_requested("luma_averaging"):
@@ -270,6 +307,41 @@ def map_dropouts_rf_to_tbc(errlist, start_line_idx, end_line_idx, linelocs, outl
                     rv_lines.append(line_idx - lineoffset)
 
     return rv_lines, rv_starts, rv_ends
+
+
+def _expected_response(field):
+    """THIS head's accumulated luma response - the model the residual is
+    measured against.
+
+    The field's own `ResponseModel` carries the model that was in force when
+    that field was measured, and under the limit the first field's is empty
+    by construction: a field is refined against the model the fields before
+    it built, and the first has none. The panel draws the first field, so
+    without this the expected response - the one quantity the residual is a
+    residual OF - is the one curve missing from it.
+    """
+    from vhsdecode.luma_amplitude import measured_response
+
+    try:
+        return measured_response(field.rf, field.isFirstField)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _other_head_response(field):
+    """The OTHER head's accumulated luma response, for the plot.
+
+    The heads differ measurably - in level, in the response's slope and in
+    its shape - so a panel that draws only the field's own head cannot show
+    that difference. Imported locally, as `sync_edge_trace` is, because
+    this module is on the dropout path and the plot is the only caller.
+    """
+    from vhsdecode.luma_amplitude import measured_response
+
+    try:
+        return measured_response(field.rf, not field.isFirstField)
+    except Exception:                                            # noqa: BLE001
+        return None
 
 
 def beat_sample_locations(field):

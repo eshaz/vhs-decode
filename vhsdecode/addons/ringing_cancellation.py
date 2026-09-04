@@ -108,6 +108,11 @@ def _load_phase_profile():
                 _phase_profile_state["data"][
                     "landing_bank_enabled"] = bool(
                     config.get("landing_bank", True))
+                # default: the synthesized blend is muted while channel_eq
+                # carries the RF physics
+                _phase_profile_state["data"][
+                    "synth_blend_under_channel_eq"] = bool(
+                    config.get("synth_blend_under_channel_eq", False))
         except (OSError, ValueError, KeyError):
             _phase_profile_state["data"] = None
     return _phase_profile_state["data"]
@@ -351,12 +356,23 @@ class MeasurementWindow:
 
 
 def build_geometry(sys_params, decoder_params, samples_per_line,
-                   line_offset, line_count):
+                   line_offset, line_count, include_vertical_interval=False):
     """Derive the sync-interval geometry from the supplied system parameters.
 
     `sys_params` is the video standard's timing table (SysParams), and
     `decoder_params` the decoder's configuration (DecoderParams); together
     they are the only sources of every number here.
+
+    `include_vertical_interval` admits the equalizing and serration lines
+    that are normally excluded. It exists for ONE purpose: a LOW-FREQUENCY
+    response measurement. A horizontal sync pulse is 4.7 microseconds and
+    reaches no lower than a few hundred kilohertz; the broad vertical sync
+    pulses are tens of times longer and are the only long pulses the
+    signal contains, so a low-frequency measurement that excludes them has
+    nothing to measure with. It must stay FALSE everywhere else - those
+    lines carry pulses of a different width and at twice line rate, and
+    folding them into an average of horizontal sync pulses would corrupt
+    it. Default False, so every existing path is unchanged.
     """
     sample_rate_mhz = float(sys_params["outfreq"])
 
@@ -384,7 +400,8 @@ def build_geometry(sys_params, decoder_params, samples_per_line,
         sync_depth_ire=abs(float(sys_params["vsync_ire"])),
         luma_lowpass_mhz=luma_lowpass_hz / 1e6,
         transition_settle_samples=transition_settle_samples,
-        first_measurable_line=line_offset + lines_of_vertical_sync,
+        first_measurable_line=(line_offset if include_vertical_interval
+                               else line_offset + lines_of_vertical_sync),
         # the population is defined by the specification, not derived
         # from waveforms (the user's rule): every measured line must
         # carry a genuine horizontal sync pulse.  Interlaced fields are
@@ -3147,6 +3164,11 @@ def fit_artifact_model(state, geometry, window_plan, average_fields):
     # point on the smear-corrected signal, and the measurement now
     # matches it.
     ring_stacked = stacked_target - envelope_prediction
+    # Kept undeflated for the joint re-solve below: the peel deflates its
+    # working copy pass by pass, and the final amplitudes have to be fitted
+    # against what the rings actually have to explain, not against what the
+    # previous peel left of it.
+    ring_target_whole = ring_stacked.copy()
 
     def ring_windows_of(residual_stacked, polarity):
         """The certification windows over the CURRENT ring residual,
@@ -3366,6 +3388,31 @@ def fit_artifact_model(state, geometry, window_plan, average_fields):
                 noise_floor ** 2 + _line_locked_floor(
                     peel_windows, geometry.sample_rate_mhz,
                     maximum_ring_mhz, floor_guard_mhz) ** 2)
+
+            # STOP AT THE LIMIT, not when the budget runs out.
+            #
+            # The peel used to end only when its slot budget was spent or
+            # no further candidate certified. Neither is a statement about
+            # the residual, and the derivation's own rule is that the
+            # process ends when what is left is at the noise floor - "we
+            # cannot estimate random noise, that is physically not
+            # possible, this process ends there".
+            #
+            # So: if what this polarity's windows still hold is already at
+            # or under the floor those same windows imply, there is nothing
+            # left to certify and the remaining slots are not spent looking.
+            # The floor is the one computed for this peel, so the test
+            # tightens as the peel proceeds rather than being fixed at the
+            # first pass's estimate.
+            if peel_windows:
+                remaining = math.sqrt(float(np.mean(
+                    [float(np.mean(np.asarray(window, dtype=np.float64) ** 2))
+                     for window in peel_windows])))
+                if remaining <= peel_floor:
+                    state.setdefault("notes", []).append(
+                        "peel stopped at the floor: %.4f IRE left against a "
+                        "floor of %.4f" % (remaining, peel_floor))
+                    break
             for pole in sorted(
                     estimate_decay_modes(peel_windows, capacity,
                                          peel_floor),
@@ -3400,6 +3447,48 @@ def fit_artifact_model(state, geometry, window_plan, average_fields):
                            else ring_levels + peel_levels)
             # the next peel certifies against what THIS peel left
             ring_stacked = ring_stacked - peel_prediction
+
+    # THE AMPLITUDES ARE RE-SOLVED AS A WHOLE.
+    #
+    # The peel above IDENTIFIES the components, and identifying them one at
+    # a time is right - a component only becomes visible once the larger
+    # ones are out of the way. But each peel also FITTED its amplitudes
+    # against a residual the previous peels had already deflated, so every
+    # amplitude carried the earlier ones' errors, and two components close
+    # enough to overlap within the window's resolution were mis-split: the
+    # first fitted took energy belonging to the second, and the second was
+    # then fitted to a residual distorted by that error.
+    #
+    # Ethan's rule, and the reason this is here: "Since each correction will
+    # affect all the other frequency responses, it is critical that this
+    # residual is measured and corrected AS A WHOLE." So once the support is
+    # known, every amplitude is solved together, in one system, against the
+    # undeflated target. The support comes from the peel; the amplitudes do
+    # not.
+    #
+    # A component the joint solve cannot sustain is dropped by it, which is
+    # the correct outcome: it was an artifact of the order it was found in.
+    if len(ring_poles) > 1:
+        joint = solve_pass(list(ring_poles), ring_target_whole, False,
+                           stacked_roots, list(ring_polarities))
+        (joint_poles, joint_pairs, joint_alphas, joint_energies,
+         _joint_echo, _joint_ghost, joint_levels, _joint_prediction) = joint
+        if len(joint_poles) == len(ring_poles):
+            ring_pairs = list(joint_pairs)
+            ring_alphas = list(joint_alphas)
+            ring_energies = list(joint_energies)
+            ring_levels = joint_levels
+        else:
+            # The solve returned a different support than it was given.
+            # Keeping the peel's own answer is the conservative reading -
+            # a mismatch here means the two disagree about what is being
+            # fitted, and a silently misaligned amplitude set is worse
+            # than a sequentially fitted one.
+            diagnostics_note = (
+                "joint re-solve returned %d of %d components; kept the "
+                "peel's amplitudes" % (len(joint_poles), len(ring_poles)))
+            state.setdefault("notes", []).append(diagnostics_note)
+
     if ring_levels is None:
         ring_levels = np.zeros_like(smear_levels)
 
@@ -5282,6 +5371,11 @@ def _gate_parameters(model, geometry, input_noise_ire, strength):
                             w = float(profile[weight_key])
                             if w <= 0.0:
                                 continue
+                            if model.get("channel_eq_active") and not \
+                                    profile.get(
+                                        "synth_blend_under_channel_eq",
+                                        False):
+                                continue
                             deviation = np.asarray(
                                 stack[nearest], dtype=np.float64)
                             t0_index = int(profile["t0_index"])
@@ -6257,6 +6351,13 @@ def process_field(video_buffer, geometry, sync_tip_level, blanking_level,
     # pipeline)
     lti_parameters = {"gain": 0.0, "threshold": 0.1, "blur_radius": 0.0}
     model = state.get("model")
+    if model is not None:
+        # while the identified RF channel response is applied (channel_eq)
+        # the RF-derived synthesized kernels describe physics that stage
+        # now carries; the gate mutes their blend unless the sidecar says
+        # otherwise (synth_blend_under_channel_eq)
+        model["channel_eq_active"] = bool(
+            shared_state.get("channel_eq_active", False))
     strength = _correction_strength(state, average_fields)
     # measure-only mode (--debug_plot hsync_model without --inverse_eq):
     # the model is measured, fitted and SHOWN, but the buffer is
@@ -6289,8 +6390,36 @@ def process_field(video_buffer, geometry, sync_tip_level, blanking_level,
         state["inversion_diagnostics"] = inversion_diagnostics
         corrected = (corrected_ire * level_units_per_ire + blanking_level)
         if np.all(np.isfinite(corrected)):
-            video_buffer[:whole_lines * samples_per_line] = \
-                corrected.astype(video_buffer.dtype)
+            # THE CORRECTION GOES WHERE THE MEASUREMENT WENT, and nowhere
+            # else. The model is calibrated on
+            # [first_measurable_line, last_measurable_line) and was being
+            # applied to every sample of the buffer - the vertical
+            # interval, everything above the first measurable line, and the
+            # field's FINAL row, which `build_geometry` excludes precisely
+            # because it spans the field boundary and carries the next
+            # field's half-line equalizing pulse. Those rows never entered
+            # an accumulator, a template, a stratum, a variance or a fit
+            # weight, and correcting them applies a model nothing validated
+            # against them.
+            #
+            # The filter is still RUN over the whole buffer, because it is
+            # causal with memory across line boundaries and restricting its
+            # input would change its state at every row it did reach. Only
+            # the write-back is restricted, so the rows the model owns get
+            # exactly the correction they would have got, and the rest are
+            # left as they arrived.
+            #
+            # Applying to sync, blanking AND picture alike within those
+            # rows is deliberate and unchanged: a correction confined to
+            # blanking hides its picture behaviour from every sync gauge.
+            corrected = corrected.reshape(whole_lines, samples_per_line)
+            first_row = max(int(geometry.first_measurable_line), 0)
+            last_row = min(int(geometry.last_measurable_line), whole_lines)
+            if last_row > first_row:
+                buffer_rows = video_buffer[:whole_lines * samples_per_line]
+                buffer_rows = buffer_rows.reshape(whole_lines, samples_per_line)
+                buffer_rows[first_row:last_row] = (
+                    corrected[first_row:last_row].astype(video_buffer.dtype))
         # the corrector's impulse must cover the slowest component's
         # settle to the level tolerance, or a long smear correction is
         # truncated in the luma-transient stage's view of it: length =

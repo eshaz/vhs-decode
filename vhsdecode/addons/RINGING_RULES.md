@@ -127,3 +127,241 @@ subject to all rules above.
     decodes the apparent effect collapsed 5.08 → 1.16. Use
     `--inverse_eq -1` references for any sync-region measurement.
 
+
+## Addendum (Sep 2 2026, measured — the identification loop)
+
+24. **Check a decode's PRODUCTS, never its exit status.** The decoder
+    can fail and still exit zero: its json writer dies in
+    `lddecode.utils._consume` with `'NoneType' object has no attribute
+    'items'`, the run reports success, and a downstream tool reads a
+    truncated or absent output. Any automated loop must require the
+    `.tbc`, the `.tbc.json` and whatever sidecars it asked for to exist
+    (and the field count to match `numberOfSequentialFields`) before it
+    believes a decode. Two decodes must never share an output prefix
+    either: the second trips over the first's half-written files, which
+    is how this was found.
+
+25. **The tbc line starts AT the sync fall.** A front-porch window
+    written as an offset from the line start lands in the previous
+    line's active picture. Read the porch as the last samples BEFORE
+    the line boundary and the sync tip just after it, and derive both
+    from the format's own measurement plan rather than by eye. Booked
+    because it inflated a measured sync-to-burst wander by 5×
+    (1.7 samples against a true 0.33).
+
+26. **The demodulated baseband sees the RF magnitude relative to the
+    CARRIER'S own gain.** For an applied change `e` of the RF
+    log-response, a landing at carrier `fc` moves by
+    `d ln|R|(f) = [e(fc+f) + e(fc−f)]/2 − e(fc)` in magnitude and
+    `[e(fc+f) − e(fc−f)]/2` in phase. Attenuating the carrier itself
+    therefore BOOSTS every baseband frequency, and two landings
+    0.29 MHz apart (sync tip and blanking) share bins — one is the
+    other's sideband. Any RF-domain fit must solve for the response
+    jointly across landings; a bin-by-bin deposit cannot converge.
+
+27. **The RF equalizer never reaches the color-under.** For
+    color-under formats `demodblock` takes the chroma from the RAW
+    block (`chroma_source = data`), not from the equalized spectrum, so
+    an RF-site correction changes the luma only. A chroma correction is
+    a separate application at a separate site, and a timing correction
+    carried across the heterodyne must be scaled by
+    `f_subcarrier / f_color_under` (5.6875 on NTSC VHS), because a
+    delay is a phase of 2πfτ while heterodyning only translates.
+
+28. **Average a prediction the way the measurement averages it.** A
+    field-wide estimate is made while the carrier sweeps with the
+    picture, so a prediction evaluated at one carrier is not comparable
+    to it. Weighting by the carrier's measured occupancy moved a
+    cross-instrument comparison from 1.9σ to 0.1σ without changing
+    either measurement. Where the two instruments cover different
+    ranges, report the coverage fraction with every number and claim
+    nothing from a band the covered subsample is biased in.
+
+29. **The weaker instrument sets the comparison.** Quoting a small
+    formal error against a measurement whose signal-to-noise is near
+    one, and calling the gap a systematic, is an error of statistics
+    rather than of physics. State how far each candidate sits from the
+    weaker measurement in ITS sigma.
+
+30. **Average signed, not in magnitude, when the measurement fits one
+    coefficient.** A regression estimating one complex coefficient per
+    band recovers the signed mean. Averaging the magnitude instead
+    agrees wherever the sign is constant and differs by a factor of
+    four or more wherever it is not (measured: 0.618 against 0.136 in
+    one band, 1% agreement in the other six). And a band whose value is
+    a cancellation — the quantity crossing zero inside it — is not a
+    stable number to compare against: narrow the band first.
+
+31. **A band's response is the ratio of MEAN POWERS, then the log.**
+    Averaging per-bin decibels weights the quiet bins as heavily as the
+    loud ones and biases the answer wherever the spectrum has
+    structure. Measured cost of getting this wrong: a sideband
+    imbalance inflated from 0.3 to 0.57 nepers, and a 2.3-2.9 dB
+    "rise" manufactured out of nothing and then explained with physics
+    that was not there. The corrected measurement was both smaller and
+    a different shape.
+
+32. **Content dependence in a channel ratio is evidence, not noise.**
+    For a linear time-invariant channel the output spectrum is the
+    response squared times the input's, at every frequency, whatever
+    signal carries it. So if the same ratio differs between signals,
+    either the path is not time-invariant or the two measurements
+    differ by more than the channel. Report the between-signal spread
+    beside every such number, and treat a large one as a finding to
+    chase rather than an error bar to widen.
+
+33. **Apply rule 31 at every level of aggregation.** Computing each
+    band correctly as a power ratio and then averaging those bands as
+    decibels reintroduces exactly the bias the first step removed. Both
+    lanes made this error at the second level within hours of agreeing
+    the first, and it produced a 1.5 dB disagreement on one signal and
+    a false claim that a channel ratio was content-independent to a
+    tenth of a decibel. Aggregate powers, then take one logarithm at
+    the end.
+
+34. **The general form of 31 and 33, and their boundary.** Average a
+    quantity in the domain where the thing being estimated is linear:
+    POWER for a power ratio estimated from noisy spectra, LOG for a
+    multiplicative transfer being inverted. Where the two differ,
+    prefer the one that errs in the safe direction for what the number
+    will be used for. Rules 31 and 33 are the two commonest failures of
+    this principle, not exceptions to it. The baseband fold smooths the
+    logarithm of its transfer over the instrument's resolution
+    deliberately and correctly: its quantity is a transfer inverted
+    multiplicatively rather than a power ratio, its bins are
+    well-determined rather than noise-limited, and its average runs
+    over adjacent resolution cells rather than across a band - and the
+    geometric mean sits below the arithmetic one, which is the
+    direction an equalizer should err. A reader armed with rule 31
+    would be right to challenge that code and wrong to change it.
+
+35. **A residual below the gauge's own error is a warning, not an
+    achievement.** A per-line correction can drive its residual under
+    the measurement noise by absorbing that noise into the geometry it
+    corrects, where it stops being a number and becomes real jitter in
+    the picture. The residual cannot detect this; the direct test is
+    the CORRECTION's own content above the band the physical mechanism
+    can produce. Measured here: an unregulated time-base correction
+    reached a chi-square of 0.21 while its above-flutter-band content
+    grew every pass to parity with the in-band part, and band-limiting
+    it to the drum window left a genuine improvement of five percent
+    where the raw residual had claimed fifty-three.
+
+36. **A comparison is only a comparison when both sides are computed
+    over the same set.** Four errors in one evening had this shape and
+    every one looked like physics: an evaluation band that moved
+    between passes, a mean taken over decibels, a mean taken over
+    sub-bands, and an admitted bin population that GREW as the
+    correction improved because bins began passing the quality gates
+    the correction itself had improved. The last is the subtlest,
+    because the growth is automatic and invisible: the newly admitted
+    bins are the band edges, where the residual is worst, so a metric
+    can rise while every bin improves and a fit can be driven by
+    exactly the bins it should trust least. Freeze the population on
+    the first pass - for the fit AND for the metric - and judge
+    everything later on the set that was judged at the start.
+
+37. **A share must carry its definition with it.** A fraction always
+    looks comparable even when its numerator and denominator are
+    different objects, so two lanes can quote "the common share" and
+    mean three different quantities measured at different sites on
+    different products. Two of them agreeing is then arithmetic
+    coincidence, which happened twice in one evening before it was
+    caught. State what is over what, and where it was measured, every
+    time a share is quoted. Absolute measurements do not need this;
+    ratios always do.
+
+38. **`is_first_field` IS the head identity - use it.** Ethan's rule: it
+    matches the video head parity and stays consistent for the entire
+    period of a decode. It can swap only on a significant recording
+    change, such as EP to SP, and the response to that is to REBUILD THE
+    MODEL, not to relabel the fields.
+
+    An earlier version of this rule said the opposite, on the strength of
+    a colour-under "head signature" that turned out to carry no absolute
+    information at all. Measured per field, the colour-under's per-line
+    rotation reads `+-+-+-` starting with `+` on the FIRST DECODED FIELD
+    of every decode, whatever that field's parity is - so it is aliased
+    with the decode's own field index and identifies nothing. The one
+    position of thirteen whose per-head gain came out reversed was also
+    the only decode that began on `is_first_field=True`; that, and not the
+    tape, is the whole explanation.
+
+    The lesson that survives is about the instrument, not the label:
+    before trusting a quantity as an identity, check that it is not simply
+    counting from wherever the measurement started. A signature that
+    always reads the same on the first sample is an index, not a
+    signature.
+
+38a. **A bias measured at several positions of ONE tape is that tape's
+    repeatability, not the decoder's bias.** The per-head sync-tip gain
+    read +0.647, +0.658 and +0.635 IRE at three positions of the home
+    tape - agreement to +/-0.012 that looked like proof of a fixed
+    window-placement error. Folded across three tapes it reverses: home
+    climbs, pnb and bars FALL, and the same window reads above the late
+    porch on two of the three. Three positions of one tape is one sample.
+    Repeat on another tape before the word "systematic" is used.
+
+39. **The carrier law's null space has two members, not one.** The
+    demodulated magnitude follows [e(fc+f)+e(fc-f)]/2 - e(fc), which
+    annihilates any constant AND any linear function of frequency. A flat
+    gain is a constant; Wallace's spacing loss is -2*pi*d*f/v, linear in
+    frequency exactly. Measured through the model, a 1.5 dB gain
+    difference reaches demodulated video as 0.0e+00 nepers and a 0.40 um
+    spacing difference as 1.8e-15, while gap, thickness and azimuth come
+    through at 0.15 to 0.32. A parameter left free in a null direction is
+    not merely ill-determined, it is unconstrained and takes whatever the
+    noise asks for - so both are refused by `fit_head_difference` and
+    belong to the RF envelope, where a level is a level and a slope is a
+    slope.
+
+40. **Projecting out the mean IS fitting a constant.** Mean-centring both
+    sides of a fit is algebraically identical to giving the model a free
+    constant and discarding its value. So a quantity that mean-centring
+    removes was never "absorbed" by the other parameters - it was computed
+    and thrown away, and naming it leaves every other fitted parameter
+    bit-identical (verified to 1e-12). The fix for a discarded quantity is
+    to report it, not to re-attribute what it supposedly displaced.
+
+41. **A drive proxy can be anti-correlated with what it proxies for.**
+    Ranking captures by the standard deviation of their combed chroma
+    power - the obvious stand-in for "how hard is this material driving
+    the coupling" - orders them BACKWARDS against the measured
+    resolvability: ramp has the highest value (6.91) and the worst null
+    ratio (1.3x), chromanoise the lowest (1.58) and the best (14.5x). The
+    statistic is normalised by the mean power, so on material carrying
+    little chroma it measures the relative size of the NOISE rather than
+    the signal. The lesson generalises past this one statistic: when a
+    proxy is a ratio, ask what its denominator does on the cases where the
+    numerator is small. Where a direct test exists - here the null ratio
+    itself - use it and do not proxy at all.
+
+42. **A confident-looking output with no resolvability channel is the
+    dangerous failure.** An estimator that returns a plausible shape from
+    material that cannot support one, with nothing in its output saying
+    so, is worse than one that declines: every consumer downstream reads
+    it as a measurement. Where a matched null can be built - destroy the
+    pairing, leave both spectra untouched - report the ratio alongside the
+    result even when nothing gates on it, so the difference between "this
+    is the answer" and "this is what the pipeline returns from noise" is
+    visible to whoever has to decide.
+
+43. **Reproducibility bounds noise, not confounding.** An admission rule
+    that scales a component by how far two independently accumulated banks
+    agree is measuring repeatability, and repeatability answers "is this
+    noise?" - it does not by itself answer "is this the thing I named?".
+    Where a candidate confound is shared by both banks, their agreement
+    cannot separate it from the quantity, and a second, independent
+    condition is what does.
+
+    RECORDED WITH ITS OWN LIMIT, because the first application of this rule
+    was wrong. It was raised against the per-head luma response, on the
+    argument that odd and even fields might carry different content. They
+    do not confound it: the head is identified by FIELD PARITY, a property
+    of the recording rather than of what is on it, and both heads
+    accumulate over the same tape and the same content - so a
+    content-driven component appears in both accumulations and CANCELS in
+    their difference, exactly so on static material where the fields carry
+    identical picture. The independent check agrees: measured on the sync
+    tip, where no picture reaches at all, the per-head gain reads +0.98 dB
+    at 161 sigma. The general rule stands; that instance of it does not.

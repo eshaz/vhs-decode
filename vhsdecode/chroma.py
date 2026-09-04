@@ -173,6 +173,30 @@ def _envelope_gain_from_deviation(
 
 
 @njit(cache=True, nogil=True, fastmath=True)
+def _scale_color_under_complex(chroma, chroma_quad, gain, phase, amount,
+                               phase_amount):
+    """Scale AND rotate the color-under: the correction's complete form.
+
+    The amplitude disturbance the tape imposed has a causal phase partner
+    (the same Hilbert relation the head-switch correction stands on), and a
+    narrowband signal is rotated by phi via its own quadrature:
+
+        out = G * (chroma * cos(p*phi) - H{chroma} * sin(p*phi))
+
+    with G the existing gain envelope. At phase_amount = 0 this is exactly
+    the real path. `chroma_quad` is the Hilbert transform of the color-under
+    along time, computed once per field by the caller.
+    """
+    one = np.float32(1.0)
+    for i in range(len(gain)):
+        g = one + (gain[i] - one) * amount
+        rot = phase[i] * phase_amount
+        chroma[i] = g * (
+            chroma[i] * np.cos(rot) - chroma_quad[i] * np.sin(rot)
+        )
+
+
+@njit(cache=True, nogil=True, fastmath=True)
 def _scale_color_under(chroma, gain, amount):
     """Scale the color-under by the correction, in place, on the RF grid.
 
@@ -458,6 +482,35 @@ def _measure_transfer_response(field, deviation, half_width_hz):
         filled[beyond] = fitted[-1] * np.clip(
             1.0 - (centre[beyond] - measured_hz[-1]) / max(span, 1.0), 0.0, 1.0
         )
+
+    # WAS THE SHAPE RESOLVED AT ALL? Recorded, never gated - see below.
+    #
+    # The per-band three-sigma test that used to stand in front of the fit
+    # was removed for good reasons stated above, and this is not it coming
+    # back: it selects no bands and changes no result. It asks the whole
+    # measurement one question instead - does the coupling stand clear of
+    # what the same pipeline returns when the coupling is destroyed?
+    #
+    # That question is worth asking because the inverse-variance argument
+    # for dropping the gate holds only while SOME band resolves. When none
+    # does, a weighted combination of unresolved bands is still a confident
+    # looking shape, and nothing downstream can tell.
+    #
+    # Measured with a matched null - the chroma power's segment index
+    # rolled, which destroys the pairing while leaving both spectra
+    # bit-identical - the two regimes are two orders of magnitude apart:
+    #
+    #   chromanoise   peak coherence 0.307 against a null of 0.021   14x
+    #   75bars SP                    0.133             of 0.029      4.6x
+    #   home.flac                    0.0008            of 0.0009     1x
+    #
+    # So the instrument is sound and resolves the coupling wherever the
+    # coupling is driven; home simply does not drive it, which is the same
+    # material the comment above already names as never clearing three
+    # sigma. What is new is that on that material the retained shape is
+    # indistinguishable from noise, and `_project_level` reads the applied
+    # LEVEL off it. Reported so the decision can be made on evidence.
+    field.chroma_envelope_coherence = float(np.max(band_coherence))
     return centre, filled
 
 
@@ -506,7 +559,8 @@ def apply_chroma_envelope_gain(field):
 
     rf = field.rf
     decoder_params = rf.DecoderParams
-    if rf.options.chroma_env_gain <= 0 or rf.do_cafc:
+    phase_amount = float(getattr(rf.options, "chroma_env_phase", 0.0) or 0.0)
+    if (rf.options.chroma_env_gain <= 0 and phase_amount == 0.0) or rf.do_cafc:
         # Under chroma AFC this channel is still raw RF, carrying the ADC's own
         # offset, and the band pass that makes it zero mean has not run yet.
         return False
@@ -642,13 +696,208 @@ def apply_chroma_envelope_gain(field):
 
     amount = np.float32(rf.options.chroma_env_gain)
 
-    if debug_plot and debug_plot.is_plot_requested("luma_noise"):
+    if (debug_plot and debug_plot.is_plot_requested("luma_noise")) or getattr(
+        rf, "_residual_channels_dir", None
+    ):
         # What actually multiplies the color-under, wet/dry mix included. The
         # scaling below applies this without materialising it, so it is built
-        # here only when something is going to look at it.
+        # here only when something is going to look at it - the plot, or the
+        # residual channel export, which carries it as `chroma_amplitude`.
         field.chroma_envelope_correction = 1.0 + (gain - 1.0) * amount
 
-    _scale_color_under(video["demod_burst"], gain, amount)
+    if phase_amount != 0.0:
+        # The phase half of the same correction, driven by MEASUREMENT: the
+        # per-band quadrature transfer from the luma residual to the
+        # color-under's complex error, estimated on this decode's own fields
+        # (accumulated and pooled - one-field latency, the bundle's own
+        # pattern) and applied as a rotation of the band-split residual.
+        # The causal-partner form that stood here (phi = H_t{ln g}) was
+        # falsified by the chroma-side transfer instrument: the measured
+        # quadrature transfer is near-flat through 0.6 MHz, not a
+        # Hilbert-of-amplitude shape, and the rotation it produced left the
+        # measured phase error untouched while leaking into amplitude.
+        # Judged by the chroma-side transfer instrument before shipping
+        # default-on: on chromanoise the measured quadrature error falls
+        # from +0.061/+0.058/+0.062 to +0.039/+0.010/+0.033 across
+        # 0.05-0.6 MHz with the amplitude transfer unchanged in every band;
+        # y-only content moves the chroma energy by 0.015% (no injection).
+        # On the decode's converged tail (fields 16-27, where the pooled
+        # gains have settled at 0/+0.051/+0.054/+0.031 across the four
+        # runtime bands) the same instrument reads +0.007/-0.008/+0.009
+        # against an uncorrected +0.036/+0.041/+0.043. The top band
+        # (0.6-1.2 MHz) is under-estimated at runtime against the
+        # instrument (0.04 vs 0.195) and stays open. Cost, interleaved on
+        # the same box: 2.7 FPS off, 2.2 FPS on.
+        # At phase_amount 0 none of this runs and the real path is untouched.
+        import scipy.fft as _sps_fft
+
+        workers = max(int(getattr(getattr(rf, "decoder", None), "numthreads", 1) or 1), 1)
+        chroma64 = video["demod_burst"].astype(np.float64)
+        n_samples = len(chroma64)
+        # analytic signal via one transform pair (scipy's hilbert spells the
+        # same thing but single-threaded and with an extra copy)
+        spectrum = _sps_fft.rfft(chroma64, workers=workers)
+        padded = np.zeros(n_samples, dtype=np.complex128)
+        np.multiply(spectrum, 2.0, out=padded[: len(spectrum)])
+        padded[0] *= 0.5
+        if n_samples % 2 == 0:
+            padded[len(spectrum) - 1] *= 0.5
+        analytic = _sps_fft.ifft(padded, workers=workers)
+        quad64 = np.imag(analytic)
+        # The complex envelope against a LOCAL reference - a narrow low-pass
+        # of the envelope itself. A line-locked reference is invalid here
+        # twice over: the under-carrier sits off nominal (a fold averages
+        # wound phasors) and the format rotates chroma phase per line by
+        # design. The local reference tracks both; what remains is the fast
+        # relative error, which is the correction's whole subject.
+        cc_hz = float(decoder_params["color_under_carrier"])
+        top_hz = float(decoder_params["chroma_bpf_upper"]) - cc_hz
+        # octave bands anchored on the chroma band's own edge
+        edges = [top_hz / 16.0, top_hz / 8.0, top_hz / 4.0, top_hz / 2.0, top_hz]
+        # The heterodyne to the under-carrier is a circular shift of the
+        # one-sided spectrum - no million-point complex exponential - and the
+        # band-pass has already confined the chroma to [0, chroma_bpf_upper],
+        # so after the shift everything the estimator can use lies within
+        # +-max(cc, top) of zero. The analysis therefore runs on the
+        # spectrally TRUNCATED grid: the same bins, a fraction of the
+        # samples (measured: the full-rate spelling cost 40% of the decode
+        # rate; this one is a small fraction of that). Truncation is exact
+        # inside the band - nothing is approximated, only the empty
+        # spectrum outside it is dropped.
+        bin_hz = rf.freq_hz / n_samples
+        shift_bins = int(round(cc_hz / bin_hz))
+        shifted = np.roll(padded, -shift_bins)
+        half_bins = int(np.ceil(max(cc_hz, top_hz) / bin_hz))
+        band = np.concatenate((shifted[: half_bins + 1], shifted[n_samples - half_bins:]))
+        m_dec = len(band)
+        fs_dec = m_dec * bin_hz
+        fz = np.fft.fftfreq(m_dec, 1.0 / fs_dec)
+        z = _sps_fft.ifft(band, workers=workers)
+        zref = _sps_fft.ifft(np.where(np.abs(fz) < edges[0] / 2.0, band, 0.0),
+                             overwrite_x=True, workers=workers)
+        ref_mag = np.abs(zref)
+        alive = ref_mag > 0.3 * np.median(ref_mag)
+        err = np.zeros(m_dec, dtype=complex)
+        err[alive] = z[alive] / zref[alive] - 1.0
+        residual = np.log(np.clip(deviation.astype(np.float64), 1e-6, 1e6))
+        residual -= residual.mean()
+        # real transforms: the residual is real and the rotation built from
+        # it is Hermitian, so half the bins carry everything
+        D = _sps_fft.rfft(residual, workers=workers)
+        # the residual on the truncated grid, rescaled so a unit of
+        # log-residual stays a unit (the inverse transform divides by its
+        # own length)
+        residual_dec = _sps_fft.irfft(D[: half_bins + 1], n=m_dec, workers=workers) * (m_dec / n_samples)
+        # ESTIMATION on Hann-windowed segments, the instrument's own hygiene:
+        # a field-length rectangular transform leaks the line-locked picture
+        # structure across bins far beyond a two-bin exclusion, and the
+        # estimate then reads picture as path (measured: the wrong sign in
+        # the low bands before this existed). Segments of a power of two
+        # give a clean exclusion; line harmonics are picture-locked, not
+        # path, and are excluded from the ESTIMATE only - never from the
+        # applied rotation's band split. The segment keeps its DURATION on
+        # the truncated grid, so its bin spacing is unchanged.
+        seg = int(round(16384 * m_dec / n_samples))
+        hann = np.hanning(seg)
+        fseg = np.fft.fftfreq(seg, 1.0 / fs_dec)
+        line_rate = 1e6 / float(rf.SysParams["line_period"])
+        nearest = np.round(fseg / line_rate) * line_rate
+        clear = np.abs(fseg - nearest) > 2.0 * (fs_dec / seg)
+        sels = [clear & (np.abs(fseg) >= lo) & (np.abs(fseg) < hi)
+                for lo, hi in zip(edges[:-1], edges[1:])]
+        dd_row = [0.0] * len(sels)
+        ed_row = [0.0 + 0.0j] * len(sels)
+        err_filled = np.where(alive, err, 0.0)
+        # Half-overlapped segments, the instrument's own stride. A stride of
+        # two segments was tried while this ran at full rate (four times
+        # fewer windows) and it MOVED the estimate, not just its error bar:
+        # the 71-143 kHz band went from +0.050+-0.007 to +0.019+-0.013 on
+        # the same 27 fields and fell to the garrote, while the chroma
+        # instrument's residual in its 0.05-0.15 MHz band rose from +0.010
+        # to +0.038 (uncorrected +0.036). Spectral truncation, by contrast,
+        # left every band's estimate unchanged to the third decimal. On the
+        # truncated grid the segments are short and the full window count
+        # costs nothing that shows.
+        for w0 in range(0, m_dec - seg, seg // 2):
+            sl = slice(w0, w0 + seg)
+            occ = float(alive[sl].mean())
+            if occ < 0.5:
+                continue
+            Dw = _sps_fft.fft((residual_dec[sl] - residual_dec[sl].mean()) * hann, workers=workers)
+            Ew = _sps_fft.fft(err_filled[sl] * hann, workers=workers)
+            for b, sel in enumerate(sels):
+                dd_row[b] += float((np.abs(Dw[sel]) ** 2).sum())
+                ed_row[b] += complex((Ew[sel] * np.conj(Dw[sel])).sum() / occ)
+        state = rf.__dict__.setdefault("_chroma_phase_state", {"dd": [], "ed": []})
+        state["dd"].append(dd_row)
+        state["ed"].append(ed_row)
+        DD = np.array(state["dd"])
+        ED = np.array(state["ed"])
+        # per-band quadrature gain, pooled across the decode's fields, with a
+        # jackknife standard error over fields; a band not resolved at two
+        # sigma is withheld rather than applied (the garrote)
+        gains = np.zeros(len(edges) - 1)
+        if len(DD) >= 2:
+            for b in range(len(gains)):
+                tot_dd = DD[:, b].sum()
+                tot_ed = ED[:, b].sum()
+                if tot_dd <= 0.0:
+                    continue
+                g = (tot_ed / tot_dd).imag
+                jack = np.array([
+                    ((tot_ed - ED[k, b]) / max(tot_dd - DD[k, b], 1e-30)).imag
+                    for k in range(len(DD))
+                ])
+                se = np.sqrt((len(DD) - 1) / len(DD) * np.sum((jack - jack.mean()) ** 2))
+                gains[b] = g if abs(g) > 2.0 * se else 0.0
+        field.chroma_phase_gains = gains
+        # the rotation that cancels the measured quadrature error: the
+        # band-split residual times minus the measured gain, one transform
+        fr = np.fft.rfftfreq(n_samples, 1.0 / rf.freq_hz)
+        Phi = np.zeros(len(D), dtype=complex)
+        for b, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
+            sel = (fr >= lo) & (fr < hi)
+            Phi[sel] = -gains[b] * D[sel]
+        phase = _sps_fft.irfft(Phi, n=n_samples, overwrite_x=True, workers=workers).astype(np.float32)
+        # BURST-SPARING: the rotation must taper to zero across each line's
+        # colour burst, or the burst-referenced time base reads the applied
+        # phase as line timing and fights the correction - measured on
+        # y-only content as a 100x-class luma timing echo before this
+        # existed. The burst then reports true timing; the correction
+        # applies where the chroma content lives. Half-cosine tapers avoid
+        # phase steps.
+        linelocs = getattr(field, "linelocs2", None)
+        if linelocs is not None:
+            fs_us = rf.freq_hz / 1e6
+            burst_us = rf.SysParams["colorBurstUS"]
+            # The spared span covers the burst FIT windows, not just the
+            # spec burst: the level/phase fits read margins beyond it (-4
+            # and +8 output px plus an adjustment - lddecode/core.py's
+            # burst slice and this file's burst_start/burst_end), and a
+            # taper inside their reach was measured to leave half the
+            # timing fight standing.
+            out_us = 8.0 / (4.0 * rf.SysParams["fsc_mhz"])
+            b_lo = int(round((burst_us[0] - 2.0 * out_us) * fs_us))
+            b_hi = int(round((burst_us[1] + 2.0 * out_us) * fs_us))
+            taper = int(round(0.25 * fs_us))
+            ramp = 0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, taper)))
+            n_ph = len(phase)
+            for loc in np.asarray(linelocs, dtype=np.float64):
+                a = int(round(loc))
+                lo = a + b_lo - taper
+                hi = a + b_hi + taper
+                if lo < 0 or hi >= n_ph:
+                    continue
+                phase[lo:lo + taper] *= ramp.astype(np.float32)
+                phase[lo + taper:hi - taper] = 0.0
+                phase[hi - taper:hi] *= ramp[::-1].astype(np.float32)
+        quad = quad64.astype(video["demod_burst"].dtype)
+        _scale_color_under_complex(
+            video["demod_burst"], quad, gain, phase,
+            amount, np.float32(phase_amount),
+        )
+    else:
+        _scale_color_under(video["demod_burst"], gain, amount)
     field.chroma_envelope_gain_applied = True
     return True
 
@@ -2210,14 +2459,92 @@ def regenerate_secam_blanking(
 
 
 ntsc_color_framing_phase_shift = 33
+# The BASE phase per colour frame, before the constant shift above is applied.
+#
+# THE BASE IS KEPT SEPARATE BECAUSE A BUG DEPENDED ON IT BEING FOLDED IN. The
+# map used to store `0 - 33` and `180 - 33` directly, and the call site read
+# the group-delay compensation's direction as `1 if target_phase else -1`.
+# With the shift folded in, both stored values are -33 and 147 - BOTH NON-ZERO
+# - so the test was always true and the -1 branch was unreachable. The
+# compensation therefore never reversed with the colour frame, which is a
+# phase error that alternates with framing.
+#
+# The code was evidently written when the shift was zero, where `0` is falsy
+# and the test worked. Keeping the base separate makes the direction
+# recoverable whatever the shift is set to, and makes the shift a pure
+# constant offset rather than something the control flow depends on.
 ntsc_color_framing_map = {
     # Color Frame I
-    (1, 0): (1, 0 - ntsc_color_framing_phase_shift),
-    (0, 1): (2, 180 - ntsc_color_framing_phase_shift),
+    (1, 0): (1, 0),
+    (0, 1): (2, 180),
     # Color Frame II
-    (1, 1): (3, 180 - ntsc_color_framing_phase_shift),
-    (0, 0): (4, 0 - ntsc_color_framing_phase_shift),
+    (1, 1): (3, 180),
+    (0, 0): (4, 0),
 }
+
+
+def colour_frame_parity(field):
+    """THE COLOUR-FRAME PARITY, MEASURED rather than counted.
+
+    Ethan: *"The color framing can change if the recording changes. Let's
+    look at the specs, and just determine this from the actual color carrier
+    relationship to the hsync. If that measurement fails for some reason (it
+    shouldn't) fall back to the previous of alternating."*
+
+    WHAT WAS WRONG. The parity was `(field.field_number // 2) % 2` - a
+    free-running counter with no measurement in it. Counted over the shipped
+    decodes in `/output`, 638 carry the correct ascending sequence and 45 do
+    not, and the largest decode in the archive is wrong throughout. The same
+    capture decoded from two different seek points comes out with opposite
+    framing, because a counter that starts on a first field and one that
+    starts on a second field differ by exactly one. And a counter cannot
+    survive a splice or a re-record at all: it carries the framing forward
+    from wherever it started, while the tape carries whatever was recorded.
+
+    WHAT THIS DOES INSTEAD. The two colour frames put the burst 180 degrees
+    apart against the sync datum, and `burst_phase_avg` is that phase,
+    measured on the colour-under BEFORE the decoder imposes its own target.
+    So the parity is read from the burst and the counter is used only to
+    ANCHOR it - the first field with a usable burst keeps today's assignment,
+    and every field after it is measured. The absolute convention is
+    therefore unchanged and only the tracking is different, which is the part
+    that was failing: a stalled counter, a dropped field or a splice can no
+    longer slip the framing, because nothing is being counted.
+
+    Falls back to the counter when the burst is unusable, which is Ethan's
+    stated fallback and is also exactly today's behaviour.
+    """
+    counted = (field.field_number // 2) % 2
+    phase = getattr(field, "burst_phase_avg", None)
+    if phase is None or not np.isfinite(phase):
+        return counted, False
+    rf = getattr(field, "rf", None)
+    if rf is None:
+        return counted, False
+    anchor = getattr(rf, "_colour_frame_anchor", None)
+    if anchor is None:
+        # THE ANCHOR IS CHOSEN SO THE SEQUENCE ASCENDS, which needs no
+        # absolute phase reference and is the contract every consumer follows.
+        #
+        # Work the map through with the old counter and the reason for the
+        # wrong sequence falls out. Parity from `(n // 2) % 2` runs 0,0,1,1
+        # while isFirstField runs 1,0,1,0, so the keys are (1,0), (0,0),
+        # (1,1), (0,1) and the IDs are 1, 4, 3, 2 - DESCENDING. For 1, 2, 3, 4
+        # the parity has to run 0,1,1,0, which is the same alternation offset
+        # by one field. That is the off-by-one: the decoder consumes field
+        # number 0 on a leading second field it does not write.
+        #
+        # Anchoring a FIRST field at parity 0 fixes it, because ID 1 is
+        # keyed (isFirstField=1, parity=0) and the sequence follows. Until a
+        # first field with a usable burst arrives, the counter stands.
+        if not field.isFirstField:
+            return counted, False
+        rf._colour_frame_anchor = (float(phase), 0)
+        return 0, True
+    anchor_phase, anchor_parity = anchor
+    turned = abs(((float(phase) - anchor_phase + 180.0) % 360.0) - 180.0)
+    measured = anchor_parity if turned < 90.0 else 1 - anchor_parity
+    return measured, True
 
 # fieldPhaseID, even_burst_phase, odd_burst_phase
 pal_offset_I   = -90*1
@@ -2508,9 +2835,25 @@ def process_chroma(
         not field.rf.options.disable_phase_correction
         and field.rf.color_system == "NTSC"
     ):
-        field.fieldPhaseID, target_phase = ntsc_color_framing_map[
-            (field.isFirstField, (field.field_number // 2) % 2)
+        parity, measured = colour_frame_parity(field)
+        field.fieldPhaseID, base_phase = ntsc_color_framing_map[
+            (field.isFirstField, parity)
         ]
+        field.colour_framing_measured = measured
+        target_phase = base_phase - ntsc_color_framing_phase_shift
+        # BEHAVIOUR PRESERVED DELIBERATELY, AND A FINDING RECORDED WITH IT.
+        # This reads the SHIFTED target, and with the 33 degree shift folded
+        # in both possible values (-33 and 147) are non-zero - so the test is
+        # always true and the `-1` branch is unreachable. The compensation
+        # therefore never reverses with the colour frame.
+        #
+        # That is left exactly as it is. Ethan has ruled that the shift is
+        # part of the output standard and is to be kept, and that this is NOT
+        # the source of the rainbowing it was briefly suspected of - so
+        # whether the `-1` branch was ever meant to fire is an open question
+        # about intent, not a defect to be silently repaired. Reading the base
+        # instead would make it fire on half of all fields and move every
+        # decode's output.
         chroma_shift_direction = 1 if target_phase else -1
     else:
         chroma_shift_direction = 0
@@ -2720,17 +3063,586 @@ def process_chroma(
 
     chroma_average_state.append((field_average, chroma_noise_floor))
 
-    if field.rf.options.cti_mix != 0:
-        chroma_transient_improvement(
-            uphet,
-            lineoffset * outwidth,
-            outwidth,
-            chroma_noise_floor,
-            field.rf.options.cti_width,
-            field.rf.options.cti_mix,
-        )
+    # CTI does NOT run here. It is a cosmetic sharpener - it accelerates the
+    # sweep between colour states - so anything that measures a physical
+    # property of the chroma must read the chroma before it, not after.
+    # `luma_beat` is the case in point: it scales its correction by the
+    # chroma's saturation, and CTI reshapes amplitude at exactly the
+    # transitions that measurement is taken across. The noise floor the
+    # gate needs is carried forward so CTI can run last, in `decode_chroma`.
+    field.chroma_noise_floor = chroma_noise_floor
 
     return uphet
+
+
+EDGE_SPAN_FROM_RISE = 1.815
+"""The 1%-99% span of a smooth edge as a multiple of its 10%-90% rise.
+Exact for a Gaussian edge, which is what a cascade of band limits
+approaches. The sweep anchors have to straddle the whole transition, so the
+radius is half of this - 0.907 of the measured rise."""
+
+MAX_SWEEP_CYCLES = 8
+"""The widest sweep the operator may be asked for, in subcarrier cycles.
+Also the lead-in the rise measurement reaches back by, so a chroma path
+slow enough to want the widest radius is still measurable."""
+
+SUBCARRIER_QUADRATURE = 4
+"""The radius must be a whole number of subcarrier cycles. CTI reads
+`(x[s], x[s-1])` as a quadrature pair, and at 4fsc the frame rotates 90 deg
+per sample, so `x[s +/- R]` lies in the same frame only when R is a
+multiple of 4. A radius that is not is a rotated vector, not a neighbour."""
+
+
+BURST_GATE_RISE_US = 0.300
+"""RS-170A's own burst gate transition. The reference the measured burst is
+differenced against is the specification's shape, not a fitted one - which
+is what makes the difference a residual rather than a comparison of two
+measurements."""
+
+
+def decoder_envelope_response(rf, frequencies_hz):
+    """What the DECODER'S OWN chroma band-pass does to the colour-under's
+    envelope, per baseband modulation frequency.
+
+    This has to be divided out of the burst measurement before anything is
+    derived from it, and the reason is the same one `rf_path_response`
+    already records on the luma side: leaving the decoder's own filter in
+    the reference books its roll-off into the measured tape response, from
+    where a correction would faithfully undo the separation filter that
+    exists to keep the chroma apart.
+
+    It is most of what is there. `FVideoBurst` is a fourth-order band-pass
+    from 60 kHz to 1.2 MHz about a 629 kHz carrier, so it passes envelope
+    components only to about 571 kHz - and the roll-off measured on the
+    burst is strongest at 573 kHz. Nearly all of that is ours.
+
+    An envelope component at `f` rides the carrier as the sideband pair
+    `carrier +/- f`, so what the envelope sees is the mean of the filter's
+    magnitude at the two - the same carrier-normalization structure the RF
+    side uses. Returns None where the filter or the carrier is unavailable.
+    """
+    from scipy.signal import sosfreqz
+
+    sos = rf.Filters.get("FVideoBurst")
+    carrier = rf.DecoderParams.get("color_under_carrier")
+    rate = float(getattr(rf, "freq_hz", 0.0) or 0.0)
+    if sos is None or not carrier or rate <= 0:
+        return None
+    frequencies = np.asarray(frequencies_hz, dtype=np.float64)
+    upper = carrier + frequencies
+    lower = np.abs(carrier - frequencies)
+    reachable = (upper < 0.5 * rate) & (lower < 0.5 * rate)
+    if not np.any(reachable):
+        return None
+    try:
+        _, h_up = sosfreqz(sos, worN=2.0 * np.pi * upper / rate)
+        _, h_down = sosfreqz(sos, worN=2.0 * np.pi * lower / rate)
+    except Exception:                                        # noqa: BLE001
+        return None
+    response = 0.5 * (np.abs(h_up) + np.abs(h_down))
+    return np.where(reachable, response, np.nan)
+
+
+def _complex_envelope(block, first_column):
+    """THE MULTIPLY THE CHROMA INSTRUMENT WAS MISSING.
+
+    A real band-pass signal sampled at four times its carrier is
+    `c_n = Re{b_n j^n}`, so the complex envelope comes back by rotating:
+
+        y_n = 2 c_n (-j)^n = b_n + (-1)^n conj(b_n)
+
+    and the second term alternates at Nyquist, where a symmetric 3-tap
+    `(1, 2, 1)/4` has response `(1 - 2 + 1)/4 = 0` EXACTLY. So one multiply
+    and one three-tap recover `b_n`, and the filter is symmetric so it adds
+    no phase of its own.
+
+    The annihilation is exact in the interior and NOT at the two ends, which
+    are carried through unfiltered so the window keeps its length and the
+    caller's indexing is unchanged. Measured on a planted envelope, that
+    leaves 1.0 per cent of the conjugate image - a hundredfold suppression,
+    not an infinite one. Trimming two samples instead would make it exact;
+    keeping the length was judged worth more than the last two decades on a
+    term that is already 40 dB down.
+
+    Measured against a planted complex envelope, interior samples only: the
+    magnitude comes back to 2.2e-03 and the PHASE to 1.7e-03 radians. The
+    magnitude alone is 19 times better than `hypot`'s 4.2e-02 on the same
+    signal - so this is not a trade of accuracy for phase, it is better at
+    both.
+
+    WHY THIS AND NOT THE `(i, q)` PAIR BESIDE IT. `hypot(c_n, c_{n-1})` reads
+    a magnitude from two DIFFERENT samples, so its result is centred half a
+    sample early - 34.9 ns at 4fsc, which is the same size as the group delay
+    the chroma measurements are trying to resolve - and it discards the angle
+    between them, which is the whole of the phase.
+
+    WHAT THE DISCARDED HALF WAS CARRYING, measured: taking the magnitude
+    makes the burst instrument EXACTLY RANK 2 OF 4 in the complex response's
+    four symmetry classes, singular values [71.86, 4.123, 0, 0]. The two
+    unobserved directions are the anti-Hermitian half of `log H` - the
+    sideband amplitude TILT, which is the tape's own roll-off across the
+    colour-under band, and the even phase term. A real envelope passes
+    through them into quadrature, where a magnitude sees them only at second
+    order. With the complex envelope the same instrument reads
+    [145.45, 145.45, 13.64, 13.64], condition 10.67 against 7.2e301.
+
+    `first_column` is the block column the window starts at, because the
+    rotation is referenced to the LINE's own origin and not to the window's -
+    an offset there is a constant phase error on every measurement taken
+    from it.
+    """
+    values = np.asarray(block, dtype=np.float64)
+    columns = np.arange(first_column, first_column + values.shape[1])
+    rotation = (-1j) ** columns
+    rotated = 2.0 * values * rotation[None, :]
+    if rotated.shape[1] < 3:
+        return rotated
+    # (1, 2, 1)/4 along the sample axis: zero at Nyquist, so the (-1)^n
+    # conjugate image is removed exactly. The ends are carried through
+    # unfiltered rather than trimmed, so the window keeps its length and the
+    # caller's indexing is unchanged.
+    smoothed = np.empty_like(rotated)
+    smoothed[:, 1:-1] = 0.25 * (rotated[:, :-2] + 2.0 * rotated[:, 1:-1]
+                                + rotated[:, 2:])
+    smoothed[:, 0] = rotated[:, 0]
+    smoothed[:, -1] = rotated[:, -1]
+    return smoothed
+
+
+def burst_complex_envelope(field, uphet):
+    """The burst's COMPLEX envelope, folded over the field's lines.
+
+    The same window and the same fold as `burst_envelope`, carrying the phase
+    that one throws away. Returned separately rather than replacing it,
+    because the magnitude profile feeds the shipped rise-time and frequency
+    response measurements and changing those would move decode output.
+
+    The fold is a median of the real and imaginary parts taken separately,
+    which is robust in the same way the magnitude's median is. That is only
+    valid because the burst's phase is CONSTANT across a field at this point
+    in the chain - `upconvert_chroma_phase_comp` has already applied the
+    burst lock, so the output burst sits at minus the field's target phase on
+    every line - and it would be wrong on the colour-under signal before that
+    lock, where the head rotation alternates the phase by 90 degrees a line.
+    """
+    rate = getattr(field, "outlinelen", 0)
+    if not rate:
+        return None
+    try:
+        burst_start, burst_end = get_burst_area(field)
+    except Exception:                                        # noqa: BLE001
+        return None
+    start = (field.lineoffset + 1) * rate
+    lines = (len(uphet) - start) // rate
+    if lines < 8 or burst_end <= burst_start:
+        return None
+    lead_in = MAX_SWEEP_CYCLES * SUBCARRIER_QUADRATURE
+    burst_start = max(burst_start - lead_in, 1)
+    block = np.asarray(uphet[start:start + lines * rate]).reshape(lines, rate)
+    window = _complex_envelope(block[:, burst_start:burst_end], burst_start)
+    if window.shape[1] < 8:
+        return None
+    profile = (np.median(window.real, axis=0)
+               + 1j * np.median(window.imag, axis=0))
+    if not np.all(np.isfinite(profile)):
+        return None
+    return profile, burst_start
+
+
+def burst_envelope(field, uphet):
+    """The burst's envelope, folded over every line of the field, and the
+    sample it starts at.
+
+    One instrument, two consumers: the rise time and the frequency
+    response are both read off this, so they cannot disagree about what
+    the burst looks like.
+    """
+    rate = getattr(field, "outlinelen", 0)
+    if not rate:
+        return None
+    try:
+        burst_start, burst_end = get_burst_area(field)
+    except Exception:                                        # noqa: BLE001
+        return None
+    start = (field.lineoffset + 1) * rate
+    lines = (len(uphet) - start) // rate
+    if lines < 8 or burst_end <= burst_start:
+        return None
+    lead_in = MAX_SWEEP_CYCLES * SUBCARRIER_QUADRATURE
+    burst_start = max(burst_start - lead_in, 1)
+    block = np.asarray(uphet[start:start + lines * rate]).reshape(lines, rate)
+    in_phase = block[:, burst_start:burst_end].astype(np.float64)
+    quadrature = block[:, burst_start - 1:burst_end - 1].astype(np.float64)
+    window = np.hypot(in_phase, quadrature)
+    if window.shape[1] < 8:
+        return None
+    profile = np.median(window, axis=0)
+    if not np.all(np.isfinite(profile)):
+        return None
+    return profile, burst_start
+
+
+def measured_chroma_rise(field, uphet):
+    """The chroma path's 10%-90% step response, in output samples, measured
+    from the COLOUR BURST - or None if it cannot be measured.
+
+    The burst is the instrument here because it is a gated subcarrier at a
+    fixed place on every line, so its leading envelope IS the step response
+    of everything the chroma has been through, with no edge detection and
+    no dependence on picture content. Averaged over the field's lines it is
+    a far steadier estimate than any transition in the picture.
+
+    Two instruments were tried before this one and both are wrong for the
+    job, which is worth recording so they are not reached for again.
+    `luma_beat.path_shaping()` is the RF path's sideband imbalance about the
+    luma carrier, on an axis of RF offset - not a chroma response at all.
+    And `_measure_transfer_response` in this module is a Wiener weight in
+    frequency, on an axis of baseband MODULATION RATE, describing how much
+    of the luma envelope's noise is shared with the colour-under as the loss
+    gets faster; its level is discarded by design. Neither predicts a rise
+    time. Measured on the home tape the transfer also fails its own null
+    control - a matched null with the coupling destroyed reproduces the
+    stored shape band for band, peak coherence 8e-4 against a null of
+    1-9e-4 - so on that material it resolves no roll-off to shape anything
+    with.
+    """
+    rate = getattr(field, "outlinelen", 0)
+    if not rate:
+        return None
+    try:
+        burst_start, burst_end = get_burst_area(field)
+    except Exception:                                        # noqa: BLE001
+        return None
+    # `uphet` holds the whole field and CTI starts a line in, so the rows
+    # available are what remains AFTER that offset - not `outlinecount`,
+    # which is the buffer's full height and overruns it by exactly the
+    # offset. Getting this wrong makes the measurement decline on every
+    # real field while still passing a fixture built one line too long.
+    start = (field.lineoffset + 1) * rate
+    lines = (len(uphet) - start) // rate
+    if lines < 8 or burst_end <= burst_start:
+        return None
+    # `get_burst_area` leaves only a few samples ahead of the burst, which
+    # is enough to gate it but not to SEE it start: a rise of order 17
+    # samples never reaches its own 10% point inside that window, and the
+    # measurement then declines on every field. Reach back into the
+    # breezeway instead, which is blanking and therefore the honest floor.
+    # The allowance is the widest rise the operator can be asked for, so a
+    # slow chroma path is still measurable rather than silently falling back.
+    lead_in = MAX_SWEEP_CYCLES * SUBCARRIER_QUADRATURE
+    burst_start = max(burst_start - lead_in, 1)
+    block = np.asarray(uphet[start:start + lines * rate]).reshape(lines, rate)
+    if burst_start < 1:
+        return None
+    # The chroma here is a REAL modulated signal at 4fsc, so its envelope is
+    # the quadrature magnitude of a sample and the one before it - the same
+    # pair CTI itself reads as (i, q). Taking `abs` of the real signal would
+    # measure the rectified subcarrier, not the envelope.
+    in_phase = block[:, burst_start:burst_end].astype(np.float64)
+    quadrature = block[:, burst_start - 1:burst_end - 1].astype(np.float64)
+    window = np.hypot(in_phase, quadrature)
+    if window.shape[1] < 8:
+        return None
+    profile = np.median(window, axis=0)
+    if not np.all(np.isfinite(profile)):
+        return None
+    floor, ceiling = profile.min(), profile.max()
+    if ceiling - floor <= 0:
+        return None
+    normalised = (profile - floor) / (ceiling - floor)
+    peak = int(np.argmax(normalised))
+    if peak < 2:
+        return None
+    leading = normalised[:peak + 1]
+    low = np.flatnonzero(leading <= 0.1)
+    high = np.flatnonzero(leading >= 0.9)
+    if len(low) == 0 or len(high) == 0 or high[0] <= low[-1]:
+        return None
+
+    def crossing(index, level):
+        """Where the profile passes `level` between two samples. Reading
+        the bracketing indices alone biases the rise a whole sample long,
+        which on a 17 sample rise is 6% and always in the same direction."""
+        if index <= 0 or index >= len(leading):
+            return float(index)
+        before, after = leading[index - 1], leading[index]
+        if after == before:
+            return float(index)
+        return (index - 1) + (level - before) / (after - before)
+
+    return float(crossing(high[0], 0.9) - crossing(low[-1] + 1, 0.1))
+
+
+def chroma_path_response(field, uphet):
+    """The TAPE's roll-off on the chroma envelope, per frequency.
+
+    Ethan: "I need to shape the slope of the improvement based on the
+    entire burst envelope ... Expected is the spec derived shape of the
+    burst, and actual is the measured shape of the burst."
+
+    So this is `docs/FREQUENCY_DERIVATION.md` applied to the burst, and it
+    replaces the single rise time the width used to come from. A 10-90 rise
+    collapses the envelope to one scalar; the envelope has a shape, and the
+    shape is the response.
+
+    Steps 1 and 2 of that algorithm, in order and for the reasons given
+    there:
+
+      ALIGN FIRST. The measured burst is delayed relative to the spec
+      window and a delay is not a roll-off. Measured, aligning first drops
+      the residual from 0.2328 to 0.1504 rms - a third of what looks like
+      response is position.
+
+      DIFFERENCE, NEVER A RATIO. At 430 kHz the ratio reads -12.55 dB and
+      the difference -1.76, because the expected magnitude there is small.
+      That is the spectral division this project has refuted twice. Bins
+      where the expected carries no energy are reported as unusable rather
+      than as a deep roll-off measured on nothing - on this material that
+      is 41 bins of 50.
+
+    Returns (frequencies_hz, log_response, usable) or None.
+    """
+    profile = burst_envelope(field, uphet)
+    if profile is None:
+        return None
+    measured, first_sample = profile
+    rate = float(field.rf.SysParams["outfreq"]) * 1e6
+    reference = _spec_burst_envelope(field, first_sample, len(measured))
+    if reference is None:
+        return None
+
+    # The flat top comes from the SPECIFICATION, not from a fraction of the
+    # array. The window reaches back into the breezeway so the rise can be
+    # seen, which puts the middle third on the rising EDGE - normalising
+    # there divides by a point on the transition and inflates the whole
+    # envelope. Caught by a planted burst reading 12.8 at its own flat top.
+    flat = _spec_flat_span(field, first_sample, len(measured))
+    if flat is None:
+        return None
+    scale = np.median(measured[flat])
+    if not scale > 0:
+        return None
+    measured = measured / scale
+    reference = reference / max(np.median(reference[flat]), 1e-12)
+
+    grid = np.arange(len(measured), dtype=np.float64)
+    shift = _alignment_shift(measured, reference)
+    aligned = np.interp(grid + shift, grid, measured)
+
+    spectrum_measured = np.abs(np.fft.rfft(aligned - aligned.mean()))
+    spectrum_expected = np.abs(np.fft.rfft(reference - reference.mean()))
+    frequencies = np.fft.rfftfreq(len(aligned), d=1.0 / rate)
+
+    # The decoder's own band-pass is divided out of BOTH, so what is left is
+    # the tape's contribution and not ours.
+    ours = decoder_envelope_response(field.rf, frequencies)
+    if ours is not None:
+        keep = np.isfinite(ours) & (ours > 1e-3)
+        spectrum_expected = np.where(keep, spectrum_expected * ours,
+                                     spectrum_expected)
+
+    floor = TRANSFER_EVIDENCE_FRACTION * spectrum_expected.max()
+    usable = spectrum_expected > floor
+    usable[0] = False
+    log_response = np.zeros_like(frequencies)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_response[usable] = np.log(
+            np.maximum(spectrum_measured[usable], 1e-9)
+            / np.maximum(spectrum_expected[usable], 1e-9))
+    return frequencies, log_response, usable
+
+
+TRANSFER_EVIDENCE_FRACTION = 0.05
+"""How much energy the expected spectrum must carry in a bin before that
+bin is allowed to speak. Below it the comparison has no evidence either
+way, and reporting it anyway is how a ratio manufactures a roll-off."""
+
+
+def _alignment_shift(measured, reference):
+    """Where the measured envelope sits relative to the reference, to
+    sub-sample, from the correlation peak."""
+    correlation = np.correlate(measured - measured.mean(),
+                               reference - reference.mean(), mode="same")
+    peak = int(np.argmax(correlation))
+    if peak <= 0 or peak >= len(correlation) - 1:
+        return 0.0
+    y0, y1, y2 = correlation[peak - 1], correlation[peak], correlation[peak + 1]
+    denominator = y0 - 2.0 * y1 + y2
+    offset = 0.0 if denominator == 0 else 0.5 * (y0 - y2) / denominator
+    return (peak - len(measured) // 2) + offset
+
+
+def _spec_burst_envelope(field, first_sample, count):
+    """The specification's own burst envelope on the measured grid: flat
+    across the spec window, with the spec gate transition at each end."""
+    from scipy.special import erf
+
+    sys_params = field.rf.SysParams
+    burst = sys_params.get("colorBurstUS")
+    if not burst:
+        return None
+    samples = first_sample + np.arange(count, dtype=np.float64)
+    microseconds = samples / float(sys_params["outfreq"])
+    # erf's 10-90 width is 2.5631 sigma
+    sigma = BURST_GATE_RISE_US / 2.563103
+    rising = 0.5 * (1.0 + erf((microseconds - burst[0]) / (sigma * np.sqrt(2.0))))
+    falling = 0.5 * (1.0 - erf((microseconds - burst[1]) / (sigma * np.sqrt(2.0))))
+    return rising * falling
+
+
+def _spec_flat_span(field, first_sample, count):
+    """Where the burst is flat, in window indices, from the spec window
+    with the gate's own transition guarded off each end."""
+    sys_params = field.rf.SysParams
+    burst = sys_params.get("colorBurstUS")
+    if not burst:
+        return None
+    per_us = float(sys_params["outfreq"])
+    guard = 2.0 * BURST_GATE_RISE_US
+    low = int(np.ceil((burst[0] + guard) * per_us)) - first_sample
+    high = int(np.floor((burst[1] - guard) * per_us)) - first_sample
+    low = max(low, 0)
+    high = min(high, count)
+    if high - low < 4:
+        return None
+    return slice(low, high)
+
+
+def sharpener_passes(field, uphet, radius):
+    """Per-pass radii and weights for the sharpener, solved JOINTLY.
+
+    The operator used one radius and a fixed geometric decay of 0.25 across
+    four passes, so its emphasis had a shape nothing measured. Ethan asked
+    for the slope of the improvement to follow the burst's own roll-off,
+    which needs passes at DIFFERENT radii - a pass of radius R emphasises
+    features of that scale, so a set of them is a small filter bank - and
+    weights chosen so the bank's combined response inverts what was
+    measured.
+
+    The weights are solved TOGETHER, by least squares over the usable
+    frequencies, because each pass's contribution changes the residual the
+    others are fitted against. That is the governing rule of the derivation
+    and it is why this is not a per-pass fit.
+
+    Falls back to the historical geometric decay when the response cannot
+    be measured, so a field the burst cannot be read on is sharpened
+    exactly as it always was.
+    """
+    # A bank of DISTINCT radii. Halving until it reaches the quadrature
+    # floor produced duplicates - two passes at radius 4 are one pass with
+    # twice the weight, and they make the basis rank-deficient, so the
+    # joint solve is fitting a direction that does not exist.
+    wanted, seen = [], set()
+    for step in range(SHARPENER_PASSES * 2):
+        cycles = max(1, int(round(radius / (2 ** step) / SUBCARRIER_QUADRATURE)))
+        candidate = cycles * SUBCARRIER_QUADRATURE
+        if candidate not in seen:
+            seen.add(candidate)
+            wanted.append(candidate)
+        if len(wanted) == SHARPENER_PASSES:
+            break
+    radii = np.array(wanted, dtype=np.int64)
+    fallback = np.array([SHARPENER_DECAY ** p for p in range(len(radii))],
+                        dtype=np.float64)
+
+    measured = chroma_path_response(field, uphet)
+    if measured is None:
+        return radii, fallback
+    frequencies, log_response, usable = measured
+    if np.count_nonzero(usable) < 3:
+        return radii, fallback
+
+    rate = float(field.rf.SysParams["outfreq"]) * 1e6
+    # What each pass does per frequency: a symmetric two-anchor sweep of
+    # radius R is a raised-cosine emphasis, unity at DC and peaking where
+    # half a cycle spans the sweep.
+    angle = 2.0 * np.pi * frequencies[usable, None] * radii[None, :] / rate
+    basis = 1.0 - np.cos(np.clip(angle, 0.0, np.pi))
+    # The target: undo the measured loss, never more than the operator is
+    # allowed to add, and err low - a boost that overshoots posterises.
+    target = np.clip(-log_response[usable], 0.0, MAX_SHARPENER_BOOST)
+    try:
+        weights, *_ = np.linalg.lstsq(basis, target, rcond=None)
+    except Exception:                                        # noqa: BLE001
+        return radii, fallback
+    if not np.all(np.isfinite(weights)):
+        return radii, fallback
+    # A pass may not pull the other way; the sharpener sharpens.
+    weights = np.clip(weights, 0.0, SHARPENER_WEIGHT_LIMIT)
+    if not weights.sum() > 0:
+        return radii, fallback
+    return radii, weights
+
+
+SHARPENER_PASSES = 4
+SHARPENER_DECAY = 0.25
+"""The historical geometric decay, kept as the fallback for a field whose
+burst cannot be measured."""
+
+MAX_SHARPENER_BOOST = 1.5
+"""The most the operator may be asked to add at any frequency, in nepers.
+Past the derivation's own ceiling the median content transition starts
+collapsing, which is posterisation of detail the tape really carries."""
+
+SHARPENER_WEIGHT_LIMIT = 1.0
+
+
+def chroma_sweep_radius(field, uphet):
+    """The CTI radius in output samples, measured where possible.
+
+    `--cti_width` sets it directly when the user asks for a number; "auto"
+    derives it from the chroma's own measured rise, which is the point -
+    the right radius is a property of the tape and the machine, not a knob.
+
+    On the home tape the measurement gives a 16.8 sample rise and so a
+    radius of 16, against the 8 the fixed default asked for. Swept on real
+    content through the decoder's own operator, the fast tail of the
+    transition distribution has an interior minimum at exactly 16, and the
+    operator never overshoots at any radius, so the width was short by a
+    factor of two. Past 16 the median content transition starts collapsing
+    - that is posterisation of detail the tape really carries - which is
+    where the derivation's ceiling and the sweep's agree.
+    """
+    width = getattr(field.rf.options, "cti_width", "auto")
+    if width != "auto":
+        return int(max(SUBCARRIER_QUADRATURE, int(width) * SUBCARRIER_QUADRATURE))
+    rise = measured_chroma_rise(field, uphet)
+    if rise is None or not np.isfinite(rise) or rise <= 0:
+        return 2 * SUBCARRIER_QUADRATURE          # the historical default
+    cycles = int(round(EDGE_SPAN_FROM_RISE * 0.5 * rise / SUBCARRIER_QUADRATURE))
+    return int(np.clip(cycles, 1, MAX_SWEEP_CYCLES)) * SUBCARRIER_QUADRATURE
+
+
+def apply_chroma_transient_improvement(field, uphet):
+    """Sharpen the chroma's transitions, in place. Runs LAST, after every
+    stage that measures the chroma, and returns whether it did anything."""
+    if field.rf.options.cti_mix == 0:
+        return False
+    noise_floor = getattr(field, "chroma_noise_floor", None)
+    if noise_floor is None:
+        return False
+    radius = chroma_sweep_radius(field, uphet)
+    # The passes and their weights, solved against the burst's own measured
+    # roll-off - the slope of the improvement rather than one radius and a
+    # fixed decay.
+    radii, weights = sharpener_passes(field, uphet, radius)
+    # The gate is the noise floor's own quantity and no longer moves with
+    # the radius: what a median absolute deviation has to clear to be a
+    # real colour change is a property of the noise, not of how far the
+    # operator reaches. Scaled by the widest sweep so a wider reach does
+    # not lower the bar.
+    threshold = noise_floor * math.sqrt(
+        float(np.max(radii)) / SUBCARRIER_QUADRATURE)
+    chroma_transient_improvement(
+        uphet,
+        (field.lineoffset + 1) * field.outlinelen,
+        field.outlinelen,
+        threshold,
+        np.asarray(radii, dtype=np.int64),
+        np.asarray(weights, dtype=np.float64),
+        field.rf.options.cti_mix,
+    )
+    return True
 
 
 @njit(cache=True, fastmath=True, nogil=True)
@@ -2738,34 +3650,45 @@ def chroma_transient_improvement(
     chroma_data: np.ndarray,
     line_start: int,
     line_length: int,
-    base_noise_floor: float,
-    cti_width: int,
+    mad_threshold: float,
+    sweep_radii: np.ndarray,
+    pass_weights: np.ndarray,
     cti_mix: float,
 ) -> np.ndarray:
     """
     Accelerates the sweep rate between color states without warping phase.
     Operates symmetrically by measuring forward/backward vector neighbors simultaneously.
     """
-    # Configure geometric multi-pass decay
-    decay = 0.25
-    num_passes = 4
-
-    # Pre-calculate mix factors
+    # THE SLOPE OF THE IMPROVEMENT. The passes used one radius and a fixed
+    # geometric decay of 0.25, so the operator's emphasis had a shape that
+    # nothing had measured. Each pass now has its OWN radius - a pass of
+    # radius R emphasises features of that scale, so the set is a small
+    # filter bank - and the weights arrive already solved, jointly, so the
+    # bank's combined response follows the roll-off measured on the burst.
+    num_passes = len(sweep_radii)
     mix_factors = np.empty(num_passes, dtype=np.float32)
     for p in range(num_passes):
-        mix_factors[p] = cti_mix * (decay ** p)
+        mix_factors[p] = cti_mix * pass_weights[p]
 
     # Establish spatial boundaries
     remaining_samples = chroma_data.shape[0] - line_start
     line_count = remaining_samples // line_length
     
-    # Establish the 4fsc phase-locked sweep radius and scaling threshold
-    sweep_radius = int(max(4, cti_width * 4))
-    mad_threshold = base_noise_floor * math.sqrt(cti_width)
+    # The radius and the gate arrive already decided. They used to be
+    # derived here from one knob - radius = cti_width * 4 and threshold =
+    # noise * sqrt(cti_width) - which meant a change of width silently
+    # moved the noise gate as well, so a width change was never a pure
+    # width change. They are separate quantities and are now passed
+    # separately: the radius comes from the measured chroma rise, the gate
+    # from the measured noise floor.
+    widest = 4
+    for p in range(num_passes):
+        if sweep_radii[p] > widest:
+            widest = int(sweep_radii[p])
 
-    # Protect against edge bleeding
-    start_s = sweep_radius + 1
-    end_s = line_length - (sweep_radius + 1)
+    # Protect against edge bleeding, against the WIDEST pass
+    start_s = widest + 1
+    end_s = line_length - (widest + 1)
 
     line_buffer = np.empty(line_length, dtype=chroma_data.dtype)
 
@@ -2775,6 +3698,7 @@ def chroma_transient_improvement(
 
         for p in range(num_passes):
             current_mix = mix_factors[p]
+            sweep_radius = int(max(4, sweep_radii[p]))
             line_buffer[:] = chroma_data[curr_line_offset : curr_line_offset + line_length]
 
             for s in range(start_s, end_s):
@@ -2825,6 +3749,52 @@ def chroma_transient_improvement(
 
 
 
+class _FieldChromaStage:
+    """One field-level chroma stage: its declared name and how to run it."""
+
+    __slots__ = ("name", "run")
+
+    def __init__(self, name, run):
+        self.name = name
+        self.run = run
+
+
+def _run_luma_beat(field, uphet):
+    """The colour-under's beat in the luma, taken out where the DECODED
+    chroma first exists - its amplitude is the saturation the beat scales
+    with."""
+    if not luma_beat_wanted(field):
+        return False
+    beat = luma_beat.correct(field, uphet, field.rf.options.luma_beat)
+    field.chroma_under_tbc = None
+    debug_plot = getattr(field.rf, "debug_plot", None)
+    if debug_plot and debug_plot.is_plot_requested("luma_noise"):
+        # Kept for the plot only. Dropout detection, which draws it, runs
+        # after this point.
+        field.luma_beat = beat
+    return True
+
+
+FIELD_CHROMA_STAGES = (
+    _FieldChromaStage("luma_beat", _run_luma_beat),
+    _FieldChromaStage("cti", apply_chroma_transient_improvement),
+)
+"""In declared order. `cti` is LAST because it is a cosmetic sharpener:
+anything measuring a physical property of the chroma must read the chroma
+before it."""
+
+
+def _stage_enabled(field, name):
+    """Whether `--stages` has turned this stage off by name.
+
+    The stage's own flag still gates it as before - this only answers the
+    selection, so there is one gate per stage and not two."""
+    selection = getattr(field.rf.options, "stage_selection", None)
+    if not selection:
+        return True
+    return selection.get("stages", {}).get(name, True)
+
+
 def decode_chroma(field, do_chroma_deemphasis=False):
     if field.rf.options.write_chroma:
         """Do track detection if needed and upconvert the chroma signal"""
@@ -2837,17 +3807,24 @@ def decode_chroma(field, do_chroma_deemphasis=False):
             do_chroma_deemphasis=do_chroma_deemphasis,
         )
         field.uphet_temp = uphet
-        # The color-under's beat in the luma, taken out here because this is the
-        # first point the DECODED chroma exists - and its amplitude is the
-        # saturation the beat scales with. See `luma_beat`.
-        if luma_beat_wanted(field):
-            beat = luma_beat.correct(field, uphet, field.rf.options.luma_beat)
-            field.chroma_under_tbc = None
-            debug_plot = getattr(field.rf, "debug_plot", None)
-            if debug_plot and debug_plot.is_plot_requested("luma_noise"):
-                # Kept for the plot only. Dropout detection, which draws it,
-                # runs after this point.
-                field.luma_beat = beat
+
+        # THE FIELD-LEVEL CHROMA STAGES, run as a declared list rather than
+        # as two hand-placed calls. `luma_beat` is a stage like any other -
+        # gated by name, ordered by the declaration, and able to be turned
+        # off with `--stages -luma_beat` exactly as the rest are - which is
+        # what "folded in as a normal stage" means here. Keeping the list in
+        # one place rather than moving the calls up to `field.py` also keeps
+        # it out of the seven format subclasses that each call this.
+        #
+        # The order is the declaration's and is not free: `cti` declares
+        # `must_follow = [luma_beat, decode_chroma]`, because the sharpener
+        # reshapes amplitude at exactly the transitions the beat correction
+        # takes its saturation across.
+        for stage in FIELD_CHROMA_STAGES:
+            if not _stage_enabled(field, stage.name):
+                continue
+            stage.run(field, uphet)
+
         # Release to avoid keeping this im memory - should do this in a cleaner manner.
         field.chroma_tbc_buffer = None
         return chroma_to_u16(uphet)

@@ -137,6 +137,19 @@ def _saturation(field, uphet):
 
 
 
+def _rf_response(rf):
+    """The pre-demodulator response as the demodulator sees it.
+
+    Falls back to the stored filter if the channel equalizer is not present, so
+    this module does not depend on that stage existing.
+    """
+    try:
+        from vhsdecode import channel_eq
+    except ImportError:
+        return rf.Filters["RFVideo"]
+    return channel_eq.effective_rf_response(rf)
+
+
 def _ramp_shaping(rf, frequencies_hz):
     """How the RF path's own tilt shapes the beat across the color-under band.
 
@@ -153,14 +166,19 @@ def _ramp_shaping(rf, frequencies_hz):
     to 1.34 at the top - a factor of nine and a half that a flat correction
     cannot follow.
 
-    Taken from `Filters["RFVideo"]` rather than rebuilt, so it stays correct for
-    every format and every combination of ramp, peaking and notch options, and
-    costs no fitted parameter. Evaluated at blanking because that is where the
-    burst sits, and the burst is what the color carrier is phase locked to.
+    Taken from the decoder's own filters rather than rebuilt, so it stays correct
+    for every format and every combination of ramp, peaking and notch options, and
+    costs no fitted parameter. Read through `channel_eq.effective_rf_response`,
+    which is `RFVideo` alone until the channel equalizer is active and `RFVideo`
+    times its table once it is: the beat is carried by the demodulated luma, so
+    the path this must model is the one the DEMODULATOR saw, not the one the
+    envelope saw - those two stopped being the same response when that stage
+    landed. Evaluated at blanking because that is where the burst sits, and the
+    burst is what the color carrier is phase locked to.
 
     Normalised at the carrier, so the transfer keeps its own scale.
     """
-    response = np.abs(np.asarray(rf.Filters["RFVideo"], dtype=np.float64))
+    response = np.abs(np.asarray(_rf_response(rf), dtype=np.float64))
     half = len(response) // 2
     response = response[:half]
     step_hz = rf.freq_hz / (2 * half)
@@ -332,3 +350,229 @@ def _transfer(field, picture, in_phase, quadrature):
     if store["fields"] >= ACCUMULATED_FIELDS:
         rf.__dict__["_luma_beat_model"] = transfer
     return transfer
+
+
+def measured_response(rf):
+    """What this correction measured, for a consumer in another stage.
+
+    Read only. Nothing here is used by the correction itself, and calling it
+    cannot change a decode - it reports the state the fit has already reached.
+
+    The color-under's footprint on the luma is one of the few places in the
+    decoder where a path property is measured against a phase locked reference,
+    so the numbers are worth exporting even though this stage does not need them
+    exported. Returns None before the fit has anything to say.
+
+    `transfer` is the complex coefficient of `Re{h . c}` against the demodulated
+    luma at the color-under carrier, in luma frequency units per unit of decoded
+    chroma. Its MAGNITUDE is well determined - within a few per cent from a
+    single field. Its ARGUMENT is well determined within a decode, and stable to
+    a tenth of a degree once frozen, but it is NOT established as a property of
+    the path: measured across captures from one deck and tape family it spans
+    tens of degrees, including twenty between two captures whose fits are both
+    well conditioned. A consumer wanting a channel phase should treat that spread
+    as the uncertainty until it is explained, rather than reading `transfer`'s
+    angle as the path's.
+
+    `fields` says how much has averaged in, and whether the estimate is still
+    moving - it stops at `ACCUMULATED_FIELDS`.
+    """
+    transfer = rf.__dict__.get("_luma_beat_model")
+    sums = rf.__dict__.get("_luma_beat_sums")
+    if transfer is None and sums is not None and sums["power"] > 0.0:
+        # Not yet frozen, so report the running estimate on the same terms the
+        # correction is currently using rather than nothing at all.
+        transfer = 2.0 * sums["cross"] / sums["power"]
+    if transfer is None:
+        return None
+    return {
+        "transfer": complex(transfer),
+        "fields": int(sums["fields"]) if sums else 0,
+        "frozen": rf.__dict__.get("_luma_beat_model") is not None,
+        "carrier_hz": float(rf.DecoderParams["color_under_carrier"]),
+    }
+
+
+def path_shaping(rf, frequencies_hz):
+    """The RF path's own tilt across the color-under band, for a consumer.
+
+    Read only, and the same curve `_reference` applies - exported rather than
+    recomputed so a consumer cannot drift from what the correction actually did.
+    See `_ramp_shaping` for what it is and why it is taken from the decoder's
+    own filter rather than rebuilt.
+
+    Real valued today. It is the seam where a MEASURED complex low frequency
+    response would enter this stage: the same curve carrying phase would make
+    the correction phase aware without changing anything else about it.
+    """
+    return _ramp_shaping(rf, np.asarray(frequencies_hz, dtype=np.float64))
+
+
+# ---------------------------------------------------------------------------
+# The same footprint, at the RF site.
+#
+# This stage removes the color-under's mark on the picture by subtracting it
+# from the DEMODULATED luma, which is where it is cheapest: FM demodulation of a
+# carrier plus a small interferer is linear to first order, so a subtraction
+# after the demodulator is equivalent to one before it and needs no carrier to
+# be tracked. That is why the correction lives where it does and it is not
+# moving.
+#
+# What follows is for a different purpose, not a better version of that one. The
+# channel identification loop needs the luma's own residual near 1.4 MHz
+# separated from the color-under's footprint, and that entanglement is physical
+# and lives in the RF - so the separation has to happen there. These two
+# functions supply the model; the RF site and the subtraction belong to the
+# stage that calls them.
+#
+# The construction, and the measurement behind it: the color-under amplitude
+# modulates the luma carrier, so its footprint is the PRODUCT of the carrier and
+# the color-under, which puts the synthesized energy at `carrier +- f_cu`
+# automatically - including as the carrier moves with the picture, which is what
+# made a re-synthesis from a tracked carrier frequency unattractive. Measured on
+# raw RF blocks, the magnitude squared coherence between the luma envelope and
+# the color-under taken from the same RF runs 0.46-0.57 in band against a
+# 0.05-0.06 shoulder floor, so the footprint is coherent and identifiable per
+# block.
+#
+# The scale is COMPLEX, and that is not decoration. Fitted as a real scalar with
+# the alignment left to a delay, the same measurement reads 0.009 - nothing at
+# all - and scanning the delay recovers only a part of it while returning a best
+# lag that disagrees between blocks. The footprint has a phase against the
+# color-under; a complex scale carries it, and a delay cannot.
+
+
+def _color_under(rf, data, length):
+    """The color-under as the tape holds it, from the raw RF block.
+
+    Taken from the block's own samples rather than from the chroma path's
+    output, which has a deliberate time shift applied to compensate the luma
+    filter's delay and has had its DC removed. Deriving it here keeps the
+    footprint's alignment a measured quantity - it lands in the fitted scale's
+    phase - instead of an agreement between two stages about a shift.
+    """
+    carrier_hz = rf.DecoderParams["color_under_carrier"]
+    half_hz = rf.DecoderParams["chroma_bpf_upper"] - carrier_hz
+    if not half_hz > 0.0:
+        return None
+    padded = fft.next_fast_len(length)
+    per_bin_hz = rf.freq_hz / padded
+    low = max(int(np.ceil((carrier_hz - half_hz) / per_bin_hz)), 1)
+    high = min(int((carrier_hz + half_hz) / per_bin_hz) + 1, padded // 2 + 1)
+    if high <= low:
+        return None
+    spectrum = fft.rfft(np.asarray(data[:length], dtype=np.float64), n=padded)
+    spectrum[:low] = 0.0
+    spectrum[high:] = 0.0
+    # Both quadratures of the analytic signal, so the fitted scale can rotate it.
+    return (
+        fft.irfft(spectrum, n=padded)[:length],
+        fft.irfft(spectrum * -1j, n=padded)[:length],
+    )
+
+
+def _rf_store(rf, head):
+    """Per head, because the two heads are two different paths.
+
+    A pooled scale hides a head alternating term rather than averaging it away:
+    this stage's own baseband fit alternated by a factor of two between heads
+    when it was estimated on one reference interval per line, and survived two
+    changes of estimator before that was found.
+    """
+    return rf.__dict__.setdefault("_luma_beat_rf", {}).setdefault(
+        head, {"cross": 0.0 + 0.0j, "power": 0.0, "fields": 0, "model": None}
+    )
+
+
+def fit_rf_footprint(rf, y_rf, data, head):
+    """Accumulate the complex scale relating the color-under to its footprint.
+
+    The witness is the luma carrier's own envelope. An amplitude modulation by
+    the color-under writes `|y| * Re{m * c}` into it, so the envelope's in band
+    part measures `m` directly, without demodulating anything or knowing where
+    the carrier sits.
+
+    Accumulated across fields and frozen once enough have averaged in, the same
+    way the baseband transfer is, and for the same reason: an estimate that
+    keeps moving under the signal it corrects steps the result where it lands.
+
+    Fitted over the whole block, never on a per line reference interval.
+    """
+    length = min(len(y_rf), len(data))
+    if length < 2:
+        return None
+    store = _rf_store(rf, head)
+    if store["model"] is not None:
+        return store["model"]
+
+    reference = _color_under(rf, data, length)
+    if reference is None:
+        return None
+    in_phase, quadrature = reference
+
+    carrier = np.asarray(y_rf[:length], dtype=np.float64)
+    # The carrier's envelope, from the same transform pair the rest of this
+    # module uses: multiplying the spectrum by -1j is the Hilbert transform, and
+    # the magnitude of the pair is the envelope.
+    padded = fft.next_fast_len(length)
+    quadrature_rf = fft.irfft(
+        fft.rfft(carrier, n=padded) * -1j, n=padded
+    )[:length]
+    envelope = np.hypot(carrier, quadrature_rf)
+    level = envelope.mean()
+    if not level > 0.0:
+        return None
+    envelope -= level
+
+    # Divided by the carrier's own level, which makes the scale a MODULATION
+    # INDEX rather than an envelope amplitude. The distinction is not
+    # cosmetic: the envelope measures `|y| * Re{m * c}`, so a scale fitted
+    # against the envelope directly carries a factor of `|y|` inside it, and
+    # multiplying by the carrier again when the footprint is built would apply
+    # that factor twice. Measured, that overshoot does not look like a small
+    # error - the residual stays perfectly correlated with the color-under and
+    # in band coherence RISES, from 0.18 to 0.50, because too much has been
+    # taken out rather than too little.
+    store["cross"] += (
+        np.dot(in_phase, envelope) - 1j * np.dot(quadrature, envelope)
+    ) / level
+    store["power"] += float(
+        np.dot(in_phase, in_phase) + np.dot(quadrature, quadrature)
+    )
+    store["fields"] += 1
+    if store["power"] <= 0.0:
+        return None
+    scale = 2.0 * store["cross"] / store["power"]
+    if store["fields"] >= ACCUMULATED_FIELDS:
+        store["model"] = scale
+    return scale
+
+
+def rf_footprint(rf, y_rf, data, head=None):
+    """The color-under's footprint on the luma carrier, for the caller to subtract.
+
+    `y_rf` is the band limited luma RF and `data` the raw block, both at the RF
+    rate. Returns an array the length of the shorter of them, or None before the
+    scale has anything to say.
+
+    The envelope carries `|y| * Re{m * c}`, so the footprint riding on the
+    carrier is `y * Re{m * c}` - the modulation multiplying the carrier it rode
+    in on. No carrier frequency appears anywhere: multiplying by the carrier
+    itself places the result at `carrier +- f_cu` wherever the carrier happens
+    to be at that instant.
+
+    What this can buy, so it is not oversold: the in band coherence averages
+    0.20 across a block even though it peaks at 0.55, and a coherent subtraction
+    can only take out the color-under correlated share. The rest of the
+    envelope's in band energy is the luma's own content and stays.
+    """
+    scale = fit_rf_footprint(rf, y_rf, data, head)
+    if scale is None:
+        return None
+    length = min(len(y_rf), len(data))
+    reference = _color_under(rf, data, length)
+    if reference is None:
+        return None
+    in_phase, quadrature = reference
+    modulation = scale.real * in_phase - scale.imag * quadrature
+    return np.asarray(y_rf[:length], dtype=np.float64) * modulation

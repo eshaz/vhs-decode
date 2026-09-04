@@ -59,14 +59,94 @@ supported_tape_formats = {
     "VIDEO2000",
 }
 
-_SUPPORTED_IRE0_ADJUST_VALUES = {"hsync", "backporch"}
+# "declip" is a MODIFIER rather than an anchor: it does not choose what
+# ire0 is measured from, it refuses the hsync-derived scale when the sync
+# tip reads clipped. It is listed here because the whitelist is what makes
+# a mode reachable at all - a value missing from it is not rejected with an
+# error but SILENTLY REWRITTEN by _normalize_ire0_adjust_args, so the mode
+# never runs and the user is never told. That is how "declip" shipped dead.
+_SUPPORTED_IRE0_ADJUST_VALUES = {"hsync", "backporch", "declip"}
+
+
+def _normalize_stages_args(raw_args):
+    """Let `--stages -cti` mean what it looks like.
+
+    A selection may legitimately begin with `-` (turn this stage off), and
+    argparse reads a leading dash as the start of another option. The same
+    problem was solved for `--ire0_adjust` by rewriting argv before
+    parsing, and this follows it: where the token after `--stages` parses
+    as a selection, it is attached with `=` so argparse never sees a bare
+    dash. A token that does NOT parse is left alone, so a genuine
+    `--stages` with a missing value still reports the missing value rather
+    than swallowing the next flag.
+    """
+    from vhsdecode import pipeline_graph
+
+    try:
+        declared = pipeline_graph.load()
+    except Exception:                                        # noqa: BLE001
+        return list(raw_args)
+
+    out, index = [], 0
+    tokens = list(raw_args)
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--stages" and index + 1 < len(tokens):
+            candidate = tokens[index + 1]
+            if candidate.startswith("-"):
+                try:
+                    pipeline_graph.parse_selection(candidate, declared)
+                except ValueError:
+                    out.append(token)
+                    index += 1
+                    continue
+                out.append("--stages=" + candidate)
+                index += 2
+                continue
+        out.append(token)
+        index += 1
+    return out
+
+
+def _stage_selection(value):
+    """`--stages` takes stage and component names, never amounts.
+
+    Validated against the pipeline declaration at parse time, so a typo
+    fails here with the valid list rather than silently disabling a
+    correction and producing a decode nobody can account for."""
+    from vhsdecode import pipeline_graph
+
+    try:
+        pipeline_graph.parse_selection(value, pipeline_graph.load())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error))
+    return value
+
+
+def _cti_width(value):
+    """`--cti_width` takes a whole number of subcarrier cycles, or "auto"
+    to measure the chroma's own rise from the colour burst per field."""
+    if str(value).strip().lower() == "auto":
+        return "auto"
+    try:
+        width = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            "cti_width takes a whole number of subcarrier cycles, or 'auto'"
+        )
+    if not 1 <= width <= 8:
+        raise argparse.ArgumentTypeError(
+            "cti_width must be between 1 and 8 subcarrier cycles"
+        )
+    return width
 
 
 def _parse_ire0_adjust(value):
     parsed = value.lower()
     if all(part.strip().lower() in _SUPPORTED_IRE0_ADJUST_VALUES for part in parsed.split(",")):
         return parsed
-    raise argparse.ArgumentTypeError("Allowed values: hsync, backporch")
+    raise argparse.ArgumentTypeError(
+        "Allowed values: " + ", ".join(sorted(_SUPPORTED_IRE0_ADJUST_VALUES)))
 
 
 def _normalize_ire0_adjust_args(raw_args):
@@ -377,6 +457,24 @@ def main(args=None, use_gui=False):
         ),
     )
     parser.add_argument(
+        "--chroma_env_phase",
+        dest="chroma_env_phase",
+        metavar="amount",
+        nargs="?",
+        type=float,
+        const=1.0,
+        default=1.0,
+        help=(
+            "Correct the PHASE of the color-under for the tape's amplitude"
+            " noise, alongside the amplitude gain: the decode measures its own"
+            " per-band quadrature transfer from the luma carrier's amplitude"
+            " residual to the color-under and applies the cancelling rotation"
+            " (the burst itself is left untouched so the time base reads true"
+            " timing). 1.0 applies the measured transfer in full, 0 disables,"
+            " a fraction blends."
+        ),
+    )
+    parser.add_argument(
         "--luma_transient",
         dest="luma_transient",
         metavar="amount",
@@ -419,6 +517,26 @@ def main(args=None, use_gui=False):
         ),
     )
     parser.add_argument(
+        "--head_switch_export",
+        dest="head_switch_export",
+        metavar="npz",
+        type=str,
+        default=None,
+        help=(
+            "Write `--head_switch`'s measured per-band transfer (residual log-amplitude to demodulated frequency, with its standard error and the model kernel) to this npz, refreshed every field - the asymmetry witness for reconciling one channel response per head offline."
+        ),
+    )
+    parser.add_argument(
+        "--time_base_response",
+        dest="time_base_response",
+        metavar="npz",
+        type=str,
+        default=None,
+        help=(
+            "The offline loop's per-field time anti-residual (records keyed by the field's read location: line_deviation, standard_error, pass_index), fed to `--carrier_tbc`'s refinement as a prior on the same footing as the carrier amplitude's witness. The sync resampler is a derivable component: its residual is exported each pass and its anti-residual comes back here on the next. The file is read statelessly - each decode applies exactly the total it names to the sync-derived line locations and remembers nothing of a previous pass - so the file must carry the total wanted, never a delta on top of what a previous pass applied. Inert without the file."
+        ),
+    )
+    parser.add_argument(
         "--carrier_tbc",
         dest="carrier_tbc",
         metavar="amount",
@@ -430,6 +548,87 @@ def main(args=None, use_gui=False):
             "Refine the time base correction from the luma carrier itself, correcting line timing and brightness together. (Experimental feature)"
             "\n  A playback speed error time-warps each line and shifts every demodulated level at once, because frequency is level after FM demodulation - so the decoder already derives both corrections from one spline of the measured line positions. This re-measures each line's 50%% sync crossing on the demodulated carrier frequency, a channel amplitude events cannot move; the refined positions feed the very same spline, in addition to the sync-pulse-derived measurements, so the resample timing and the wow level adjust improve together. The refinement corrects the wow-and-flutter band - at and below the head drum's rotation rate, where the carrier trace is the measurably better instrument and where the sync time base's own smoothing loses the flutter - and the level adjust's smoothing is shortened to let that band through."
             "\n  Add the flag with no value to apply the whole measured deviation; fractions scale it, 0 disables. The field's absolute alignment, including the color burst lock, stays where the sync-pulse time base put it, and any stretch of lines the carrier trace could not measure cleanly keeps its sync-derived positions outright. `--debug_plot luma_noise` gains a per-head panel of the measured line-period deviation."
+        ),
+    )
+    parser.add_argument(
+        "--baseband_eq",
+        dest="baseband_eq",
+        metavar="amount",
+        nargs="?",
+        type=float,
+        default=0.5,
+        const=1.0,
+        help=(
+            "Equalize the demodulated luma's low-frequency amplitude AND phase from a measured response of the playback channel to the specified waveform. (Experimental feature)"
+            "\n  The horizontal sync pulse is ideal by the video specification, and on a flat field so is the whole line; what the decoded waveform does that the specification does not is the playback channel's own response - heads, VCR electronics and the decoder's RF chain - to a known input, measured offline as a complex ratio against the ideal (`--baseband_lf_response`, `--sync_step_response`). This inverts that measured response, amplitude and phase together, on the demodulated luma before de-emphasis - the same fractional log-domain inverse `--luma_eq` applies to the RF path's magnitude. Only the polarity-common part of a two-polarity measurement is folded; the fold is withheld wherever the measurement's own error, the disagreement between heads, or the level-dependent share explains the departure, is exactly unity at DC and wherever nothing was measured, and never reaches the ring band."
+            "\n  On by default at HALF the measured amount wherever a measurement file is given, which is where the correction gain law puts a measured correction whose model error is not itself measurable: the applied fraction that maximises the expected gain is one over one plus that error, the benefit reaches zero at twice it, and half keeps three quarters of the ideal while staying far from the point where a correction costs more than it returns. There is a known model error here of exactly the kind the law is for - the polarity-common part folded is the linear channel PLUS the record emphasis, which is amplitude-dependent and calibrated at the sync pulse's own span, so it mis-scales on picture content at other amplitudes until that share moves to the transient-restoration stage that owns it. Add the flag with no value to fold the whole measured amount; fractions scale both the dB and the degrees, 0 disables. Inert without a measurement file. `--debug_plot luma_noise` gains a panel of the field's raw demodulated line folded over its lines, equalizer off and on, with the difference magnified."
+        ),
+    )
+    parser.add_argument(
+        "--baseband_lf_response",
+        dest="baseband_lf_response",
+        metavar="npz",
+        type=str,
+        default=None,
+        help=(
+            "Flat-field line-harmonic identification of the channel's complex response (an npz declaring its measurement site), consumed by `--baseband_eq` and `--head_switch_prior`. Measured on a flat-field recording from the same deck; load-bearing from the line rate to a few tens of kHz by its own standard errors."
+        ),
+    )
+    parser.add_argument(
+        "--sync_step_response",
+        dest="sync_step_response",
+        metavar="npz",
+        type=str,
+        default=None,
+        help=(
+            "Sync-step complex response export (per head and polarity with its even/odd decomposition, an npz declaring its measurement site) from `tools/ringing_measure/sync_step_response.py`, consumed by `--baseband_eq` and `--head_switch_prior`. Only the polarity-common part is folded. A comma-separated list is a chain: each later file was measured on a decode already corrected by the earlier ones, and its fold is applied in addition - the closed loop that calibrates the response from the corrected sync pulse itself."
+        ),
+    )
+    parser.add_argument(
+        "--head_switch_prior",
+        dest="head_switch_prior",
+        metavar="amount",
+        nargs="?",
+        type=float,
+        default=0,
+        const=1.0,
+        help=(
+            "Centre `--head_switch`'s per-band regularization on the measured channel instead of on zero. (Experimental feature)"
+            "\n  The cancellation measures its own transfer from the amplitude residual to the demodulated luma per band; below a few hundred kHz that evidence is thin and the estimate is pulled toward nothing. With a measured channel response declared (`--baseband_lf_response`, `--sync_step_response`) it is pulled instead toward the model kernel times the measured channel, as far as that measurement is believed, so the regression rules where it has evidence and the measurement fills where it has none. Add the flag with no value for the full measured centre; fractions scale it, 0 disables. Inert without a measurement file."
+        ),
+    )
+    parser.add_argument(
+        "--channel_response",
+        dest="channel_response",
+        metavar="npz",
+        type=str,
+        default=None,
+        help=(
+            "The identified complex response of the playback channel at the RF site immediately before the FM demodulator (an npz from the offline multidimensional information extrapolation loop under `tools/ringing_measure/`, declaring its site), consumed by `--channel_eq`."
+        ),
+    )
+    parser.add_argument(
+        "--channel_eq",
+        dest="channel_eq",
+        metavar="amount",
+        nargs="?",
+        type=float,
+        default=0,
+        const=1.0,
+        help=(
+            "Invert the identified channel response on the RF, immediately before the FM demodulator, where the whole path before the demodulator is linear and one filter fixes all levels at once. (Experimental feature)"
+            "\n  The response is identified offline by iterating the decoder's own measurements - the sync edges, the constant carrier envelope, the noise floor - against the specification's ideal until no residual is left above the noise; the converged anti-residual set is what this applies. Unity at DC and wherever nothing was identified, delay-normalized at the blanking carrier so the sync edges do not move, applied after the envelope has been taken so the color-under correction and dropout detection still read the tape. Supersedes `--luma_eq` at that site while active."
+            "\n  Add the flag with no value to apply the identified inverse in full; fractions scale it, 0 disables. Inert without `--channel_response`."
+        ),
+    )
+    parser.add_argument(
+        "--residual_channels",
+        dest="residual_channels",
+        metavar="dir",
+        type=str,
+        default=None,
+        help=(
+            "Write the residual channels of every field - the carrier envelope (amplitude), what the RF equalizer changed in the demodulated luma (frequency), the final time base's own speed deviation (time), and the color-under gain applied (chroma amplitude) - downscaled to 4fsc on the final time base correction, one npz per field in this directory, for the offline identification loop."
         ),
     )
     chroma_group.add_argument(
@@ -445,13 +644,15 @@ def main(args=None, use_gui=False):
     chroma_group.add_argument(
         "--cti_width",
         dest="cti_width",
-        type=int,
-        default=2,
+        type=_cti_width,
+        default="auto",
         help=(
-            "Sets Chroma Transient Improvement width (color-under only). This controls how sharply to focus the chroma in units of subcarrier cycles. Default is 2."
+            "Sets Chroma Transient Improvement width (color-under only), in subcarrier cycles. Default is auto."
             "\n  Since color under has lower bandwidth than the source, some of the hue detail is lost and sharper edges can be recovered with CTI"
+            "\n  auto measures the chroma path's own step response from the color burst, per field, and sizes the sweep to it - so the width follows the tape and the machine instead of a guess."
             "\n  * Larger width  -> more edge sharpness, less hue detail."
             "\n  * Smaller width -> more hue detail, less edge sharpness."
+            "\n  Give a number to override the measurement; 2 was the old fixed default and measured on a home recording the right value is 4."
         ),
     )
     chroma_group.add_argument(
@@ -520,7 +721,22 @@ def main(args=None, use_gui=False):
         " vsync_levels, " # shows the vsync levels and debugging information
         " hsync_model, " # shows the hsync artifact model's measurement and correction (needs --inverse_eq)
         " luma_noise," # shows the measured noise and frequency response on the luma carrier
-        " luma_averaging" # shows the frequency response of the luma's carrier per video head
+        " sync_step_fold," # the decoded line folded over its lines against the level-adjusted spec sync pulse, baseband equalizer off and on
+        " luma_averaging," # shows the frequency response of the luma's carrier per video head
+        " pipeline_graph" # renders the correction pipeline's own declaration as a graph, showing which stages this decode enables and where the chain collapses; writes <output>.pipeline.mmd and, alone among the plots, does not serialise the decode
+    )
+    parser.add_argument(
+        "--stages",
+        dest="stages",
+        metavar="+name,-name.part",
+        type=_stage_selection,
+        default=None,
+        help=(
+            "Turn correction stages, and components within a stage, on or off by name."
+            "\n  A comma separated list of +name or -name, where a name is a stage or stage.component - for example `--stages +head_switch,-cti,-ringing.ghost`."
+            "\n  Names are validated against the pipeline's own declaration, so a typo fails here with the valid list. `--debug_plot pipeline_graph` draws what a given selection resolves to."
+            "\n  This is on and off only. How MUCH of a correction to apply is derived from the residual, not set here."
+        ),
     )
     debug_group.add_argument(
         "--dp",
@@ -675,7 +891,8 @@ def main(args=None, use_gui=False):
     )
 
     raw_args = list(args) if args is not None else sys.argv[1:]
-    normalized_args = _normalize_ire0_adjust_args(raw_args)
+    normalized_args = _normalize_stages_args(
+        _normalize_ire0_adjust_args(raw_args))
     args = parser.parse_args(normalized_args)
 
     try:
@@ -758,14 +975,25 @@ def main(args=None, use_gui=False):
     rf_options["y_comb"] = args.y_comb
     rf_options["cti_mix"] = args.cti_mix
     rf_options["cti_width"] = args.cti_width
+    rf_options["stages"] = args.stages
     rf_options["cafc"] = args.cafc
     rf_options["cagc_fields"] = args.cagc_fields
     rf_options["chroma_env_gain"] = args.chroma_env_gain
+    rf_options["chroma_env_phase"] = args.chroma_env_phase
     rf_options["luma_eq"] = args.luma_eq
     rf_options["luma_transient"] = args.luma_transient
     rf_options["luma_beat"] = args.luma_beat
     rf_options["head_switch"] = args.head_switch
     rf_options["carrier_tbc"] = args.carrier_tbc
+    rf_options["baseband_eq"] = args.baseband_eq
+    rf_options["baseband_lf_response"] = args.baseband_lf_response
+    rf_options["sync_step_response"] = args.sync_step_response
+    rf_options["head_switch_prior"] = args.head_switch_prior
+    rf_options["head_switch_export"] = args.head_switch_export
+    rf_options["time_base_response"] = args.time_base_response
+    rf_options["channel_response"] = args.channel_response
+    rf_options["channel_eq"] = args.channel_eq
+    rf_options["residual_channels"] = args.residual_channels
     rf_options["inverse_eq"] = args.inverse_eq
     rf_options["lti_gain"] = args.lti_gain
     rf_options["disable_right_hsync"] = args.disable_right_hsync
@@ -804,6 +1032,27 @@ def main(args=None, use_gui=False):
         from vhsdecode.debug_plot import DebugPlot
 
         debug_plot = DebugPlot(args.debug_plot)
+
+    if debug_plot and debug_plot.is_plot_requested("pipeline_graph"):
+        # The pipeline's own declaration, rendered. Emitted here, before
+        # the decode, because it describes structure rather than any
+        # field: the graph a reader wants is of the pipeline they are
+        # about to run, resolved against the flags they actually gave.
+        from vhsdecode import pipeline_graph
+
+        graph_path = outname + ".pipeline.mmd"
+        try:
+            declared = pipeline_graph.load()
+            summary = pipeline_graph.summarise(declared, rf_options)
+            pipeline_graph.write(
+                graph_path, rf_options,
+                "%s %s - correction pipeline" % (tape_format, system))
+            logger.info(
+                "pipeline graph: %s (%d nodes, %d enabled: %s)",
+                graph_path, summary["nodes"], len(summary["enabled"]),
+                ", ".join(summary["enabled"]))
+        except Exception as err:                              # noqa: BLE001
+            logger.warning("could not render the pipeline graph: %s", err)
 
     if args.cxadc:
         logger.warning("--cxadc is deprecated! use -f 8fsc instead!")
@@ -884,7 +1133,8 @@ def main(args=None, use_gui=False):
         system=system,
         tape_format=tape_format,
         doDOD=not args.nodod,
-        threads=args.threads if not debug_plot else 0,
+        threads=(args.threads if not (debug_plot
+                 and debug_plot.wants_serialised_decode()) else 0),
         inputfreq=sample_freq,
         level_adjust=args.level_adjust,
         rf_options=rf_options,

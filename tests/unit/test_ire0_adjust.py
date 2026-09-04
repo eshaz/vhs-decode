@@ -45,7 +45,14 @@ def _field(ire0_adjust="backporch,hsync"):
     )
     return types.SimpleNamespace(
         rf=rf,
-        ire0_backporch=[74, 124],
+        # The real field derives these from the format's timing
+        # (`FieldShared.level_windows`); the stub supplies what that
+        # derivation produces for NTSC VHS at 4fsc, so the geometry the
+        # tests below write into the input still lands where it should:
+        # the sync tip inside [0, 74) and blanking after it.
+        level_windows=lambda: ((7, 60), (112, 128)),
+        # the real vectorised measurement, so the stub exercises it
+        _window_levels=FieldShared._window_levels,
         outlinecount=OUTLINECOUNT,
         outlinelen=OUTLINELEN,
         out_scale=358.4,
@@ -122,8 +129,8 @@ def test_hsync_alone_degenerate_field_still_guarded():
 def test_healthy_field_still_uses_its_own_hz_ire():
     """The guard must not disturb a field whose windows read different levels.
 
-    hz_to_output measures hsync over [4, ire0_backporch[0] - 4) and black over
-    [ire0_backporch[0] + 4, ire0_backporch[1] - 4), so the sync level has to
+    hz_to_output measures hsync over the derived tip window and black over
+    the derived back porch window, so the sync level has to
     cover the whole first window to move the median.
     """
     inp = _flat_input()
@@ -138,3 +145,63 @@ def test_healthy_field_still_uses_its_own_hz_ire():
 
     assert out.dtype == np.uint16
     assert not np.array_equal(out, backporch_only)
+
+
+class TestLevelWindows:
+    """`FieldShared.level_windows` derives the measurement spans from the
+    format's timing. Both spans were hard-coded per system and both were
+    misplaced; these are the regression guards for that."""
+
+    @staticmethod
+    def _field(system):
+        import math
+        from vhsdecode.field import FieldShared
+
+        if system == "NTSC":
+            outfreq, lpf = 4 * 315e6 / 88 / 1e6, 6.6e6
+            sys_params = {"hsyncPulseUS": 4.7, "colorBurstUS": (5.3, 7.8),
+                          "activeVideoUS": (9.45, 62.5), "outfreq": outfreq}
+        else:
+            outfreq, lpf = 4 * 4433618.75 / 1e6, 3.4e6
+            sys_params = {"hsyncPulseUS": 4.7, "colorBurstUS": (5.6, 7.85),
+                          "activeVideoUS": (10.5, 62.5), "outfreq": outfreq}
+        rf = types.SimpleNamespace(SysParams=sys_params,
+                                   DecoderParams={"video_lpf_freq": lpf})
+        stub = types.SimpleNamespace(
+            rf=rf, usectooutpx=lambda x: x * outfreq)
+        return FieldShared.level_windows(stub), sys_params, outfreq
+
+    def test_the_porch_starts_at_the_burst_end_not_the_burst_start(self):
+        """The old NTSC window began at 74, which is the burst START, so it
+        sat in the sync rise's settling tail rather than on the porch."""
+        (_, porch), sys_params, outfreq = self._field("NTSC")
+        assert porch[0] >= sys_params["colorBurstUS"][1] * outfreq - 1
+        assert porch[0] > 74
+
+    def test_the_porch_stops_short_of_active_video(self):
+        """A window that reaches the active transition picks up the approach
+        to it and moves with picture content; every window stopping a
+        settling guard short measured 5-50x cleaner."""
+        (_, porch), sys_params, outfreq = self._field("NTSC")
+        active_start = sys_params["activeVideoUS"][0] * outfreq
+        assert porch[1] < active_start
+        assert active_start - porch[1] >= 4
+
+    def test_the_tip_stops_before_the_sync_rise(self):
+        """The old tip window ran to `ire0_backporch[0] - 4` = 70, and the
+        rise is at output sample 68 - so it measured through the edge."""
+        (tip, _), sys_params, outfreq = self._field("NTSC")
+        rise = sys_params["hsyncPulseUS"] * outfreq
+        assert tip[1] < rise
+        assert tip[0] > 0
+
+    def test_both_windows_are_non_degenerate_on_both_systems(self):
+        for system in ("NTSC", "PAL"):
+            (tip, porch), _, _ = self._field(system)
+            assert tip[1] - tip[0] >= 4, system
+            assert porch[1] - porch[0] >= 4, system
+
+    def test_the_windows_do_not_overlap_each_other(self):
+        for system in ("NTSC", "PAL"):
+            (tip, porch), _, _ = self._field(system)
+            assert tip[1] <= porch[0], system

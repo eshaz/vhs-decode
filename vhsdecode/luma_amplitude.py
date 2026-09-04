@@ -60,6 +60,8 @@ nothing else. It carries no assumption about what will consume it.
 from collections import namedtuple
 
 import numpy as np
+
+from vhsdecode import residual_limit
 from numba import njit
 
 import scipy.fft as sps_fft
@@ -178,6 +180,27 @@ CURVE_MINIMUM_POPULATION = 64
 
 # Points the accumulated response needs before it stands in for the line.
 CURVE_DENSE_MINIMUM_POINTS = 8
+
+
+# The sweep residue's bins, in the collapse formula's OWN argument theta^2
+# (= q * slope^2), so nothing about the axis is invented here: the ladder is
+# anchored on the knee at theta^2 = 1, where the formula's own damping
+# 1/(1 + theta^2) halves, and each step is a factor of four - one octave in
+# theta. It reaches eight octaves below the knee because that is where the
+# carrier's sweep actually lives: measured over four captures the median
+# theta is 0.02-0.04 and the 99th percentile 0.33, so almost every sample
+# sits at theta^2 below 0.11, and a ladder centred on the knee would put the
+# whole picture into one bin.
+SWEEP_RESIDUE_OCTAVES = 8
+SWEEP_RESIDUE_RATIO = 4.0
+
+
+
+# The sync transition's 10-90% width as the video standard sends it. Used to
+# stand a guard off each blanking edge, never to model the edge itself - the
+# recorded edge is not this shape (the sync-edge instrument reads a delay of
+# 45-55 ns against an ideal centred on the same crossing).
+SYNC_EDGE_US = 0.140
 
 
 # Natural log amplitude to decibels, so the instrumentation reports in the unit
@@ -448,12 +471,18 @@ def _sweep_arrays(carrier_hz, span, track_width, track_arg, slope):
 
 
 @njit(cache=True, nogil=True, fastmath=True)
-def _collapse_at(l1, q, q2, rho, ceiling, position, fraction, lower, upper,
+def _collapse_at(l1, q, q2, rho, ceiling, fraction, lower, upper,
                  track, slope):
     """The closed-form collapse at one resolved table index. See
     `sweep_collapse_tables` for the terms; `_deviation_from_response` and the
-    strided `_collapse_closed` both stand on this so the two paths cannot
-    drift apart."""
+    the deviation kernel stands on this alone now. Its strided companion
+    `_collapse_closed` was retired with the compensated binning that was its
+    only caller - the response is measured as the deviation's own residual,
+    so there is no longer a second path to keep in step.
+
+    Takes the index already RESOLVED - lower, upper and the fraction between
+    them. The unresolved `position` was taken here too and never read, every
+    caller having resolved it before the call."""
     a = l1[lower]
     l1_v = a + (l1[upper] - a) * fraction
     a = q[lower]
@@ -476,36 +505,12 @@ def _collapse_at(l1, q, q2, rho, ceiling, position, fraction, lower, upper,
     if collapse > ceil_v:
         collapse = ceil_v
     # The phase is the same complex number read the other way: the even and
-    # ceiling factors are positive reals and cannot turn it.
-    return collapse, np.arctan2(imag, real)
-
-
-@njit(cache=True, nogil=True, fastmath=True)
-def _collapse_closed(carrier_hz, track_arg, slope, l1, q, q2, rho, ceiling,
-                     frequency_step, out):
-    """The collapse on a sample set, float64 tables, float32 out - the strided
-    companion of the deviation kernel, for the compensated binning."""
-    last = len(l1) - 1
-    for i in range(len(carrier_hz)):
-        position = carrier_hz[i] / frequency_step
-        if position <= 0.0:
-            lower = 0
-            upper = 0
-            fraction = 0.0
-        elif position >= last:
-            lower = last
-            upper = last
-            fraction = 0.0
-        else:
-            lower = int(position)
-            upper = lower + 1
-            fraction = position - lower
-        value, _ = _collapse_at(
-            l1, q, q2, rho, ceiling, position, fraction, lower, upper,
-            np.float64(track_arg[i]), np.float64(slope[i]),
-        )
-        out[i] = np.float32(value)
-    return out
+    # ceiling factors are positive reals and cannot turn it. theta^2 comes
+    # back with them because it is the formula's own sweep argument and the
+    # measured sweep residue is indexed on it - recomputing it in the caller
+    # would be a second spelling of the same lerp, which is exactly how two
+    # paths drift apart.
+    return collapse, np.arctan2(imag, real), theta2
 
 
 def path_transient_scale(rf):
@@ -899,6 +904,119 @@ def _described_level(
     return level
 
 
+def sweep_residue_edges():
+    """Bin edges in theta^2 for the measured sweep residue.
+
+    The first bin holds everything below the ladder and the last everything
+    at or above the knee, so every sweep rate lands somewhere and no sample
+    is dropped from the measurement that corrects it.
+    """
+    ladder = SWEEP_RESIDUE_RATIO ** np.arange(
+        -SWEEP_RESIDUE_OCTAVES, 1, dtype=np.float64)
+    return np.concatenate(([0.0], ladder))
+
+
+# RULE R3 and the statistic that carries it live in `residual_limit`, the
+# shared law - see `docs/RESIDUAL_LIMIT_DESIGN.md`. They are named here so
+# the call sites below read as the design does.
+_cell_medians = residual_limit.cell_medians
+_orthogonal = residual_limit.orthogonal
+
+
+def joint_residue_of(rf, head, bin_count):
+    """The product component: what neither margin can carry, over carrier
+    frequency AND the sweep argument together.
+
+    Held orthogonal to both margins by construction (see `_orthogonal`), so
+    the response table stays a response and the collapse residue stays a
+    function of sweep rate alone.
+
+    ADMITTED ONLY AS FAR AS IT GENERALISES, and the test is the component's
+    own: it is accumulated in two banks on alternating fields, and what is
+    applied is scaled by how far the banks agree - the population-weighted
+    correlation between them, floored at zero. A component that describes
+    the path reads near one and passes through; a component that describes
+    the field it was measured from reads near zero and is withheld, with no
+    constant chosen anywhere to do it.
+
+    That test exists because this term needs it. Fitted on the fields it is
+    then measured on, the limit drives every component to nothing -
+    0.0001 / 0.0000 / 0.0002 dB for response, sweep and product. Fitted on
+    other fields it stands at 0.0328 / 0.0079 / 0.0563 dB, and the product
+    is the WORST of the three: the least reproducible from one field to the
+    next, which is what a term describing the picture rather than the path
+    looks like. In-sample convergence is not evidence; see rule R5 in
+    `docs/RESIDUAL_LIMIT_DESIGN.md`.
+
+    Ones wherever nothing has been measured, so an unvisited cell is left
+    to the formula rather than to an extrapolation across one.
+    """
+    edges = sweep_residue_edges()
+    store = rf.__dict__.get("_luma_joint_residue") or {}
+    entry = store.get(bool(head))
+    factor = np.ones((bin_count, len(edges)))
+    if entry is None:
+        return edges, factor
+    banks, weights = entry
+    weight = weights.sum(axis=0)
+    described = weight >= CURVE_MINIMUM_POPULATION
+    if not np.any(described):
+        return edges, factor
+    cells = np.zeros_like(weight)
+    cells[described] = banks.sum(axis=0)[described] / weight[described]
+    cells = _orthogonal(cells, np.where(described, weight, 0.0))
+    # the two banks, each on its own evidence, projected the same way
+    pair = []
+    for bank in (0, 1):
+        w = weights[bank]
+        ok = w >= CURVE_MINIMUM_POPULATION
+        half = np.zeros_like(w)
+        half[ok] = banks[bank][ok] / w[ok]
+        pair.append(_orthogonal(half, np.where(ok, w, 0.0)))
+    trust = residual_limit.agreement(
+        pair[0], pair[1], weights[0], weights[1], CURVE_MINIMUM_POPULATION)
+    rf._luma_joint_trust = trust
+    return edges, np.exp(trust * cells)
+
+
+def sweep_residue_of(rf, head):
+    """The accumulated multiplicative correction to the collapse, per bin.
+
+    C is predicted from the decoder's own filter and is right to about a
+    twentieth of a decibel. What it is not right about is measurable, is a
+    function of the sweep rate alone, and reproduces across pictures on the
+    formula's own theta axis - r = +0.94 and +0.78 between two pictures of
+    one head, where the same residue read on per-condition sweep DECILES
+    cannot be compared across conditions at all, the deciles standing at
+    different sweep rates on each.
+
+    THE PRODUCT TERM IS NOT CARRIED, and was built and measured before that
+    was decided. A joint table over frequency AND sweep rate does reduce the
+    residual in its own cells - 0.836 to 0.666 per cent rms on chromanoise,
+    1.487 to 1.427 on bars - but it does nothing at all for the
+    frequency-binned residual the debug panel draws, which it cannot: that
+    margin is divided out before this is accumulated, so the two are
+    orthogonal by construction. Against that it reproduces across pictures
+    at only r = +0.25 and +0.19, which is the signature of describing the
+    picture, and the spelling that measured it cost 60 per cent of the
+    decode rate. Restoring it is a table shape and a lookup; the case for it
+    has to come from a consumer that reads the joint residual, not from the
+    panel.
+
+    Ones wherever nothing has been measured yet, so an unvisited sweep rate
+    is left to the formula rather than to an extrapolation.
+    """
+    edges = sweep_residue_edges()
+    store = rf.__dict__.get("_luma_sweep_residue") or {}
+    entry = store.get(bool(head))
+    residue = np.ones(len(edges))
+    if entry is not None:
+        total, weight = entry
+        described = weight >= CURVE_MINIMUM_POPULATION
+        residue[described] = np.exp(total[described] / weight[described])
+    return edges, residue
+
+
 def _model_log_level(grid_hz, curve, dense, sync_band):
     """`ln R` on a frequency grid: the measurement inside the described range,
     the low end's own roll-off continued below it, the fitted line above."""
@@ -961,7 +1079,8 @@ def _response_tables(response, frequency_step, curve, dense, sync_band):
 @njit(cache=True, nogil=True, fastmath=True)
 def _deviation_from_response(
     amplitude, carrier_hz, fail_inv, l1, q, q2, rho, ceiling,
-    track_arg, slope, frequency_step, low, high
+    track_arg, slope, frequency_step, low, high,
+    residue_edges, residue, joint, sync_tip_hz, bin_hz
 ):
     """The residual `n`: how far the amplitude departs from `S * C * R`.
 
@@ -1012,11 +1131,25 @@ def _deviation_from_response(
         base = fail_inv[lower]
         inverse = base + (fail_inv[upper] - base) * fraction
         ratio = amplitude[i] * inverse
-        collapse, _ = _collapse_at(
-            l1, q, q2, rho, ceiling, np.float64(position),
+        collapse, _, theta2 = _collapse_at(
+            l1, q, q2, rho, ceiling,
             np.float64(fraction), lower, upper,
             np.float64(track_arg[i]), np.float64(slope[i]),
         )
+        # The measured half of the collapse: what the formula predicts times
+        # what the residue says it gets wrong at this sweep rate. The bins
+        # are few and the mass sits in the first of them, so the scan costs
+        # less on average than the division below.
+        b = 0
+        while b + 1 < len(residue_edges) and theta2 >= residue_edges[b + 1]:
+            b += 1
+        f_bin = int((carrier_hz[i] - sync_tip_hz) / bin_hz)
+        if f_bin < 0:
+            f_bin = 0
+        elif f_bin >= len(joint):
+            f_bin = len(joint) - 1
+        # the sweep margin and the product that neither margin can carry
+        collapse *= residue[b] * joint[f_bin, b]
         if collapse > 0.05:
             ratio = np.float32(ratio / collapse)
         if ratio <= zero:
@@ -1139,8 +1272,8 @@ def _block_residual_kernel(envelope, carrier_hz, expected_ln, l1, q, q2, rho,
             fraction = position - np.float32(lower)
         base = expected_ln[lower]
         expected = base + (expected_ln[upper] - base) * fraction
-        collapse, _ = _collapse_at(
-            l1, q, q2, rho, ceiling, np.float64(position),
+        collapse, _, _ = _collapse_at(
+            l1, q, q2, rho, ceiling,
             np.float64(fraction), lower, upper,
             np.float64(track_arg[i]), np.float64(slope[i]),
         )
@@ -1176,8 +1309,8 @@ def _block_phase_kernel(carrier_hz, l1, q, q2, rho, ceiling, track_arg, slope,
             lower = int(position)
             upper = lower + 1
             fraction = position - np.float32(lower)
-        _, psi = _collapse_at(
-            l1, q, q2, rho, ceiling, np.float64(position),
+        _, psi, _ = _collapse_at(
+            l1, q, q2, rho, ceiling,
             np.float64(fraction), lower, upper,
             np.float64(track_arg[i]), np.float64(slope[i]),
         )
@@ -1308,13 +1441,57 @@ def sync_edge_trace(field):
 def _measure_level_anchors(field, centred_hz):
     """The carrier frequency at the format's two fixed levels, measured.
 
-    Per usable line, the median carrier over the sync tip and over the two
-    porches (the burst span excluded), anchored on the decoder's line
-    positions with guard margins from the format's own transition width and
-    the path's settling span. The medians are robust to the anchor grid's
-    few-sample jitter, which is why plain linelocs plus spec offsets
-    suffice here where the fold instrument needed refined edges - a LEVEL
-    is flat across its span; a TIMING is not.
+    Per usable line, the median carrier over the sync tip and over the back
+    porch after the burst, anchored on the decoder's line positions with
+    guard margins from the format's own transition width and the path's
+    settling span. The medians are robust to the anchor grid's few-sample
+    jitter, which is why plain linelocs plus spec offsets suffice here
+    where the fold instrument needed refined edges - a LEVEL is flat across
+    its span; a TIMING is not.
+
+    THE FRONT PORCH IS NOT A LEVEL and is deliberately excluded. It stood
+    here pooled with the back porch, on geometry alone, until the
+    consuming lane asked whether the anchors move with picture content.
+    They did. The front porch is 1.5 us long and follows the active-video
+    transition, whose carrier overshoot needs about 1 us to settle at this
+    path's transient scale, so no guard leaves a settled span inside it:
+    measured per line over four captures of ONE deck - four contents, two
+    speeds, both heads; the mechanism is a porch shorter than the path's
+    settling and should hold wherever that is true, but the SIZE of the
+    error is a property of the path and is not established off this deck.
+    The per-line regression below is the test to repeat elsewhere. The
+    front span's own median sat
+    at -0.04 / -5.41 / +2.63 / +5.40 IRE across them (sd 3.99) while every
+    back-porch window agreed to sd 0.3-0.5, and the front-minus-back
+    difference regressed on the PRECEDING line's active level at
+    -0.21 +- 0.005 IRE per IRE (41-66 sigma on the two flat-field tapes,
+    2.3 IRE of anchor swing). Pooling the two therefore averaged a settled
+    level with a content-driven tail. The back porch after the burst
+    carries none of it: slope 0.001-0.009 IRE per IRE, under 0.06 IRE of
+    swing, and its median holds to sd 0.27 IRE across the same four
+    captures. A span between the sync rise and the burst was also carried
+    here and was DEAD CODE - at 40 MSps the guards leave it negative width
+    - and the rise's own overshoot occupies it in any case (+64 IRE at
+    5.0 us, settled by 5.8).
+
+    Do not extend the span to the start of active video. lddecode's own
+    blanking convention (burst end to active start) was measured on the
+    same lines and picks up the approach to the active transition: slope
+    +0.010 to +0.052 IRE per IRE, 11-49 sigma, up to 0.48 IRE of swing.
+
+    That last ranking is SMALL in absolute terms and was checked across
+    domains and decks after the consuming lane failed to reproduce it. In
+    the decoded 4fsc luma of this deck's flat-field capture it does
+    reproduce - the windows reaching active start regress at +0.0040 to
+    +0.0042 IRE per IRE against +0.0001 to +0.0012 for the rest, 32-36
+    sigma on the line-correlation-corrected count - so the video domain is
+    not blind to it. What differs between decks is not the ranking but the
+    COMMON term every window shares: about 0.001 IRE per IRE here against
+    about 0.021 on the consuming lane's tape, where the same ~0.002-0.004
+    best-to-worst spread is a 9% effect instead of a large ratio. Choose
+    the window on the spread, never on the ratio, and expect the common
+    term - a settling tail, not a window artefact - to dominate on tapes
+    whose porch has one.
 
     Returns (porch_hz, tip_hz) medians-of-lines for this field, or None.
     The spec anchor in `carrier_frequency_bins` is deliberately NOT fed by
@@ -1322,6 +1499,17 @@ def _measure_level_anchors(field, centred_hz):
     does damage there); this is an EXPORT for consumers that need the
     measured axis - the head-switch kernel's absolute level and slope
     anchors first among them.
+
+    READ THE TIP WITH CARE. The sync pulse is spec-ideal in TIMING as
+    recorded but NOT in DEPTH after the recorder: on these decks the tip
+    sits shallow (this measurement reads porch-minus-tip 5.8% under the
+    spec deviation; the decoded picture reads the tip near -34 IRE while
+    black and white land on spec). So `porch_hz` is a sound LEVEL anchor,
+    but a scale derived from porch minus tip inherits the recorder's sync
+    processing and would stretch a spec-level picture - measured by the
+    consuming lane on the source tape. `hz_ire_measured` is exported as
+    what it is, a tip-referenced scale, and should not replace the spec
+    scale for picture levels.
     """
     linelocs = getattr(field, "linelocs2", None)
     if linelocs is None:
@@ -1329,8 +1517,9 @@ def _measure_level_anchors(field, centred_hz):
     rf = field.rf
     fs_us = rf.freq_hz / 1e6
     sys_params = rf.SysParams
-    # spans in samples relative to each line's sync falling edge
-    edge = 0.140 * fs_us * 3.0
+    # spans in samples relative to each line's sync falling edge, from the
+    # format's own timings rather than NTSC numbers written out here
+    edge = SYNC_EDGE_US * fs_us * 3.0
     knee, span = path_transient_scale(rf)
     # Two guards, the ringing lane's convention: a LEVEL span needs only the
     # transition width plus a third of the settling (levels are flat once
@@ -1339,11 +1528,9 @@ def _measure_level_anchors(field, centred_hz):
     # was measured to eat every porch whole.
     level_guard = int(np.ceil(edge + span / 3.0))
     tip_guard = int(np.ceil(edge + span))
-    sync_samples = int(round(4.7 * fs_us))
-    front = int(round(1.5 * fs_us))
-    burst_lo = int(round(5.3 * fs_us))
-    burst_hi = int(round(7.8 * fs_us))
-    active = int(round(9.45 * fs_us))
+    sync_samples = int(round(sys_params["hsyncPulseUS"] * fs_us))
+    burst_hi = int(round(sys_params["colorBurstUS"][1] * fs_us))
+    active = int(round(sys_params["activeVideoUS"][0] * fs_us))
     n = len(centred_hz)
     L = np.asarray(linelocs, dtype=np.float64)
     inner = L[9:min(len(L) - 1, 261)]
@@ -1362,27 +1549,16 @@ def _measure_level_anchors(field, centred_hz):
         if lo < 0 or hi + active >= n or hi <= lo:
             continue
         tips.append(np.median(centred_hz[lo:hi]))
-        spans_p = []
-        f_lo, f_hi = a - front + level_guard, a - level_guard
-        if f_hi > f_lo:
-            spans_p.append(centred_hz[f_lo:f_hi])
-        b_lo = a + sync_samples + level_guard
-        b_hi = a + burst_lo - level_guard
-        if b_hi > b_lo:
-            spans_p.append(centred_hz[b_lo:b_hi])
-        b2_lo = a + burst_hi + level_guard
-        b2_hi = a + active - level_guard
-        if b2_hi > b2_lo:
-            spans_p.append(centred_hz[b2_lo:b2_hi])
-        if spans_p:
-            porches.append(np.median(np.concatenate(spans_p)))
+        p_lo = a + burst_hi + level_guard
+        p_hi = a + active - level_guard
+        if p_hi > p_lo:
+            porches.append(np.median(centred_hz[p_lo:p_hi]))
     if len(tips) < CURVE_INDEPENDENT_POINTS or len(porches) < CURVE_INDEPENDENT_POINTS:
         return None
     return float(np.median(porches)), float(np.median(tips))
 
 
-def _refresh_block_model(rf, response, frequency_step, tables, deviation,
-                         stride, dropout_fraction, sync_band):
+def _refresh_block_model(rf, response, frequency_step, tables, sync_band):
     """Rebuild the pooled block bundle from this field's accumulated state.
 
     The noise scale that lived here is measured history: a strided-MAD
@@ -1393,7 +1569,9 @@ def _refresh_block_model(rf, response, frequency_step, tables, deviation,
     on Ethan's ruling. The honest floor and the noise's frequency response
     live in the shared inbox (luma_noise_response) and this lane's fold
     instruments; a future noise consumer starts from those, not from a MAD
-    over picture.
+    over picture. Its inputs - the deviation, the stride it was sampled on
+    and the dropout fraction - were still taken here after it went, and are
+    now gone with it.
     """
     store = rf.__dict__.get("_luma_eq_lines")
     if not store:
@@ -1650,6 +1828,15 @@ def measure_amplitude_deviation(field):
     # The fitted line, accumulated per head where the measurement is made.
     # One owner for the model's factors: the equalizer and the block bundle
     # both read this store, and neither accumulates it themselves.
+    # The response's own reading of which head wrote this field, against
+    # the parity the decoder assigned. Disagreement means the accumulations
+    # are mixing two heads, which no amount of limit-taking can undo.
+    matched = head_from_response(rf, levels, population)
+    if matched is not None:
+        agree, seen = rf.__dict__.get("_luma_head_check", (0, 0))
+        rf._luma_head_check = (
+            agree + int(matched == bool(field.isFirstField)), seen + 1)
+
     line_store = rf.__dict__.setdefault("_luma_eq_lines", {})
     line_key = bool(field.isFirstField)
     line_total, line_weight = line_store.get(line_key, (np.zeros(3), 0.0))
@@ -1660,11 +1847,12 @@ def measure_amplitude_deviation(field):
     # fitting densely per field loses - but a decode's worth of one head's
     # fields determines it well, and the two heads genuinely differ.
     #
-    # Binned a second time, from the same subsample, with the sweep collapse divided
-    # out first so a carrier that was moving contributes the amplitude it would
-    # have had standing still. What comes back is the amplitude's own median
-    # against carrier frequency - the curve the debug plot draws as "carrier
-    # amplitude / median" - and it is used as the model directly.
+    # Measured below as the deviation's own residual rather than by binning
+    # the subsample a second time with the collapse divided out. That second
+    # binning stood here for a long time and its failure is recorded at the
+    # measurement itself: it estimated a quantity related to the residual but
+    # not identical to it, and the table it produced could not cancel the
+    # residual it described.
     #
     # A steadiness gate stood here for a long time and is measurably better on
     # the bar patterns - about 0.11 on 75bars SP and 0.10 at EP against the
@@ -1672,108 +1860,40 @@ def measure_amplitude_deviation(field):
     # for it to act on. It is absent by decision: the gate makes the model
     # describe a sub-population rather than the amplitude, and on real content
     # the deviation is then not flat where it should be.
-    compensated = sampled_flattened
     tables = sweep_collapse_tables(rf)
     track_arg = np.empty_like(centred_hz)
     slope = np.empty_like(centred_hz)
     _sweep_arrays(centred_hz, tables.span, tables.track_width, track_arg, slope)
-    # The collapse on the subsample, for the compensated binning: a moving
-    # carrier contributes the amplitude it would have had standing still.
-    # Same float64 formula the deviation kernel applies per sample, so the
-    # two paths cannot drift apart; float32 out, the width the binning gate
-    # has always read.
-    sampled_collapse = _collapse_closed(
-        sampled_carrier_hz, track_arg[::stride], slope[::stride],
-        tables.l1, tables.q, tables.q2, tables.rho, tables.ceiling,
-        np.float64(frequency_step),
-        np.empty(len(sampled_carrier_hz), dtype=np.float32),
-    )
-    alive = sampled_collapse > 0.05
-    compensated = np.where(
-        alive, compensated / np.where(alive, sampled_collapse, 1.0), 0.0
-    )
-    dense_levels, dense_population, dense_centre_hz = _binned_median(
-        compensated, sample_bin, sync_tip_hz, bin_hz, bin_count
-    )
-    store = rf.__dict__.setdefault("_luma_dense_response", {})
-    key = bool(field.isFirstField)
-    total, weight, centre_total = store.setdefault(
-        key, (np.zeros(bin_count), np.zeros(bin_count), np.zeros(bin_count))
-    )
-    # Every bin that saw anything contributes, weighted by how much it saw, and
-    # the population test is applied to the ACCUMULATED weight rather than to
-    # each field's share of it. Testing per field defeats the accumulation: a
-    # bin holding thirty samples a field never qualifies, though thirty fields
-    # of them would describe it well. That is what starved the ends of the
-    # range, where the model then fell back on the line - and the line is a poor
-    # description exactly there, because the amplitude arches rather than falls
-    # monotonically.
-    described = (dense_population > 0.0) & (dense_levels > 0)
-    _measure_reliability(rf, key, dense_levels, dense_population, described,
-                         total, weight)
-    total[described] += np.log(dense_levels[described]) * dense_population[described]
-    weight[described] += dense_population[described]
-    # The frequency each bin stands at is accumulated the same way its level is,
-    # weighted by how many samples went into it. Taking it from THIS field's
-    # centres instead - which is what happened - puts a zero wherever a bin
-    # accumulated enough from earlier fields but the picture did not visit it
-    # this time. The frequencies then stop ascending, `np.interp` reads them as
-    # nonsense, and the model swings by 2.5x where the amplitude it describes
-    # varies by 1.14x. It bites on material whose levels roam rather than sit at
-    # a few discrete bars, which is most real content.
-    centre_total[described] += (
-        dense_centre_hz[described] * dense_population[described]
-    )
-    # Only frequencies with real evidence describe themselves, and the test is
-    # on the ACCUMULATED weight. Bins the carrier barely touched - the far
-    # undershoot below sync tip, the overshoot past peak white - are left to
-    # what `_response_tables` extrapolates. Admitting them instead, on
-    # whatever handful of samples they hold, stretches the interpolation over
-    # uncorrelated excursions and drags the model away from the amplitude it
-    # follows.
-    #
-    # This admission is the ONLY gate. Past it a bin is believed outright, and
-    # the graded blends that used to sit downstream of it are gone - see
-    # `_described_level` for the measurements that ended them.
-    #
-    # A PARAMETRIC form of the accumulated response was built and rejected, and
-    # it is worth saying so because it is an attractive thing to rebuild. The
-    # ripple was fitted as damped sinusoids by matrix pencil, which on planted
-    # signals is exact where peak picking leaves a third of the ripple behind.
-    # On real data it does not hold: the singular values of the Hankel matrix
-    # decay smoothly - 1, 0.69, 0.20, 0.17, 0.17, 0.14 - where a true sum of
-    # sinusoids drops twelve orders of magnitude after its last component, so
-    # there is no rank to find, the answer moves with the pencil parameter, and
-    # the strongest component disagrees between the two heads by microseconds
-    # rather than the nanoseconds a real echo would. The test before trying
-    # again is that singular value spectrum: no knee, no parametric form.
-    accumulated = weight >= CURVE_MINIMUM_POPULATION
-    dense = (
-        (
-            centre_total[accumulated] / weight[accumulated],
-            total[accumulated] / weight[accumulated],
-            weight[accumulated],
-        )
-        if np.count_nonzero(accumulated) >= CURVE_DENSE_MINIMUM_POINTS
-        else None
-    )
 
+    key = bool(field.isFirstField)
+    store = rf.__dict__.setdefault("_luma_dense_response", {})
+    banks, weights, centre_total = store.setdefault(
+        key,
+        (np.zeros((2, bin_count)), np.zeros((2, bin_count)), np.zeros(bin_count)),
+    )
+    # Banked on THIS HEAD's own field count, not on the decode's. Fields
+    # alternate heads, so a bank index that flips per field puts every one
+    # of a head's fields in the same bank and leaves the other empty - the
+    # agreement test then has nothing to compare and reads zero for a
+    # reason that has nothing to do with the component. That is a mistake
+    # this file made and the measurement it produced was worthless.
+    seen = rf.__dict__.setdefault("_luma_field_count", {})
+    bank = int(seen.get(key, 0)) % 2
+    seen[key] = int(seen.get(key, 0)) + 1
+    total = banks.sum(axis=0)
+    weight = weights.sum(axis=0)
+    # THE MODEL IN FORCE, from the fields already seen and not from this one.
+    # Measuring a field through a model its own residual has already entered
+    # is fitting, not measuring; keeping this field out is what makes the
+    # sequence below an iteration.
+    dense = _head_model(rf, key, bin_count)
+    sync_band = (rf.iretohz(sys_params["vsync_ire"], spec=True),
+                 rf.iretohz(0.0, spec=True))
+    residue_edges, residue = sweep_residue_of(rf, key)
+    _, joint = joint_residue_of(rf, key, bin_count)
     dropout_fraction = rf.dod_options.dod_threshold_p
-    # The deviation divides by the LINE'S R, not the accumulated table -
-    # measured, resolved, on all three conditions: withholding the table is
-    # worth -0.016/-0.037/-0.041 per cent against keeping it, and
-    # -0.012/-0.025/-0.043 against the synthesized-collapse build it
-    # replaced (record-referenced, paired). Under the closed-form collapse
-    # the table's ripple prices NEGATIVE here: what it absorbs from the
-    # deviation is structure the correction is better off leaving. The table
-    # is still measured and accumulated - the equalizer inverts it on its own
-    # evidence, the plots draw it, and the block model's expectation carries
-    # what its consumer rules (see `_refresh_block_model`).
     fail_inv = _response_tables(
-        response, frequency_step, curve, None,
-        # sync tip and blanking, the format's own two fixed levels
-        (rf.iretohz(sys_params["vsync_ire"], spec=True),
-         rf.iretohz(0.0, spec=True)),
+        response, frequency_step, curve, dense, sync_band,
     )
     deviation = _deviation_from_response(
         amplitude,
@@ -1785,7 +1905,166 @@ def measure_amplitude_deviation(field):
         np.float32(frequency_step),
         np.float32(dropout_fraction),
         np.float32(1.0 / dropout_fraction),
+        residue_edges,
+        residue,
+        joint,
+        np.float64(sync_tip_hz),
+        np.float64(bin_hz),
     )
+
+    # THE LIMIT. The response is measured as the deviation's OWN residual
+    # under the model in force, and that measurement goes back into the
+    # model, so each field is one step of an iteration that the decode's own
+    # field sequence carries to its limit.
+    #
+    # It replaces a different estimator, and the difference is the whole
+    # point. What stood here binned the flattened subsample with the collapse
+    # divided out - a quantity RELATED to the residual but not the same one -
+    # and the table it produced could not cancel the residual it was supposed
+    # to describe: re-imposing it on the deviation made the trace worse, not
+    # better, which is why the table was withheld from the deviation and the
+    # withholding measured as an improvement. Measured against itself instead,
+    # the residual closes. Offline, driving this to convergence on captured
+    # fields takes the binned residual from 24-41 times the bins' own standard
+    # error to below it in one pass on chromanoise and two on bars, and the
+    # peak-to-peak swing from 7-9.5 per cent to 0.2-0.5.
+    #
+    # The roll-off survives its own audit under that limit: re-derived from
+    # the converged model it lands at -3.296 against -3.303 dB/MHz fitted
+    # directly on 75bars head A, -3.299 against -3.323 and -2.956 against
+    # -2.988 on chromanoise. The line is not carrying an error the residual
+    # was hiding.
+    #
+    # WHY THE SWEEP AXIS IS NOT OPTIONAL. Taken over frequency alone the
+    # limit converges onto the picture: the converged table repeats within
+    # one picture at r = +0.98 and across two pictures at only +0.49, and it
+    # agrees BETTER between the two heads of one picture than between two
+    # pictures of one head - the signature of one axis absorbing what belongs
+    # to another. Separating the sweep dimension lifts the frequency
+    # component to +0.77 and +0.86. Both main effects are taken; the
+    # interaction between them is deliberately left alone, being mostly
+    # picture (r = +0.25 and +0.19 across pictures).
+    # The frequency table is accumulated on a residual with the TRACK
+    # component already removed, so the two do not describe the same
+    # structure twice. Without this the frequency table absorbs whatever of
+    # the track's profile happens to project onto carrier frequency, and
+    # then applies it to every field as though the path's response had that
+    # shape. The track model is divided out HERE and nowhere else: the
+    # deviation the correction rides on keeps it, because it is the tape.
+    residual_samples = np.asarray(deviation[::stride], dtype=np.float64)
+    along_track = track_correction(rf, field, deviation, stride, sampled_carrier_hz)
+    if along_track is not None:
+        residual_samples = residual_samples / np.where(
+            along_track > 0.0, along_track, 1.0)
+    # And the amplitude this field's OWN time-base error carries, at the
+    # measured coupling. The track term above removes the profile the two
+    # share along the track; this removes what is particular to this field,
+    # which no accumulated profile can hold. Both are the same rule - a
+    # component is accumulated on a residual with the others already gone -
+    # applied once across the track axis and once within the field.
+    coupling = time_base_coupling(rf, key)
+    if coupling != 0.0:
+        timing = field_time_base(field)
+        if timing is not None:
+            values, live = timing
+            linelocs = np.asarray(getattr(field, "linelocs", ()), dtype=np.float64)
+            if len(linelocs) >= len(values):
+                index = np.arange(len(residual_samples), dtype=np.float64) * stride
+                line_of = np.searchsorted(linelocs, index, side="right") - 1
+                inside = (line_of >= 0) & (line_of < len(values))
+                place = np.clip(line_of, 0, len(values) - 1)
+                carried = np.where(inside & live[place], coupling * values[place], 0.0)
+                residual_samples = residual_samples / np.exp(carried)
+    ratio_levels, ratio_population, ratio_centre_hz = _binned_median(
+        residual_samples, sample_bin, sync_tip_hz, bin_hz, bin_count,
+    )
+    described = (ratio_population > 0.0) & (ratio_levels > 0)
+    # The level this field says the response has: the model it was measured
+    # through, times how far the residual departed from unity.
+    grid_hz = np.arange(len(response), dtype=np.float64) * frequency_step
+    model_ln = _model_log_level(grid_hz, curve, dense, sync_band)
+    seen_ln = np.zeros(bin_count)
+    seen_ln[described] = np.interp(
+        ratio_centre_hz[described], grid_hz, model_ln
+    ) + np.log(ratio_levels[described])
+    levels_seen = np.zeros(bin_count)
+    levels_seen[described] = np.exp(seen_ln[described])
+    _measure_reliability(rf, key, levels_seen, ratio_population, described,
+                         total, weight)
+    banks[bank][described] += seen_ln[described] * ratio_population[described]
+    weights[bank][described] += ratio_population[described]
+    # The frequency each bin stands at is accumulated the same way its level
+    # is, weighted by how many samples went into it. Taking it from THIS
+    # field's centres instead - which is what happened - puts a zero wherever
+    # a bin accumulated enough from earlier fields but the picture did not
+    # visit it this time. The frequencies then stop ascending, `np.interp`
+    # reads them as nonsense, and the model swings by 2.5x where the
+    # amplitude it describes varies by 1.14x.
+    centre_total[described] += ratio_centre_hz[described] * ratio_population[described]
+
+    # THE SECOND DIMENSION, measured on the same residual with the frequency
+    # dimension divided out first, so neither axis is handed the other's
+    # structure. Indexed on the collapse formula's own theta^2, which is what
+    # makes the table the same object from tape to tape.
+    #
+    # A PARAMETRIC form of the frequency table was built and rejected, and it
+    # is worth saying so because it is an attractive thing to rebuild. The
+    # ripple was fitted as damped sinusoids by matrix pencil, which on planted
+    # signals is exact where peak picking leaves a third of the ripple behind.
+    # On real data it does not hold: the singular values of the Hankel matrix
+    # decay smoothly - 1, 0.69, 0.20, 0.17, 0.17, 0.14 - where a true sum of
+    # sinusoids drops twelve orders of magnitude after its last component, so
+    # there is no rank to find, the answer moves with the pencil parameter,
+    # and the strongest component disagrees between the two heads by
+    # microseconds rather than the nanoseconds a real echo would. The test
+    # before trying again is that singular value spectrum: no knee, no
+    # parametric form.
+    flat_ratio = np.asarray(deviation[::stride], dtype=np.float64)
+    scale = np.where(described, ratio_levels, 1.0)[sample_bin]
+    usable = (flat_ratio > 0.0) & (scale > 0.0)
+    theta2 = np.interp(sampled_carrier_hz, grid_hz, tables.q) * (
+        np.asarray(slope[::stride], dtype=np.float64) ** 2
+    )
+    residue_store = rf.__dict__.setdefault("_luma_sweep_residue", {})
+    res_total, res_weight = residue_store.setdefault(
+        key, (np.zeros(len(residue_edges)), np.zeros(len(residue_edges)))
+    )
+    place = np.clip(
+        np.searchsorted(residue_edges, theta2, side="right") - 1,
+        0, len(residue_edges) - 1,
+    )
+    logged = np.log(np.where(usable, flat_ratio / np.maximum(scale, 1e-30), 1.0))
+    sweep_med, sweep_pop = _cell_medians(
+        np.where(usable, place, len(residue_edges)), logged,
+        len(residue_edges) + 1,
+    )
+    keep = sweep_pop[:-1] >= CURVE_INDEPENDENT_POINTS
+    res_total[keep] += sweep_med[:-1][keep] * sweep_pop[:-1][keep]
+    res_weight[keep] += sweep_pop[:-1][keep]
+
+    # THE PRODUCT COMPONENT, rule R3 of docs/RESIDUAL_LIMIT_DESIGN.md: what
+    # neither margin carries, over frequency and sweep rate together. Stored
+    # as measured and made orthogonal to both margins where it is read, so
+    # the response table stays a response and this cannot put a frequency
+    # mean back into it - the coupling that stalls the sequence otherwise.
+    joint_store = rf.__dict__.setdefault("_luma_joint_residue", {})
+    joint_total, joint_weight = joint_store.setdefault(
+        key,
+        (np.zeros((2, bin_count, len(residue_edges))),
+         np.zeros((2, bin_count, len(residue_edges)))),
+    )
+    # alternating banks, so the component can be asked whether it says the
+    # same thing on evidence it has not seen
+    bank = (int(rf.__dict__.get("_luma_field_count", {}).get(key, 1)) - 1) % 2
+    cells = np.where(usable, sample_bin * len(residue_edges) + place,
+                     bin_count * len(residue_edges))
+    cell_med, cell_pop = _cell_medians(
+        cells, logged, bin_count * len(residue_edges) + 1)
+    cell_med = cell_med[:-1].reshape(bin_count, len(residue_edges))
+    cell_pop = cell_pop[:-1].reshape(bin_count, len(residue_edges))
+    keep_cell = cell_pop >= CURVE_INDEPENDENT_POINTS
+    joint_total[bank][keep_cell] += cell_med[keep_cell] * cell_pop[keep_cell]
+    joint_weight[bank][keep_cell] += cell_pop[keep_cell]
 
     anchors = _measure_level_anchors(field, centred_hz)
     if anchors is not None:
@@ -1795,8 +2074,7 @@ def measure_amplitude_deviation(field):
             porch_sum + anchors[0], tip_sum + anchors[1], count + 1.0)
 
     _refresh_block_model(
-        rf, response, frequency_step, tables, deviation, stride,
-        dropout_fraction,
+        rf, response, frequency_step, tables,
         (rf.iretohz(sys_params["vsync_ire"], spec=True),
          rf.iretohz(0.0, spec=True)),
     )
@@ -2086,13 +2364,109 @@ def _measure_reliability(rf, head, levels, population, seen, total, weight):
     )
 
 
+def _head_model(rf, head, bin_count):
+    """One head's response, as the SHARED response plus its own departure
+    from it - the head treated as a measured dimension rather than as two
+    models kept apart.
+
+    Two independent per-head tables halve the evidence for everything the
+    heads have in common, which is most of the response: they are the same
+    tape, the same electronics and the same band, differing in the gap that
+    wrote them. Decomposed instead, the shared component carries both
+    heads' evidence and the head-specific part is measured explicitly and
+    admitted on its own - which is also the only form in which the variance
+    BETWEEN the heads is described rather than merely duplicated.
+
+    The head term is orthogonal to the shared one by construction (it is
+    the departure from the population-weighted mean over heads), so R3
+    holds here as it does for the sweep product: applying it cannot put a
+    shared mean back into the shared component.
+
+    Admitted by R5's own test, banked on each head's own field count. The
+    shared component is not gated - it stands on both heads' evidence and
+    is what the line already assumed.
+    """
+    store = rf.__dict__.get("_luma_dense_response") or {}
+    if not store:
+        return None
+    weight_by_head = {}
+    total_by_head = {}
+    centre_by_head = {}
+    for which, (banks, weights, centre_total) in store.items():
+        weight_by_head[which] = weights.sum(axis=0)
+        total_by_head[which] = banks.sum(axis=0)
+        centre_by_head[which] = centre_total
+    mass = sum(weight_by_head.values())
+    shared = np.zeros(bin_count)
+    lit = mass > 0
+    shared[lit] = sum(total_by_head.values())[lit] / mass[lit]
+    key = bool(head)
+    if key not in store:
+        described = mass >= CURVE_MINIMUM_POPULATION
+        if np.count_nonzero(described) < CURVE_DENSE_MINIMUM_POINTS:
+            return None
+        centres = sum(centre_by_head.values())[described] / mass[described]
+        return centres, shared[described], mass[described]
+    own_weight = weight_by_head[key]
+    own = np.zeros(bin_count)
+    here = own_weight > 0
+    own[here] = total_by_head[key][here] / own_weight[here]
+    delta = np.where(here, own - shared, 0.0)
+    banks, weights, centre_total = store[key]
+    pair = []
+    for bank in (0, 1):
+        w = weights[bank]
+        ok = w > 0
+        half = np.zeros(bin_count)
+        half[ok] = banks[bank][ok] / w[ok]
+        pair.append(np.where(ok, half - shared, 0.0))
+    trust = residual_limit.agreement(
+        pair[0], pair[1], weights[0], weights[1], CURVE_MINIMUM_POPULATION)
+    rf.__dict__.setdefault("_luma_head_trust", {})[key] = trust
+    described = own_weight >= CURVE_MINIMUM_POPULATION
+    if np.count_nonzero(described) < CURVE_DENSE_MINIMUM_POINTS:
+        return None
+    return (
+        centre_total[described] / own_weight[described],
+        (shared + trust * delta)[described],
+        own_weight[described],
+    )
+
+
+def measured_response(rf, head):
+    """The accumulated luma path response of one head: (curve, dense).
+
+    The public form of what `update_luma_equalizer` reads for itself, so a
+    consumer outside this module (the channel identification stage) does
+    not depend on the private stores. `head` is the field's isFirstField
+    truth value. `curve` is the fitted line (centre_hz, level, slope) with
+    the line's own weight folded in; `dense` is (centre_hz, log_level,
+    weight) over the bins whose ACCUMULATED population has reached
+    CURVE_MINIMUM_POPULATION, or None while fewer than
+    CURVE_DENSE_MINIMUM_POINTS have - the same admission the pooled
+    consumer applies. Both are natural log of the flattened amplitude, the
+    decoder's own path response already divided out. Returns (None, None)
+    before the head has been seen.
+    """
+    key = bool(head)
+    lines = rf.__dict__.get("_luma_eq_lines") or {}
+    curve = None
+    if key in lines and lines[key][1] > 0:
+        curve = tuple(lines[key][0] / lines[key][1])
+    store = rf.__dict__.get("_luma_dense_response") or {}
+    dense = None
+    if key in store:
+        dense = _head_model(rf, key, len(store[key][2]))
+    return curve, dense
+
+
 def _pooled_dense(rf):
     """Both heads' accumulated responses together, on the model's contract."""
     store = rf.__dict__.get("_luma_dense_response")
     if not store:
         return None
-    total = sum(entry[0] for entry in store.values())
-    weight = sum(entry[1] for entry in store.values())
+    total = sum(entry[0].sum(axis=0) for entry in store.values())
+    weight = sum(entry[1].sum(axis=0) for entry in store.values())
     centre_total = sum(entry[2] for entry in store.values())
     described = weight >= CURVE_MINIMUM_POPULATION
     if np.count_nonzero(described) < CURVE_DENSE_MINIMUM_POINTS:
@@ -2102,6 +2476,409 @@ def _pooled_dense(rf):
         total[described] / weight[described],
         weight[described],
     )
+
+
+def _track_axis(field, deviation):
+    """The track axis: which bin of the track each strided sample sits in.
+
+    Returns (place, usable, bins, stride) or None. Shared by every
+    component measured on this axis, so the amplitude residual and the time
+    base's cannot end up on two axes that only look alike.
+    """
+    from vhsdecode import head_switch
+
+    regions = head_switch.locate(field)
+    if not regions:
+        return None
+    # THE LAST sustained excursion in the field, not the first. `locate`
+    # identifies excursions and returns them in positional order; the first
+    # of them is not the switch and does not sit still - measured over 25
+    # fields it wanders from line 4 to line 261, a standard deviation of
+    # 107-115 lines out of 262. The LAST one is the switch: the field's
+    # data overhangs its own end, so the switch sits at the boundary, and
+    # measured the same way it stands at line 259.6 +- 0.8 on one head and
+    # 258.9 +- 0.3 on the other - stable to under a line, and agreeing with
+    # the head-switch arc's own reading of the onset at line 259-260.
+    #
+    # The rule is structural rather than a fitted line number: the switch
+    # is where the field ends, so it is the last of them, and no constant
+    # is written down here. An axis anchored on the first region is not a
+    # track axis at all - it is a different axis every field.
+    origin = int(max(region[0] for region in regions))
+    if origin < 0 or origin >= len(deviation):
+        return None
+    linelocs = np.asarray(getattr(field, "linelocs", ()), dtype=np.float64)
+    if len(linelocs) < CURVE_INDEPENDENT_POINTS:
+        return None
+    bins = int(getattr(field, "linecount", 0)) or (len(linelocs) - 1)
+    if bins < CURVE_INDEPENDENT_POINTS:
+        return None
+    switch_line = int(np.searchsorted(linelocs, origin, side="right")) - 1
+    # how wide the switch's own excursion is, in lines, measured rather than
+    # written down: both heads touch the tape across it, so those lines
+    # belong to neither track
+    first = int(np.searchsorted(linelocs, min(r[0] for r in regions), side="right"))
+    last = int(np.searchsorted(linelocs, max(r[1] for r in regions), side="right"))
+    switch_span = max(last - first, 1)
+    return origin, bins, switch_line, linelocs, switch_span
+
+
+def _accumulate(rf, name, key, bins, place, values, usable):
+    """One component's cells into its own two-bank store.
+
+    WEIGHTED BY FIELDS, not by samples, and the two components sharing this
+    axis are why. The amplitude residual brings thousands of samples to a
+    bin and the time base brings one line; weighted by sample count the
+    first outvotes the second by three orders of magnitude, and a per-field
+    population gate written for the first never admits the second at all -
+    which is what happened when this was first written, and the time-base
+    component simply never appeared.
+
+    The field is the honest independent unit in any case: samples within a
+    field are correlated, the field is what the agreement test resamples,
+    and it is what the rest of the tree jackknifes over. So a bin takes
+    this field's median once, at unit weight, and its accumulated weight
+    counts the FIELDS that have described it. Every component then reads in
+    one currency.
+
+    A bin that saw anything contributes. A per-field population test here
+    defeats the accumulation, which is the lesson already recorded at the
+    dense table: a bin holding a handful of samples a field never
+    qualifies, though thirty fields of them describe it well.
+    """
+    median, population = residual_limit.cell_medians(
+        np.where(usable, place, bins), np.where(usable, values, 0.0), bins + 1
+    )
+    store = rf.__dict__.setdefault(name, {})
+    banks, weights = store.setdefault(key, (np.zeros((2, bins)), np.zeros((2, bins))))
+    if banks.shape[1] != bins:
+        return
+    bank = (int(rf.__dict__.get("_luma_field_count", {}).get(key, 1)) - 1) % 2
+    seen = population[:bins] > 0
+    banks[bank][seen] += median[:bins][seen]
+    weights[bank][seen] += 1.0
+
+
+def head_from_response(rf, levels, population):
+    """Which head this field's own response matches, or None.
+
+    Ethan: the COMMON frequency response between the heads determines which
+    head is being modelled. Remove what the two share and correlate what is
+    left against each head's own departure from it - the head that wrote the
+    field is the one it matches. Measured: the right head on 25 of 25 fields
+    of 75 bars and 25 of 26 of chromanoise, the own-head correlation +0.587
+    and +0.508 against −0.563 and −0.451 for the other, cleanly separated
+    and opposite in sign.
+
+    Used here as a CHECK, not as the key. Field parity is reliable in this
+    scope and keying on a correlation would be a worse bargain than the
+    problem it solves; but parity failing silently would mix the two heads
+    into one accumulation, and this notices. It is also the piece
+    `head_switch` needs, whose calibration pools both heads because blocks
+    in RF-block scope carry no field parity at all.
+    """
+    store = rf.__dict__.get("_luma_dense_response") or {}
+    if len(store) < 2:
+        return None
+    rows = {}
+    for which, (banks, weights, _centre) in store.items():
+        weight = weights.sum(axis=0)
+        described = weight >= CURVE_MINIMUM_POPULATION
+        if np.count_nonzero(described) < CURVE_DENSE_MINIMUM_POINTS:
+            return None
+        row = np.zeros(len(weight))
+        row[described] = banks.sum(axis=0)[described] / weight[described]
+        rows[which] = (row, described, weight)
+    here = (population > 0) & (levels > 0)
+    (a_row, a_ok, a_w), (b_row, b_ok, b_w) = rows[True], rows[False]
+    both = a_ok & b_ok & here
+    if np.count_nonzero(both) < CURVE_INDEPENDENT_POINTS:
+        return None
+    w = (a_w + b_w)[both]
+    shared = (a_row[both] * a_w[both] + b_row[both] * b_w[both]) / np.maximum(
+        a_w[both] + b_w[both], 1e-30)
+    mine = np.log(levels[both]) - shared
+    scores = {}
+    for which, row in ((True, a_row), (False, b_row)):
+        theirs = row[both] - shared
+        x = mine - np.average(mine, weights=w)
+        y = theirs - np.average(theirs, weights=w)
+        spread = np.sqrt(np.average(x * x, weights=w) * np.average(y * y, weights=w))
+        scores[which] = float(np.average(x * y, weights=w) / spread) if spread > 0 else 0.0
+    return max(scores, key=scores.get)
+
+
+def time_base_coupling(rf, head):
+    """How much amplitude a unit of time-base error carries, per head.
+
+    THE SIBLING RELATIONSHIP PUT TO WORK. The amplitude residual and the
+    time base's own residual sit on one axis - position along the track -
+    and they are coupled: measured there, the slope is −0.0026 on one head
+    and +0.0165 on the other (75 bars), −0.0063 on the second head of
+    chromanoise. `carrier_tbc` fits the same coupling independently, per
+    field and in the drum band alone, and reads −0.0040, +0.0062 and
+    −0.0059. Two instruments sharing no arithmetic, agreeing in sign on
+    every case and closely in magnitude on one head, and reproducing the
+    sign flip between the heads that `carrier_tbc`'s own docstring calls the
+    head-contact structure of the wobble.
+
+    So the amplitude a time-base error carries is a MEASURED term of the
+    model, not an assumption, and the frequency table is accumulated with it
+    removed - otherwise the table absorbs amplitude that belongs to the
+    tape's motion and applies it as though the path had that response.
+
+    Zero until both components have described the same bins, which is the
+    only condition under which the slope means anything.
+    """
+    amplitude = (rf.__dict__.get("_luma_track_residue") or {}).get(bool(head))
+    timing = (rf.__dict__.get("_luma_time_base_residue") or {}).get(bool(head))
+    if amplitude is None or timing is None:
+        return 0.0
+    values = []
+    for banks, weights in (amplitude, timing):
+        weight = weights.sum(axis=0)
+        described = weight >= CURVE_DENSE_MINIMUM_POINTS
+        row = np.zeros(len(weight))
+        row[described] = banks.sum(axis=0)[described] / weight[described]
+        values.append((row, described, weight))
+    (a_row, a_ok, a_w), (t_row, t_ok, _t_w) = values
+    both = a_ok & t_ok
+    if np.count_nonzero(both) < CURVE_INDEPENDENT_POINTS:
+        return 0.0
+    w = a_w[both]
+    x = t_row[both] - np.average(t_row[both], weights=w)
+    y = a_row[both] - np.average(a_row[both], weights=w)
+    spread = float(np.average(x * x, weights=w))
+    if not spread > 0.0:
+        return 0.0
+    return float(np.average(x * y, weights=w) / spread)
+
+
+def field_time_base(field):
+    """This field's own per-line time-base residual, against the SPEC period.
+
+    The reference is Ethan's: a perfectly flat and constant time base. Not
+    the field's own median, which removes the constant speed error by
+    construction - and the constant speed error is exactly what a spec
+    reference keeps. Reads `sync_edge_trace`, which `carrier_tbc` also
+    reads, so the two cannot drift about where the edges are.
+
+    Returns (values, live) per line interval, or None.
+    """
+    trace = sync_edge_trace(field)
+    if trace is None:
+        return None
+    rf = field.rf
+    edges = np.asarray(trace[0], dtype=np.float64)
+    spec = float(rf.SysParams["line_period"]) * rf.freq_hz / 1e6
+    if len(edges) < CURVE_INDEPENDENT_POINTS + 1 or not spec > 0.0:
+        return None
+    live = (edges[:-1] > 0) & (edges[1:] > 0)
+    values = np.where(live, (edges[1:] - edges[:-1]) / spec - 1.0, 0.0)
+    return values, live
+
+
+def track_correction(rf, field, deviation, stride, sampled_carrier_hz):
+    """The track component's correction for this field's strided samples.
+
+    RULE R3 ACROSS COMPONENTS, not just within one. The frequency table and
+    the track table are accumulated from the SAME residual, so without this
+    they describe the same structure twice: whatever of the track's profile
+    projects onto carrier frequency is absorbed by the frequency table and
+    then applied to every field as though it were frequency response. The
+    components have to be measured on a residual with the others already
+    removed, which is what this returns - the track model, ready to divide
+    out before the frequency table is accumulated.
+
+    It is NOT divided out of the deviation itself, and that distinction is
+    the whole of the attribution. A frequency response is a property of the
+    path and belongs in the model; an amplitude that varies with position
+    along the track is the tape and the head reading it, the colour-under
+    written beside it took the same loss, and it must reach the correction
+    rather than be explained away. The measurement this rests on is that the
+    speed signature explains 0.01% of the amplitude residual: the residual
+    is not the model read at the wrong frequency, it is real amplitude.
+
+    Ones where the track model has not been measured yet.
+    """
+    seen = (rf.__dict__.get("_luma_switch_line") or {}).get(bool(field.isFirstField))
+    if seen is None or seen[1] <= 0.0:
+        return None
+    linelocs = np.asarray(getattr(field, "linelocs", ()), dtype=np.float64)
+    bins = int(getattr(field, "linecount", 0)) or (len(linelocs) - 1)
+    if bins < CURVE_INDEPENDENT_POINTS or len(linelocs) < CURVE_INDEPENDENT_POINTS:
+        return None
+    residue, trust = track_residue_of(rf, bool(field.isFirstField), bins)
+    if trust <= 0.0 or not np.any(residue):
+        return None
+    switch_line = seen[0] / seen[1]
+    index = np.arange(len(sampled_carrier_hz), dtype=np.float64) * stride
+    line_of = np.searchsorted(linelocs, index, side="right") - 1
+    place = np.mod(line_of - switch_line, bins).astype(np.int64)
+    place = np.clip(place, 0, bins - 1)
+    # the same bound as the accumulation: past the last line location there
+    # is no line, so there is no track position either
+    last_line = min(bins, len(linelocs) - 1)
+    inside = (line_of >= 0) & (line_of < last_line)
+    return np.where(inside, np.exp(residue[place]), 1.0)
+
+
+def track_residue_of(rf, head, bins, name="_luma_track_residue"):
+    """A residual along the TRACK, accumulated per head.
+
+    Ones-equivalent (zeros in the log) wherever nothing has been measured,
+    and admitted only as far as it says the same thing on evidence it has
+    not seen - the two-bank test of rule R5, banked on this head's own
+    field count.
+    """
+    store = rf.__dict__.get(name) or {}
+    entry = store.get(bool(head))
+    residue = np.zeros(bins)
+    if entry is None:
+        return residue, 0.0
+    banks, weights = entry
+    weight = weights.sum(axis=0)
+    # in FIELDS, the unit `_accumulate` counts in, and at the module's own
+    # bar for an accumulated table standing on its own evidence
+    described = weight >= CURVE_DENSE_MINIMUM_POINTS
+    if not np.any(described):
+        return residue, 0.0
+    residue[described] = banks.sum(axis=0)[described] / weight[described]
+    pair = []
+    for bank in (0, 1):
+        w = weights[bank]
+        ok = w > 0
+        half = np.zeros(bins)
+        half[ok] = banks[bank][ok] / w[ok]
+        pair.append(half)
+    trust = residual_limit.agreement(
+        pair[0], pair[1], weights[0], weights[1],
+        CURVE_DENSE_MINIMUM_POINTS / 2.0)
+    rf.__dict__.setdefault(name + "_trust", {})[bool(head)] = trust
+    return trust * residue, trust
+
+
+def accumulate_track_residual(field):
+    """Both residuals on the track axis: the amplitude's, and the time base's.
+
+    THE AXIS IS THE TRACK, NOT THE FIELD. Each head writes a new track, so
+    the head switch is the physical origin and the field boundary is not:
+    the field's data overhangs into the next, and `head_switch.locate`
+    records that a field can therefore hold two switch regions - its own at
+    the first lines and the next field's at the tail. Binning on the field
+    would smear the start of one track against the end of another.
+
+    The switch is not declared by the format - `head_switches_per_field` is,
+    its position is not - so it is measured, and measured ONCE: this reads
+    `head_switch.locate`, which finds the switch from this stage's own
+    per-field deviation at tens of sigma. The two therefore cannot disagree
+    about where the switch is, which a second locator here would eventually
+    do.
+
+    BINS ARE LINE-ALIGNED, and that is load bearing rather than tidy.
+    Uniform divisions of the track beat against the line structure: the
+    residual's line-locked profile is large - largest at the sync phases,
+    where the response's low end is extrapolated - so bins each covering a
+    DIFFERENT phase mix turn that profile into a structured wander of the
+    track axis. Measured both ways on 75bars SP over 25 fields: uniform
+    bins read 0.43 dB rms at an agreement of 0.977, line-aligned bins
+    0.186 dB at 0.757 - more than half of the first figure was the beat,
+    and it agreed with itself so well because it is deterministic geometry
+    rather than tape. `head_switch.locate` records the same trap burying a
+    130 mNp switch under a 50-70 mNp wander.
+
+    TWO COMPONENTS, ONE AXIS. The amplitude residual is what this stage
+    measures; the time base's is the measured line period against the SPEC
+    period, which is Ethan's reference - a perfectly flat and constant time
+    base. Both are binned here, together, because a coupling between two
+    components can only be measured where they share an axis.
+
+    The spec reference is deliberate and differs from `carrier_tbc`, which
+    divides by the field's own median period: relative to the median, the
+    constant speed error is gone by construction, and the constant speed
+    error is precisely what a spec reference keeps. Both read the same
+    `sync_edge_trace`, so the two cannot drift apart about where the edges
+    are.
+
+    Called AFTER the memo is set, and that is structural: `locate` asks for
+    the measurement, so a call from inside `measure_amplitude_deviation`
+    would recurse.
+
+    Measurement only. Nothing here reaches the model yet.
+    """
+    measured = measured_amplitude_deviation(field)
+    if measured is None:
+        return None
+    deviation = np.asarray(measured.deviation, dtype=np.float64)
+    axis = _track_axis(field, deviation)
+    if axis is None:
+        return None
+    origin, bins, switch_line, linelocs, switch_span = axis
+    rf = field.rf
+    key = bool(field.isFirstField)
+    # Remember where the switch was, so the MEASUREMENT can place samples on
+    # the track axis without asking the locator again - which it cannot do,
+    # the locator asking for the measurement in turn. A running mean is
+    # enough: the switch stands at line 259.6 +- 0.8 and 258.9 +- 0.3, under
+    # a line of scatter, and the format's own guide puts it 6.014 H ahead of
+    # V-sync, which is the same place.
+    seen_switch = rf.__dict__.setdefault("_luma_switch_line", {})
+    total_line, count_line = seen_switch.get(key, (0.0, 0.0))
+    seen_switch[key] = (total_line + float(switch_line), count_line + 1.0)
+
+    # the amplitude residual, on the strided subsample
+    stride = max(
+        1, len(deviation) // (CURVE_INDEPENDENT_POINTS * CURVE_SAMPLES_PER_POINT)
+    )
+    sampled = deviation[::stride]
+    index = np.arange(len(sampled), dtype=np.float64) * stride
+    line_of = np.searchsorted(linelocs, index, side="right") - 1
+    place = (line_of - switch_line) % bins
+    # PAST THE LAST LINE LOCATION THERE IS NO LINE. `linelocs` stops short
+    # of the field's data - 273 entries ending near sample 761,000 of
+    # 983,040 - and `searchsorted` gives every sample beyond it the same
+    # index, so a quarter of the field piles into ONE bin. Measured: 26.8%
+    # of samples in one place, worth +0.56 dB on one head and -0.83 on the
+    # other, and the whole track residual moved 0.150/0.222 -> 0.128/0.181
+    # dB when they were dropped. They are not a line and they are not this
+    # bin's evidence.
+    last_line = min(bins, len(linelocs) - 1)
+    usable = (sampled > 0.0) & (line_of >= 0) & (line_of < last_line)
+    _accumulate(rf, "_luma_track_residue", key, bins, place,
+                np.log(np.where(usable, sampled, 1.0)), usable)
+
+    # THE SWITCH'S OWN REGION IS EXCLUDED, and it is not a detail: both
+    # heads touch the tape across the switch, so the lines there belong to
+    # neither track. Measured, excluding it takes the time-base residual on
+    # this axis from 0.109/0.127 per cent to 0.0136/0.0169 - an order of
+    # magnitude - with single bins inside the window carrying 1.49 and 2.01
+    # per cent on their own, and the alternating-field agreement falling to
+    # nothing once the window is widened. What was being measured there was
+    # the switch, not the track.
+    #
+    # The window comes from the located region itself rather than from a
+    # line count written down here: `locate` returns the excursion's own
+    # start and end, which is the measurement, and the format's overlap is
+    # about eight lines on this deck.
+    clear_of_switch = np.minimum(place, (bins - place) % bins) > switch_span
+    usable &= clear_of_switch
+
+    # the time base's own residual, per line, against the spec period
+    trace = sync_edge_trace(field)
+    if trace is not None:
+        edges = np.asarray(trace[0], dtype=np.float64)
+        spec = float(rf.SysParams["line_period"]) * rf.freq_hz / 1e6
+        count = min(len(edges) - 1, len(linelocs) - 1)
+        if count >= CURVE_INDEPENDENT_POINTS and spec > 0.0:
+            lengths = edges[1:count + 1] - edges[:count]
+            live = (edges[:count] > 0) & (edges[1:count + 1] > 0)
+            periods = np.where(live, lengths / spec - 1.0, 0.0)
+            lines = (np.arange(count) - switch_line) % bins
+            live = live & (
+                np.minimum(lines, (bins - lines) % bins) > switch_span)
+            _accumulate(rf, "_luma_time_base_residue", key, bins, lines,
+                        periods, live)
+    return track_residue_of(rf, key, bins)
 
 
 def measured_amplitude_deviation(field):
@@ -2114,6 +2891,15 @@ def measured_amplitude_deviation(field):
     if cached is None:
         cached = measure_amplitude_deviation(field)
         field._luma_amplitude_measured = cached
+        # The track axis, here rather than at either call site, because the
+        # measurement is triggered from two of them - the field's own hook
+        # and the chroma path - and the residual must be accumulated once
+        # per field however it was asked for. It runs AFTER the memo is
+        # set: the switch locator asks for the measurement, and the guard
+        # makes the re-entry that follows a no-op rather than a recursion.
+        if cached is not None and not getattr(field, "_luma_track_done", False):
+            field._luma_track_done = True
+            accumulate_track_residual(field)
     return cached
 
 

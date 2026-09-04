@@ -18,6 +18,8 @@ import vhsdecode.utils as utils
 from vhsdecode.utils import StackableMA, filtfft
 from vhsdecode.chroma import chroma_color_under_filter, TRANSFER_AVERAGE_FIELDS
 from vhsdecode import head_switch
+from vhsdecode import baseband_eq
+from vhsdecode import channel_eq
 from vhsdecode import luma_amplitude
 from vhsdecode import luma_transient
 
@@ -79,6 +81,19 @@ def _demodcache_dummy(self, *args, **kwargs):
 # We do this simply by using inheritance and overriding functions. This results in some redundant
 # work that is later overridden, but avoids altering any ld-decode code to ease merging back in
 # later as the ld-decode is in flux at the moment.
+def _resolve_stage_selection(text):
+    """The parsed `--stages` selection, or None. Resolved once, here, so
+    every consumer reads the same answer and none of them re-parses."""
+    if not text:
+        return None
+    try:
+        from vhsdecode import pipeline_graph
+
+        return pipeline_graph.parse_selection(text, pipeline_graph.load())
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
 class VHSDecode(ldd.LDdecode):
     def __init__(
         self,
@@ -241,8 +256,30 @@ class VHSDecode(ldd.LDdecode):
             return 0
         return 20 * np.log10(signal / noise)
 
-    def buildmetadata(self, f, check_phase=False):
-        """returns field information JSON and whether to duplicate or drop the field"""
+    def buildmetadata(self, f, check_phase=True):
+        """returns field information JSON and whether to duplicate or drop the field
+
+        THE PHASE CHECK IS BACK ON, and it was off for a reason that no longer
+        holds. The base class defaults it True (`lddecode/core.py:4529`) and
+        this override turned it off, which silenced the one contract that
+        verifies the colour framing ascends - `fieldPhaseID` must step by one
+        with wrap (`lddecode/core.py:4557`). With it off, 45 of the 683 NTSC
+        decodes in this repository's own output carry a wrong four-field
+        sequence and nothing said so; the largest, at 59021 fields, is wrong
+        throughout.
+
+        Both reasons it was disabled are now addressed. NTSC's framing was a
+        free-running counter and is now measured from the burst phase
+        (`chroma.colour_frame_parity`), anchored so the sequence ascends. PAL's
+        `fieldPhaseID` was a constant 1 - it read an `rf.field_number` that is
+        never incremented - and now advances (`field.py`
+        `FieldPALShared.determine_field_number`).
+
+        The check only logs and sets decode-fault bit 2; it never aborts. So
+        the cost of it being on is a warning on genuinely disturbed tape,
+        which is what a warning is for, and the benefit is that a framing slip
+        can no longer pass silently.
+        """
         prevfi_1 = self.fieldinfo[-1] if len(self.fieldinfo) else None
         prevfi_2 = self.fieldinfo[-2] if len(self.fieldinfo) > 1 else None
 
@@ -698,6 +735,21 @@ class VHSRFDecode(ldd.RFDecode):
         )
 
         self._chroma_trap = rf_options.get("chroma_trap", False)
+        # Offline measurements of the playback channel's baseband response,
+        # consumed by `baseband_eq` and by `head_switch`'s regularization.
+        self._baseband_lf_response = rf_options.get("baseband_lf_response", None)
+        self._sync_step_response = rf_options.get("sync_step_response", None)
+        self._head_switch_export = rf_options.get("head_switch_export", None)
+        self._time_base_response = rf_options.get("time_base_response", None)
+        self._baseband_eq_declared = bool(
+            self._baseband_lf_response or self._sync_step_response
+        )
+        # The identified RF channel response applied by `channel_eq`, and the
+        # directory the residual channels are exported to, downscaled to
+        # 4fsc on the final time base (`residual_channels`).
+        self._channel_response = rf_options.get("channel_response", None)
+        self._channel_eq_declared = bool(self._channel_response)
+        self._residual_channels_dir = rf_options.get("residual_channels", None)
         # TODO: integrate this under chroma_trap later
         self._use_fsc_notch_filter = (
             tape_format == "BETAMAX" or tape_format == "BETAMAX_HIFI"
@@ -776,6 +828,23 @@ class VHSRFDecode(ldd.RFDecode):
             and not (system == "405")
         )
 
+        # The stage selection is folded into the option values BEFORE the
+        # Options namedtuple is built, so every existing gate reads the
+        # selection through its own flag and there is still exactly one
+        # gate per stage.
+        _stage_selection_value = _resolve_stage_selection(
+            rf_options.get("stages"))
+        if _stage_selection_value is not None:
+            try:
+                from vhsdecode import pipeline_graph as _pipeline_graph
+
+                _changes = _pipeline_graph.apply_selection(
+                    rf_options, _stage_selection_value, _pipeline_graph.load())
+                for _line in _changes:
+                    ldd.logger.info("--stages: %s", _line)
+            except Exception as _error:                      # noqa: BLE001
+                ldd.logger.warning("--stages could not be applied: %s", _error)
+
         # No idea if this is a common pythonic way to accomplish it but this gives us values that
         # can't be changed later.
         # first depends on IRE/Hz so has to be set after that is properly set.
@@ -805,15 +874,24 @@ class VHSRFDecode(ldd.RFDecode):
                 "chroma_offset",
                 "cagc_fields",
                 "chroma_env_gain",
+                "chroma_env_phase",
                 "luma_transient",
                 "luma_beat",
                 "luma_eq",
                 "head_switch",
                 "carrier_tbc",
+                "baseband_eq",
+                "head_switch_prior",
+                "channel_eq",
                 "inverse_eq",
                 "lti_gain",
                 "cti_mix",
                 "cti_width",
+                # The stage and component selection, resolved once at init.
+                # NOTE: this list and the VALUE list below are positional and
+                # nothing checks their alignment - a new entry must go in at
+                # the SAME index in both.
+                "stage_selection",
                 "ire0_adjust",
                 "gnrc_afe",
                 "relaxed_line0",
@@ -859,15 +937,20 @@ class VHSRFDecode(ldd.RFDecode):
             int(self.DecoderParams.get("chroma_offset", 5) * (self.freq / 40.0)),
             rf_options.get("cagc_fields", 0),
             rf_options.get("chroma_env_gain", 0),
+            rf_options.get("chroma_env_phase", 0),
             rf_options.get("luma_transient", 0),
             rf_options.get("luma_beat", 0),
             rf_options.get("luma_eq", 0),
             rf_options.get("head_switch", 0),
             rf_options.get("carrier_tbc", 0),
+            rf_options.get("baseband_eq", 0),
+            rf_options.get("head_switch_prior", 0),
+            rf_options.get("channel_eq", 0),
             rf_options.get("inverse_eq", -1),
             rf_options.get("lti_gain", None),
             rf_options.get("cti_mix", 1),
             rf_options.get("cti_width", 2),
+            _stage_selection_value,
             ire0_adjust,
             rf_options.get("gnrc_afe", False),
             rf_options.get("relaxed_line0", False),
@@ -905,6 +988,12 @@ class VHSRFDecode(ldd.RFDecode):
 
         # Lastly we re-create the filters with the new parameters.
         self._computevideofilters_b()
+
+        if self._channel_eq_declared and self.options.channel_eq != 0:
+            # The identified channel response, built once on the block grid
+            # the filters above use and never mutated (the demodulation
+            # thread runs ahead of field assembly).
+            channel_eq.load(self, self._channel_response, self.options.channel_eq)
 
         DP = self.DecoderParams
 
@@ -1380,6 +1469,24 @@ class VHSRFDecode(ldd.RFDecode):
                 calibrate=calibrate,
             )
 
+        # The playback channel's measured low-frequency response - amplitude
+        # and phase - inverted next: the electronics act on the signal after
+        # the tape is read, so their response is undone before any stage
+        # that reshapes the waveform and before the nonlinear ones. Stateless
+        # and file-derived; see `baseband_eq`.
+        baseband_eq_trace = None
+        before_baseband_eq = None
+        if self.options.baseband_eq != 0 and self._baseband_eq_declared:
+            wants_trace = bool(
+                self.debug_plot
+                and (
+                    self.debug_plot.is_plot_requested("luma_noise")
+                    or self.debug_plot.is_plot_requested("sync_step_fold")
+                )
+            )
+            before_baseband_eq = demod.copy() if wants_trace else None
+            baseband_eq.correct(self, demod, self.options.baseband_eq)
+
         # The luma path's transient artifact, taken out where it is created and
         # before anything else has touched the signal. Everything below this
         # point - the spike replacement, the video equalizer, the chroma trap,
@@ -1421,6 +1528,17 @@ class VHSRFDecode(ldd.RFDecode):
         # applies main deemphasis filter
         demod_fft = npfft.rfft(demod)
         out_video_fft = demod_fft * self.Filters["FVideo"]
+        if before_baseband_eq is not None:
+            # What the baseband equalizer changed, carried through the same
+            # de-emphasis as the picture and in IRE, so the plots fold it
+            # against the decoded line - the site the sync-step measurement
+            # is referenced to. One extra inverse transform, plot-only.
+            out_before = npfft.irfft(
+                npfft.rfft(before_baseband_eq) * self.Filters["FVideo"]
+            ).real
+            baseband_eq_trace = (
+                (npfft.irfft(out_video_fft).real - out_before) / self.SysParams["hz_ire"]
+            ).astype(np.float32)
         out_video = npfft.irfft(out_video_fft).real
 
         if self.options.nldeemp:
@@ -1458,7 +1576,7 @@ class VHSRFDecode(ldd.RFDecode):
                 self.Filters["fsc_notch"][0], self.Filters["fsc_notch"][1], out_video
             )
 
-        return out_video, demod, demod_fft, head_switch_trace
+        return out_video, demod, demod_fft, head_switch_trace, baseband_eq_trace
 
     def demodblock(
         self, data=None, mtf_level=0, fftdata=None, cut=False, thread_benchmark=False
@@ -1529,11 +1647,18 @@ class VHSRFDecode(ldd.RFDecode):
         # instead costs 17% of the chroma correction's benefit to buy 1.8% on
         # the luma.
         luma_eq = self.Filters.get("LumaPathEQ")
+        # The identified channel response (`channel_eq`) takes the luma
+        # equalizer's place at this site while it is declared; with neither
+        # present, nothing below touches the signal.
+        rf_eq = self.Filters.get("ChannelEQ", luma_eq)
         unequalized = None
-        if luma_eq is not None:
-            if self.debug_plot and self.debug_plot.is_plot_requested("luma_noise"):
+        if rf_eq is not None:
+            if self._residual_channels_dir is not None or (
+                self.debug_plot and self.debug_plot.is_plot_requested("luma_noise")
+            ):
                 # The spectrum the equalizer is about to shape, demodulated
-                # separately below so the plot can show what it changed. Taken
+                # separately below so the plot can show what it changed - and
+                # so the frequency-axis residual channel can carry it. Taken
                 # after the high frequency boost, if that fired, so the two
                 # differ by the equalizer alone.
                 unequalized = (
@@ -1541,18 +1666,18 @@ class VHSRFDecode(ldd.RFDecode):
                     if boosted
                     else hilbert
                 )
-            indata_fft = indata_fft * luma_eq
+            indata_fft = indata_fft * rf_eq
 
         # Only the two branches above can have moved `indata_fft` since the
         # analytic signal was taken; where neither did, it still holds.
-        if boosted or luma_eq is not None:
+        if boosted or rf_eq is not None:
             hilbert = npfft.ifft(indata_fft * self.Filters["hilbert"])
 
         if not demod_block_debug:
             del indata_fft
 
-        out_video, demod, demod_fft, head_switch_trace = self._demodulate_to_video(
-            hilbert, envelope=env
+        out_video, demod, demod_fft, head_switch_trace, baseband_eq_trace = (
+            self._demodulate_to_video(hilbert, envelope=env)
         )
 
         # The same field as it would have been without the equalizer, for the
@@ -1629,6 +1754,13 @@ class VHSRFDecode(ldd.RFDecode):
             # --carrier_tbc refines the time base from the carrier's own
             # sync-edge trace, which is measured on this channel.
             or self.options.carrier_tbc != 0
+            # --baseband_eq's head_switch prior and plots read this channel.
+            or (self.options.baseband_eq != 0 and self._baseband_eq_declared)
+            # --channel_eq's plots and residual channels read it too.
+            or (self.options.channel_eq != 0 and self._channel_eq_declared)
+            # --residual_channels carries it as the amplitude channel's
+            # abscissa (the envelope against the instantaneous carrier).
+            or self._residual_channels_dir is not None
         ):
             # The color-under amplitude correction models the carrier amplitude
             # as a function of the instantaneous carrier frequency, so it needs
@@ -1675,6 +1807,44 @@ class VHSRFDecode(ldd.RFDecode):
                 if head_switch_trace is not None
                 else np.zeros(len(out_video), dtype=np.single)
             )
+
+        if (
+            self.options.baseband_eq != 0
+            and self._baseband_eq_declared
+            and self.debug_plot
+            and (
+                self.debug_plot.is_plot_requested("luma_noise")
+                or self.debug_plot.is_plot_requested("sync_step_fold")
+            )
+        ):
+            # What the baseband equalizer changed, in IRE - a channel for the
+            # same reason as `head_switch`, zeros where nothing was applied.
+            video_out["baseband_eq"] = (
+                baseband_eq_trace
+                if baseband_eq_trace is not None
+                else np.zeros(len(out_video), dtype=np.single)
+            )
+
+        if self._residual_channels_dir is not None:
+            # The residual channels ride the video dict to the field, where
+            # they are downscaled to 4fsc on the final time base
+            # (`residual_channels`). The stages' own traces are carried where
+            # those stages run and no plot already carries them; zeros where
+            # a block had nothing applied, as their plot channels do.
+            for name, trace, active in (
+                ("head_switch", head_switch_trace, self.options.head_switch != 0),
+                (
+                    "baseband_eq",
+                    baseband_eq_trace,
+                    self.options.baseband_eq != 0 and self._baseband_eq_declared,
+                ),
+            ):
+                if active and name not in video_out:
+                    video_out[name] = (
+                        trace
+                        if trace is not None
+                        else np.zeros(len(out_video), dtype=np.single)
+                    )
 
         rv["video"] = (
             {

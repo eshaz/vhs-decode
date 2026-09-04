@@ -193,38 +193,6 @@ def from_db(input):
     return pow(10, (input / 20))
 
 
-def limiter_filter(
-    out_video,
-    out_video_fft,
-    filters,
-    deviation,
-    clip_fraction=0.021,
-    static_fraction=0.3,  # 0.3
-    smooth=False,
-):
-    # Extract the high frequency part of the signal
-    hf_part = npfft.irfft(out_video_fft * filters["NLHighPassF"])
-    static_part = hf_part * static_fraction
-    # Limit it to preserve sharp transitions
-    clipped = np.clip(
-        hf_part,
-        -deviation * clip_fraction,
-        deviation * clip_fraction,
-        # out=hf_part,
-    )
-    if smooth:
-        remainder = hf_part - clipped
-        remainder *= 0.1
-        clipped += remainder
-    # print("clipping: ", deviation * clip_fraction)
-
-    #        self.DecoderParams["nonlinear_highpass_limit_l"],
-    #    self.DecoderParams["nonlinear_highpass_limit_h"],#
-
-    # And subtract it from the output signal.
-    return out_video - clipped - static_part
-
-
 def test_filter(filters, sample_rate, blocklen, deviation, sub_emphasis_params):
     import matplotlib.pyplot as plt
     from matplotlib import rc_context
@@ -328,22 +296,6 @@ def test_filter(filters, sample_rate, blocklen, deviation, sub_emphasis_params):
         plotter.plot_sub_emphasis(-10, ax[2], sub_emphasis_params)
         plotter.plot_sub_emphasis(-6, ax[2], sub_emphasis_params)
         plotter.plot_sub_emphasis(-3, ax[2], sub_emphasis_params, color="#000000")
-
-        # w_a = w * from_db(-3)
-        # w_a_fft = npfft.rfft(w_a)
-
-        # w4 = limiter_filter(
-        #    w_a, w_a_fft, filters, deviation,
-        # )
-        # ax[2].plot(freqs, to_db(npfft.rfft(w4) / w_a_fft), linestyle="dashed")
-
-        # w_b = w * from_db(-20)
-        # w_b_fft = npfft.rfft(w_b)
-
-        # w5 = limiter_filter(
-        #    w_b, w_b_fft, filters, deviation
-        # )
-        # ax[2].plot(freqs, to_db(npfft.rfft(w5) / w_b_fft), linestyle="dashed")
 
         ##positions = _from_freq(betamax_full_deemp_db_v_freqs).astype(int)
 

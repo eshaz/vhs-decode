@@ -1,4 +1,3 @@
-import time
 from lddecode.core import DemodCache
 from vhsdecode.addons.gnuradioZMQ import ZMQSend, ZMQReceive
 
@@ -27,9 +26,6 @@ class DemodCacheTape(DemodCache):
 
     def worker(self, return_on_empty=False):
         """Override to skip mtf stuff since that's laserdisc specific."""
-        blocksrun = 0
-        blockstime = 0
-
         rf = self.rf
 
         while True:
@@ -57,15 +53,12 @@ class DemodCacheTape(DemodCache):
                 else:
                     fftdata = block["fft"]
 
-                st = time.time()
                 output["demod"] = rf.demodblock(
                     data=block["rawinput"],
                     fftdata=fftdata,
                     mtf_level=0,
                     cut=True,
                 )
-                blockstime += time.time() - st
-                blocksrun += 1
 
                 output["request"] = request
                 output["MTF"] = 0  # Not used so just set to 0 for time.

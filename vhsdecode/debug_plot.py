@@ -7,12 +7,32 @@ def to_db_power(input_data):
     return 20 * np.log10(input_data)
 
 
+# Plots that describe the pipeline's STRUCTURE rather than any field's
+# data. They need no decode state, so they do not need the decode
+# serialised - and forcing a single worker thread for one of them would
+# both cost the user their throughput and, if the plot ever reported
+# timing, profile a pipeline they are not running.
+STRUCTURAL_PLOTS = frozenset({"pipeline_graph"})
+
+
 class DebugPlot:
     def __init__(self, stuff_to_plot: str):
         self.__stuff_to_plot = stuff_to_plot.casefold().split()
 
     def is_plot_requested(self, requested_info: str):
         return requested_info in self.__stuff_to_plot
+
+    def requested(self):
+        return tuple(self.__stuff_to_plot)
+
+    def wants_serialised_decode(self):
+        """Whether any requested plot actually needs one worker thread.
+
+        Every debug plot used to force `threads=0`, structural ones
+        included. A plot that draws the pipeline's declaration reads no
+        field and cannot benefit from it."""
+        return any(name not in STRUCTURAL_PLOTS
+                   for name in self.__stuff_to_plot)
 
 
 def plot_data_and_pulses(
@@ -514,6 +534,45 @@ def plot_final_chroma_field(input_chroma, final_chroma) -> None:
         sys.exit()
 
 
+def _fold_lines(signal, change, linelocs, start_rf, end_rf, rate_hz=40e6):
+    """Mean line of `signal` and of `signal - change`, on the lines' own grid.
+
+    Each line between two consecutive line positions is resampled onto a
+    common grid of one median line length and averaged; the result is the
+    field's line as the eye sees it in a static picture, and the difference
+    between the two folds is what the change did to it. None where fewer
+    than two whole lines fit the window.
+    """
+    import numpy as np
+
+    locs = linelocs[np.isfinite(linelocs)]
+    locs = locs[(locs >= start_rf) & (locs < end_rf - 1)]
+    if len(locs) < 3 or len(signal) != len(change):
+        return None
+    lengths = np.diff(locs)
+    period = float(np.median(lengths))
+    if not period > 0:
+        return None
+    count = int(round(period))
+    grid = np.arange(count) / count
+    x = np.arange(len(signal), dtype=float)
+    on_sum = np.zeros(count)
+    off_sum = np.zeros(count)
+    used = 0
+    for a, length in zip(locs[:-1], lengths):
+        # A line whose length strays far from the median is not a line - a
+        # missed or doubled sync - and is left out rather than smeared in.
+        if abs(length - period) > 0.02 * period:
+            continue
+        at = a + grid * length
+        on_sum += np.interp(at, x, signal)
+        off_sum += np.interp(at, x, signal - change)
+        used += 1
+    if used < 2:
+        return None
+    return on_sum / used, off_sum / used, period / rate_hz * 1e6
+
+
 def plot_luma_noise(
     envelope,
     detection_envelope,
@@ -538,7 +597,10 @@ def plot_luma_noise(
     head_switch=None,
     head_switch_regions=None,
     head_switch_expected=1,
+    other_head_response=None,
+    expected_response=None,
     wow_trace=None,
+    baseband_eq=None,
 ):
     """Luma carrier amplitude beside the luma it was demodulated from.
 
@@ -657,42 +719,81 @@ def plot_luma_noise(
 
     # One row per panel, tallest where the detail is. Named rather than
     # indexed: the arithmetic that did this broke every time a panel was added.
-    panels = [("env", 3), ("luma", 3), ("conf", 1)]
+    # Ordered by the signal each panel belongs to, in the order the process
+    # produces them: the carrier's amplitude and what is derived from it
+    # (the deviation, the chroma gain it drives, that gain's confidence),
+    # then the demodulated luma and what acts on it (the head switch
+    # removal, the luma itself, the equalizer's change, the beat removal),
+    # then the two per-line panels on their own axes. Packed tightly: the
+    # shared axis is the point, so the panels read as one strip.
+    panels = [("env", 2)]
     if deviation_window is not None:
-        panels.insert(1, ("delta", 2))
+        panels.append(("delta", 2))
     if has_correction:
-        panels.insert(0, ("corr", 2))
-    if noeq_window is not None:
-        panels.insert(panels.index(("conf", 1)), ("eqdelta", 2))
-    if beat_window is not None:
-        panels.insert(panels.index(("conf", 1)), ("beat", 2))
+        panels.append(("corr", 2))
+    panels.append(("conf", 1))
     if switch_window is not None:
-        panels.insert(panels.index(("conf", 1)), ("switch", 2))
+        panels.append(("switch", 2))
+    panels.append(("luma", 3))
+    if noeq_window is not None:
+        panels.append(("eqdelta", 2))
+    if beat_window is not None:
+        panels.append(("beat", 2))
     if wow_trace is not None:
-        panels.insert(panels.index(("conf", 1)), ("wow", 2))
+        panels.append(("wow", 2))
+    # The baseband equalizer's eye: the field's raw demodulated luma folded
+    # over its lines, with and without what the equalizer changed, so the
+    # sync pulse and porches are read against the specified waveform. Needs
+    # the raw channel (pre-de-emphasis, where the equalizer acts) and the
+    # line positions; per LINE-TIME like the wow panel, so its own axis.
+    eye = None
+    if baseband_eq is not None:
+        eye = _fold_lines(
+            hz_to_ire(np.asarray(demod, dtype=float)),
+            np.asarray(baseband_eq, dtype=float),
+            np.asarray(linelocs, dtype=float), start_rf, end_rf,
+        )
+    if eye is not None:
+        panels.append(("eye", 2))
 
-    fig = plt.figure(figsize=(16, 9) if can_score else (14, 9))
-    grid = fig.add_gridspec(
-        len(panels),
+    # Two strips: the panels sharing the RF-sample axis, packed tight so they
+    # read as one, then the per-line panels (wow per line number, the eye per
+    # line time) on their own axes below, with room between the strips.
+    shared = [(name, h) for name, h in panels if name not in ("wow", "eye")]
+    per_line = [(name, h) for name, h in panels if name in ("wow", "eye")]
+    units = sum(h for _, h in panels)
+    fig = plt.figure(figsize=(16 if can_score else 14, max(9.0, 0.85 * units + 1.5)))
+    outer = fig.add_gridspec(
+        2 if per_line else 1,
         2 if can_score else 1,
         width_ratios=[3, 1] if can_score else [1],
-        height_ratios=[height for _, height in panels],
+        height_ratios=[sum(h for _, h in shared)] + ([sum(h for _, h in per_line)] if per_line else []),
+        hspace=0.16,
+        left=0.07, right=0.98, top=0.95, bottom=0.05,
     )
+    grid = outer  # the right-hand column spans both strips
+    strip = outer[0, 0].subgridspec(len(shared), 1, height_ratios=[h for _, h in shared], hspace=0.08)
     axes, anchor = {}, None
-    for position, (name, _) in enumerate(panels):
-        # The wow panel is per LINE where every other panel is per RF
-        # sample; sharing an axis across the two units would squash it into
-        # a corner, so it alone keeps its own.
-        share = anchor if name != "wow" else None
+    for position, (name, _) in enumerate(shared):
         axes[name] = fig.add_subplot(
-            grid[position, 0], **({"sharex": share} if share is not None else {})
+            strip[position], **({"sharex": anchor} if anchor is not None else {})
         )
-        if anchor is None and name != "wow":
+        if anchor is None:
             anchor = axes[name]
+    if per_line:
+        below = outer[1, 0].subgridspec(len(per_line), 1, height_ratios=[h for _, h in per_line], hspace=0.7)
+        for position, (name, _) in enumerate(per_line):
+            axes[name] = fig.add_subplot(below[position])
+    # One x label for the whole shared strip, on its last panel; the inner
+    # panels keep their ticks but drop the labels.
+    for name, _ in shared[:-1]:
+        axes[name].tick_params(labelbottom=False)
+    axes[shared[-1][0]].set_xlabel("RF sample")
     ax_corr = axes.get("corr")
     ax_beat = axes.get("beat")
     ax_switch = axes.get("switch")
     ax_wow = axes.get("wow")
+    ax_eye = axes.get("eye")
     ax_delta = axes.get("eqdelta")
     ax_departure = axes.get("delta")
     ax_env, ax_luma, ax_conf = axes["env"], axes["luma"], axes["conf"]
@@ -737,7 +838,7 @@ def plot_luma_noise(
     # Which head wrote this field. The two differ measurably - in level, in the
     # response's slope, and in its shape - so the parity belongs on the plot.
     head = "first field (head A)" if is_first_field else "second field (head B)"
-    (ax_corr or ax_env).set_title(
+    ax_env.set_title(
         f"Luma carrier amplitude, the color-under correction it drives, "
         f"and the demodulated luma   [{head}]"
     )
@@ -855,9 +956,10 @@ def plot_luma_noise(
         ax_switch.legend(loc="lower left", fontsize="small")
 
         if head_switch_regions:
-            r_start, r_end, off_db, sigma = max(
-                head_switch_regions, key=lambda r: abs(r[2])
-            )
+            # The switch is the LAST region positionally, not the strongest:
+            # the strongest was measured to spread over ten lines while the
+            # last stands within one (see `head_switch.locate`).
+            r_start, r_end, off_db, sigma = head_switch_regions[-1]
             lines = np.searchsorted(np.asarray(linelocs, dtype=float),
                                     [r_start, r_end])
             found = (
@@ -911,10 +1013,46 @@ def plot_luma_noise(
                 bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
             )
 
+    if ax_eye is not None:
+        # Off and on over one line time, the difference magnified so a
+        # fraction of an IRE reads. Two views of the same fold: the sync
+        # interval - pulse, porches and burst, the first fifth of the line,
+        # where the equalizer's low-frequency phase shows first - beside
+        # the whole line.
+        on, off, period_us = eye
+        t = np.arange(len(on)) * (period_us / len(on))
+        change = on - off
+        spec = ax_eye.get_subplotspec()
+        ax_eye.remove()
+        halves = spec.subgridspec(1, 2, width_ratios=[2, 3], wspace=0.12)
+        ax_sync = fig.add_subplot(halves[0])
+        ax_line = fig.add_subplot(halves[1])
+        for ax in (ax_sync, ax_line):
+            ax.plot(t, off, color="tab:grey", linewidth=0.8, label="decoded line, equalizer off")
+            ax.plot(t, on, color="tab:blue", linewidth=0.8, label="equalizer on")
+            ax.plot(t, change * 10.0, color="tab:green", linewidth=0.7, label="(on - off) x10")
+            ax.axhline(0.0, color="tab:grey", linewidth=0.6, linestyle=":")
+            ax.set_xlabel("microseconds from the line start")
+        sync = t <= period_us / 5.0
+        shown = np.concatenate((off[sync], on[sync], change[sync] * 10.0))
+        pad = 0.1 * (np.max(shown) - np.min(shown) or 1.0)
+        ax_sync.set_xlim(0.0, period_us / 5.0)
+        ax_sync.set_ylim(np.min(shown) - pad, np.max(shown) + pad)
+        ax_sync.set_ylabel("folded line\n(IRE)")
+        ax_sync.set_title("sync interval", fontsize="small", loc="left")
+        ax_line.set_title("whole line", fontsize="small", loc="left")
+        ax_line.legend(loc="lower right", fontsize="small", ncol=3)
+        ax_line.annotate(
+            f"equalizer changed {np.std(change):.3f} IRE rms over the folded line, "
+            f"peak {np.max(np.abs(change)):.3f}",
+            xy=(0.995, 0.94), xycoords="axes fraction", ha="right", va="top",
+            fontsize="x-small",
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+        )
+
     ax_conf.plot(samples, confidence, color="tab:purple", linewidth=0.5)
     ax_conf.set_ylim(0, 1.05)
     ax_conf.set_ylabel("chroma correction\nconfidence")
-    ax_conf.set_xlabel("RF sample")
 
     if ax_resp is not None:
         # Both right hand panels are against the carrier's own FREQUENCY. The
@@ -1068,6 +1206,93 @@ def plot_luma_noise(
                     )
                     ripple_ax.set_ylabel("departure (dB)")
                     ripple_ax.legend(loc="lower left", fontsize="x-small")
+            # THE EXPECTED RESPONSE, which is the quantity the residual is
+            # a residual OF, and which the panel did not draw at all.
+            #
+            # Under the limit a field is refined against the model the
+            # fields before it built, so the first field - the one drawn
+            # here - has none of its own, and the model taken from its
+            # `ResponseModel` is empty. What is wanted is the model the
+            # decode converged on, which is the accumulated response for
+            # this head, and that is what is passed in.
+            if expected_response is not None:
+                expected_curve, expected_dense = expected_response
+                if expected_dense is not None and expected_curve is not None:
+                    expected_hz, expected_ln, _ = expected_dense
+                    centre_hz, level_at_centre, line_slope = expected_curve
+                    expected_line = (level_at_centre
+                                     + line_slope * (expected_hz - centre_hz))
+                    shown = np.exp(expected_ln - expected_line)
+                    scale = np.interp(expected_hz, centres,
+                                      np.maximum(model_total, 1e-9)
+                                      if model_total is not None
+                                      else np.ones(len(centres)))
+                    ax_resp.plot(
+                        expected_hz / 1e6, shown * scale,
+                        color="tab:green", linewidth=1.4, linestyle=(0, (4, 2)),
+                        label="expected response (the model in force)",
+                    )
+
+            # BOTH HEADS. The two paths differ - in level, in slope and in
+            # shape - so a panel drawing only the field's own head cannot
+            # show the difference the equalizer is pooling over. Same
+            # convention as the wow panel below: this field's head named and
+            # solid, the other faint, so a head keeps its identity down the
+            # whole figure.
+            if other_head_response is not None:
+                other_curve, other_dense = other_head_response
+                this_name = "head A" if is_first_field else "head B"
+                that_name = "head B" if is_first_field else "head A"
+                that_colour = "tab:red" if is_first_field else "tab:blue"
+                if other_dense is not None:
+                    other_hz, other_log, _ = other_dense
+                    # On the same reference as `before`: the accumulated log
+                    # response, exponentiated and normalised at its own median,
+                    # which is what `before` already is.
+                    other_rel = np.exp(
+                        np.asarray(other_log, dtype=float)
+                        - np.median(np.asarray(other_log, dtype=float))
+                    )
+                    ax_resp.plot(
+                        np.asarray(other_hz, dtype=float) / 1e6, other_rel,
+                        color=that_colour, linewidth=1.0, alpha=0.55,
+                        # The two heads' accumulated responses, drawn to be
+                        # read against each other.
+                        #
+                        # CONTENT CANNOT MAKE THESE DIFFER, and the reason is
+                        # the physics rather than an averaging argument: the
+                        # response is a function of CARRIER FREQUENCY, and
+                        # what the picture encodes decides which frequencies
+                        # get visited and how often - the sampling - not the
+                        # value at a frequency. So content changes how WELL
+                        # each frequency is measured and never what is
+                        # measured there. Corroborated where no picture
+                        # reaches at all: the per-head gain on the sync tip,
+                        # one fixed carrier and a constant envelope, reads
+                        # +0.98 dB at 161 sigma.
+                        #
+                        # The honest caveat is about the SHAPE, not the
+                        # existence. The departure carries measurement
+                        # scatter from the sweep mix - the carrier arrives at
+                        # a frequency by different trajectories depending on
+                        # the picture, and the collapse compensates that only
+                        # to within its product term, itself 0.058 to 0.088
+                        # dB. The signature is in the bands: across two
+                        # contents the response reproduces at r = +0.607 in
+                        # the sync band, where the carrier is nearly
+                        # stationary, and only +0.347 over the picture range
+                        # where the sweep mix is widest.
+                        label=f"{that_name} accumulated response",
+                    )
+                ax_resp.annotate(
+                    f"this field: {this_name}",
+                    xy=(0.015, 0.965), xycoords="axes fraction",
+                    fontsize="x-small", va="top", ha="left",
+                    color="tab:blue" if is_first_field else "tab:red",
+                    bbox={"boxstyle": "round", "facecolor": "white",
+                          "alpha": 0.85},
+                )
+
         ax_resp.axhline(1.0, color="tab:grey", linestyle=":", linewidth=1)
         ax_resp.set_ylabel("relative amplitude")
         ax_resp.set_title("Luma frequency response and the model removed",
@@ -1095,11 +1320,27 @@ def plot_luma_noise(
         # What is left at each stage of the removal. Flat is the objective:
         # anything sloping here is response the model did not describe, and it
         # is corrected onto the color-under as though it were tape noise.
+        #
+        # THESE TWO LABELS WERE THE WRONG WAY ROUND, and the mistake mattered:
+        # read off the old labels, the smoother trace looked like the full
+        # model beating the line, which argues for dropping the line - the
+        # opposite of the truth.
+        #
+        # The deviation divides by the LINE'S response only. The accumulated
+        # table is deliberately withheld from it (`measure_amplitude_deviation`
+        # passes `dense=None`, measured worth -0.016/-0.037/-0.041 per cent on
+        # the three conditions), so `after` IS the fitted roll-off's own
+        # result. And `after_line = after * exp(departure)` inside the
+        # described range - the accumulated table's departure put BACK on,
+        # which is a trace of what the correction would look like if the table
+        # were not withheld. It is drawn because that comparison is the whole
+        # argument for withholding it, not because it is applied to anything.
         mhz = centres / 1e6
         stages = (
             (before, "tab:grey", "uncorrected"),
-            (after_line, "tab:orange", "after the fitted roll-off"),
-            (after, "tab:red", "after the full model"),
+            (after_line, "tab:orange",
+             "with the accumulated table re-imposed (not applied)"),
+            (after, "tab:red", "after the fitted roll-off (the model in force)"),
         )
         for values, colour, name in stages:
             if values is None:
@@ -1160,6 +1401,123 @@ def plot_luma_noise(
     ax_env.set_xlim(start_rf, end_rf)
     fig.tight_layout()
     plt.show()
+
+
+def _ideal_line(t_us, sys_params, porch, tip):
+    """The specified line at the measured levels, where it is specified.
+
+    Time from the sync fall's 50% crossing. The sync pulse is an erf-edged
+    pulse of the specified width and 10-90% transition time from the porch
+    level to the tip level; the back porch runs to the start of active
+    video and the front porch fills the specified width before the next
+    fall. Returns the ideal and a mask of where it is defined - the active
+    picture is content, not specification. Levels are the field's own
+    measured porch and tip, so the shape is judged, not the recorder's
+    level setting (which is a separate finding).
+    """
+    import numpy as np
+    from scipy.special import erf
+
+    width = float(sys_params["hsyncPulseUS"])
+    transition = float(sys_params["syncTransitionUS"])
+    # The 10-90% width of an error-function edge is 2.563 sigma.
+    sigma = max(transition, 1e-3) / 2.563
+    active_start = float(sys_params["activeVideoUS"][0])
+    period = float(sys_params["line_period"])
+    front = float(sys_params["frontPorchUS"])
+    edge = lambda t0: 0.5 * (1.0 + erf((t_us - t0) / (np.sqrt(2.0) * sigma)))
+    pulse = edge(0.0) - edge(width)
+    ideal = porch + (tip - porch) * pulse
+    defined = (t_us < active_start) | (t_us >= period - front)
+    return ideal, defined
+
+
+def plot_sync_step_fold(demod, change, linelocs, start_rf, end_rf, hz_to_ire, sys_params,
+                        rate_hz, is_first_field, show=True):
+    """The decoded line folded over the field's lines against the
+    level-adjusted specified sync pulse, equalizer off and on.
+
+    Top: the sync interval - the fold with the equalizer off and on, and
+    the ideal at the field's own measured porch and tip levels. Middle: the
+    residuals against that ideal wherever it is specified (sync pulse,
+    back porch to active video, front porch), with the equalizer's change
+    magnified. Bottom: the whole folded line. The residual after correction
+    is the quantity the equalizer's closed loop refines on: measured shape
+    against the expected shape.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    signal = hz_to_ire(np.asarray(demod, dtype=float))
+    delta = (
+        np.asarray(change, dtype=float) if change is not None else np.zeros(len(signal))
+    )
+    fold = _fold_lines(signal, delta, np.asarray(linelocs, dtype=float), start_rf, end_rf, rate_hz)
+    if fold is None:
+        return
+    on, off, period_us = fold
+    t = np.arange(len(on)) * (period_us / len(on))
+    width = float(sys_params["hsyncPulseUS"])
+    transition = float(sys_params["syncTransitionUS"])
+    active_start = float(sys_params["activeVideoUS"][0])
+    # Levels from the fold itself: tip over the pulse interior, porch over
+    # the back porch clear of both edges and of the active picture.
+    tip_zone = (t > 4 * transition) & (t < width - 4 * transition)
+    porch_zone = (t > width + 4 * transition) & (t < active_start - 4 * transition)
+    levels = {}
+    for name, line in (("off", off), ("on", on)):
+        levels[name] = (float(np.median(line[porch_zone])), float(np.median(line[tip_zone])))
+    ideal_off, defined = _ideal_line(t, sys_params, *levels["off"])
+    ideal_on, _ = _ideal_line(t, sys_params, *levels["on"])
+    spec_depth = -float(sys_params["vsync_ire"])
+
+    fig, (ax_sync, ax_resid, ax_line) = plt.subplots(
+        3, 1, figsize=(14, 10), gridspec_kw={"height_ratios": [3, 2, 2], "hspace": 0.28}
+    )
+    head = "first field (head A)" if is_first_field else "second field (head B)"
+    fig.suptitle(f"Sync pulse: the folded decoded line against the level-adjusted specification   [{head}]")
+
+    sync = t < active_start + 1.0
+    ax_sync.plot(t[sync], off[sync], color="tab:grey", linewidth=1.0, label="decoded line, equalizer off")
+    ax_sync.plot(t[sync], on[sync], color="tab:blue", linewidth=1.0, label="equalizer on")
+    ax_sync.plot(t[sync], ideal_on[sync], color="tab:green", linewidth=1.0, linestyle="--",
+                 label="specified pulse at the measured levels")
+    ax_sync.axhline(levels["on"][0], color="tab:grey", linewidth=0.5, linestyle=":")
+    ax_sync.set_ylabel("IRE")
+    ax_sync.legend(loc="lower right", fontsize="small")
+    ax_sync.annotate(
+        f"tip depth below porch: off {levels['off'][0] - levels['off'][1]:.2f}, "
+        f"on {levels['on'][0] - levels['on'][1]:.2f}, spec {spec_depth:.0f} IRE",
+        xy=(0.01, 0.94), xycoords="axes fraction", ha="left", va="top", fontsize="x-small",
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+    )
+
+    resid_off = np.where(defined, off - ideal_off, np.nan)
+    resid_on = np.where(defined, on - ideal_on, np.nan)
+    ax_resid.plot(t[sync], resid_off[sync], color="tab:grey", linewidth=0.9, label="residual, equalizer off")
+    ax_resid.plot(t[sync], resid_on[sync], color="tab:blue", linewidth=0.9, label="residual, equalizer on")
+    ax_resid.plot(t[sync], (on - off)[sync] * 10.0, color="tab:green", linewidth=0.7, label="(on - off) x10")
+    ax_resid.axhline(0.0, color="tab:grey", linewidth=0.6)
+    ax_resid.set_ylabel("residual against\nthe specification (IRE)")
+    ax_resid.set_xlabel("microseconds from the sync fall")
+    ax_resid.legend(loc="lower right", fontsize="small", ncol=3)
+    good = defined & np.isfinite(resid_off) & np.isfinite(resid_on)
+    ax_resid.annotate(
+        f"rms over the specified intervals: off {np.sqrt(np.mean(resid_off[good] ** 2)):.3f}, "
+        f"on {np.sqrt(np.mean(resid_on[good] ** 2)):.3f} IRE",
+        xy=(0.01, 0.94), xycoords="axes fraction", ha="left", va="top", fontsize="x-small",
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+    )
+
+    ax_line.plot(t, off, color="tab:grey", linewidth=0.8, label="equalizer off")
+    ax_line.plot(t, on, color="tab:blue", linewidth=0.8, label="equalizer on")
+    ax_line.plot(t, (on - off) * 10.0, color="tab:green", linewidth=0.7, label="(on - off) x10")
+    ax_line.axhline(0.0, color="tab:grey", linewidth=0.6, linestyle=":")
+    ax_line.set_ylabel("whole line (IRE)")
+    ax_line.set_xlabel("microseconds from the sync fall")
+    ax_line.legend(loc="lower right", fontsize="small", ncol=3)
+    if show:
+        plt.show()
 
 
 def plot_luma_averaging(probe, dod_threshold_p, source="", show=True):

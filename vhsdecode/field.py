@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import numba as nb
 
@@ -13,6 +15,7 @@ from vhsdecode.doc import detect_dropouts_rf
 from vhsdecode import carrier_tbc
 from vhsdecode import luma_amplitude
 from vhsdecode import luma_transient
+from vhsdecode import residual_channels
 from vhsdecode.addons import ringing_cancellation
 from vhsdecode.addons.ringing_cancellation import (
     apply_adaptive_luma_transient_improvement,
@@ -1046,6 +1049,84 @@ class FieldShared:
         ) and getattr(self, "valid", False):
             luma_amplitude.measured_amplitude_deviation(self)
 
+    def level_windows(self):
+        """The sync tip and back porch spans used to measure levels, in
+        output samples, derived from the format's own timing.
+
+        Both were hard-coded sample pairs per system - NTSC (74, 124), PAL
+        (96, 160) - with a fixed 4-sample pad, and both were misplaced.
+
+        THE BACK PORCH ran from roughly the burst START, so it sat in the
+        sync rise's settling tail rather than on settled blanking. lddecode
+        measures from the burst END instead (`core.py` `detectLevels`), and
+        that is the convention followed here. But it is deliberately NOT
+        followed all the way to active video: the anchor is ended one
+        settling guard short of the active transition, because a window
+        that reaches the transition picks up the approach to it. Measured
+        by the luma lane, regressing each candidate window's own median on
+        the PRECEDING line's active level over ~6800 lines on four
+        captures, the burst-end-to-active-start window moves with content
+        at +0.010 to +0.052 IRE/IRE (11-49 sigma, up to 0.48 IRE of swing)
+        while every window stopping a guard short is 5 to 50 times cleaner.
+
+        That is the criterion, and it is worth stating because it is not
+        the obvious one: AN ANCHOR IS CHOSEN FOR STABILITY, NOT FOR
+        CORRECTNESS OF LEVEL. A constant offset in an anchor is nearly
+        harmless - it shifts what "zero IRE" names and every consumer of
+        the same definition moves with it. An offset that varies with the
+        picture is not, because it makes the reference move with the thing
+        it exists to be independent of.
+
+        THE SYNC TIP ran from 4 samples after the line start to 4 samples
+        before the back porch window began - which, with the porch window
+        starting near the burst, ran the tip measurement straight through
+        the sync RISE (measured at output sample 68 against a window
+        ending at 70). Deriving it from the pulse width stops it before
+        the rise instead. The two windows are no longer coupled; they were
+        only ever related by the accident of the old layout.
+
+        The guard is the same settling time the ringing measurement plan
+        uses - `TRANSITION_SETTLE_BANDWIDTHS` of the luma low-pass - so
+        there is one answer in the codebase to "how long does a transition
+        take to settle" rather than a second constant tuned here.
+        """
+        sys_params = self.rf.SysParams
+        settle_us = (ringing_cancellation.TRANSITION_SETTLE_BANDWIDTHS
+                     / float(self.rf.DecoderParams["video_lpf_freq"]) * 1e6)
+        settle = int(math.ceil(self.usectooutpx(settle_us)))
+
+        tip = (int(math.ceil(self.usectooutpx(settle_us))),
+               int(math.floor(self.usectooutpx(
+                   sys_params["hsyncPulseUS"] - settle_us))))
+        porch = (int(math.ceil(self.usectooutpx(sys_params["colorBurstUS"][1]))),
+                 int(math.floor(self.usectooutpx(
+                     sys_params["activeVideoUS"][0] - settle_us))))
+        # a degenerate window measures nothing; fall back to the widest
+        # span the line can honestly offer rather than returning an empty
+        # slice whose median is nan
+        if porch[1] - porch[0] < 4:
+            porch = (porch[0], porch[0] + max(4, settle))
+        if tip[1] - tip[0] < 4:
+            tip = (tip[0], tip[0] + max(4, settle))
+        return tip, porch
+
+    @staticmethod
+    def _window_levels(lines, window):
+        """The middle-third mean of each line's median over `window`.
+
+        One vectorised median over the whole field rather than a Python
+        loop calling `np.median` once per line - the field is already a
+        contiguous (lines x samples) view, so the slice costs nothing and
+        the median runs once. The middle third is the same trimmed mean as
+        before: it discards the lines a dropout or a head switch has moved
+        without assuming which lines those are.
+        """
+        low, high = window
+        per_line = np.median(lines[:, low:high], axis=1)
+        per_line.sort()
+        count = len(per_line)
+        return float(np.mean(per_line[count // 3: (count * 2) // 3]))
+
     def hz_to_output(self, input):
         if type(input) is np.ndarray:
             if self.rf.options.export_raw_tbc:
@@ -1055,36 +1136,27 @@ class FieldShared:
                 hz_ire = self.rf.DecoderParams["hz_ire"]
 
                 if input.size == self.outlinecount * self.outlinelen:
-                    ire0_adjust_padding = 4  # 4fsc, prevents noise around the hsync transitions from interfering with this measurement
-
                     measured_porch = None
                     if (
                         "backporch" in self.rf.options.ire0_adjust
                         or "hsync" in self.rf.options.ire0_adjust
                     ):
+                        # Both windows arrive already guarded against the
+                        # transitions either side of them, so the fixed
+                        # 4-sample pad that used to stand here is gone: it
+                        # existed because the spans were hard-coded without
+                        # regard to where the transitions actually are.
+                        tip_window, porch_window = self.level_windows()
                         # The porch is measured whenever either mode needs
                         # it: "backporch" re-anchors ire0 with it, and
                         # "hsync" needs it for the GAIN - a scale derived
                         # from one measured level and one assumed anchor is
                         # not a measurement (the hsync-alone mode long
                         # mixed the spec ire0 with the measured tip).
-                        backporch_start = self.ire0_backporch[0] + ire0_adjust_padding
-                        backporch_end = self.ire0_backporch[1] - ire0_adjust_padding
-                        blank_levels = np.sort(
-                            [
-                                np.median(
-                                    input[
-                                        i * self.outlinelen
-                                        + backporch_start : i * self.outlinelen
-                                        + backporch_end
-                                    ]
-                                )
-                                for i in range(0, self.outlinecount)
-                            ]
-                        )
-                        measured_porch = np.mean(
-                            blank_levels[self.outlinecount // 3 : (self.outlinecount * 2) // 3]
-                        )
+                        lines = input.reshape(self.outlinecount,
+                                              self.outlinelen)
+                        measured_porch = self._window_levels(lines,
+                                                             porch_window)
 
                     if "backporch" in self.rf.options.ire0_adjust:
                         ire0 = measured_porch
@@ -1092,23 +1164,7 @@ class FieldShared:
 
                     if "hsync" in self.rf.options.ire0_adjust:
                         # measure the hsync pulse level
-                        hsync_start = ire0_adjust_padding
-                        hsync_end = self.ire0_backporch[0] - ire0_adjust_padding
-                        hsync_levels = np.sort(
-                            [
-                                np.median(
-                                    input[
-                                        i * self.outlinelen
-                                        + hsync_start : i * self.outlinelen
-                                        + hsync_end
-                                    ]
-                                )
-                                for i in range(0, self.outlinecount)
-                            ]
-                        )
-                        hsync_level = np.mean(
-                            hsync_levels[self.outlinecount // 3 : (self.outlinecount * 2) // 3]
-                        )
+                        hsync_level = self._window_levels(lines, tip_window)
 
                         # calculate scaling from the difference between two
                         # MEASURED levels: the porch and the hsync tip
@@ -1117,6 +1173,50 @@ class FieldShared:
                         ]
 
                         ldd.logger.debug("calculated hz_ire: %.02f", hz_ire)
+
+                        if "declip" in self.rf.options.ire0_adjust:
+                            # A CLIPPED SYNC TIP MAKES THIS SCALE WRONG IN A
+                            # DEFINITE DIRECTION. The clip moves the measured
+                            # tip towards the porch, so the separation above
+                            # is short by the clip's depth, hz_ire comes out
+                            # too small, and every level derived from it is
+                            # stretched.
+                            #
+                            # The witness is noise, not depth: a clipped
+                            # level has no gain, so what rides on it is
+                            # suppressed there and nowhere else. Flatness
+                            # would be no witness at all, because an
+                            # unclipped sync tip is flat too.
+                            #
+                            # WHAT IS DONE HERE IS A REFUSAL, NOT A
+                            # CORRECTION, and deliberately. Recovering the
+                            # depth needs the pulse's EDGES to extrapolate
+                            # through the flattened run
+                            # (models.clipping.extrapolate_through_clip),
+                            # and the window available here holds only the
+                            # tip. So a detected clip disqualifies the tip
+                            # as a level and the calibrated scale stands -
+                            # which is the same thing the degenerate-field
+                            # guard below does, for the same reason.
+                            from vhsdecode.models import clipping
+
+                            verdict = clipping.tip_clip_from_lines(
+                                lines[:, tip_window[0]:tip_window[1]],
+                                lines[:, porch_window[0]:porch_window[1]],
+                            )
+                            if verdict.get("clipped"):
+                                ldd.logger.warning(
+                                    "ire0_adjust(declip): sync tip reads "
+                                    "clipped (tip/porch noise ratio %.3f "
+                                    "over %d lines) -> refusing the "
+                                    "tip-derived hz_ire %.02f and using the "
+                                    "calibrated %.02f",
+                                    verdict["noise_ratio"],
+                                    verdict.get("lines", 0),
+                                    hz_ire,
+                                    self.rf.DecoderParams["hz_ire"],
+                                )
+                                hz_ire = self.rf.DecoderParams["hz_ire"]
 
                         # Guard: on a degenerate field (dropout / sync loss) the
                         # backporch and hsync measurement windows can read the same
@@ -1202,7 +1302,8 @@ class FieldShared:
         self.track_phase_set = True
 
     def downscale(self, final=False, *args, **kwargs):
-        if self.rf.options.carrier_tbc != 0 and not getattr(
+        loop_increment = bool(getattr(self.rf, "_time_base_response", None))
+        if (self.rf.options.carrier_tbc != 0 or loop_increment) and not getattr(
             self, "_carrier_tbc_applied", False
         ):
             # Carrier-refined time base: swap the refined line locations in
@@ -1212,7 +1313,20 @@ class FieldShared:
             # sync-derived array is stashed for inspection; where the trace
             # is absent or fails its gates the field keeps it outright.
             # See `carrier_tbc` for the physics and the gating.
-            refined = carrier_tbc.refine_linelocs(self)
+            refined = (
+                carrier_tbc.refine_linelocs(self)
+                if self.rf.options.carrier_tbc != 0
+                else None
+            )
+            # The offline loop's time anti-residual, an increment added
+            # after every other refinement - the sync resampler as a
+            # derivable component (see `carrier_tbc.time_base_increment`).
+            if loop_increment:
+                incremented = carrier_tbc.apply_time_base_increment(
+                    self, refined if refined is not None else self.linelocs
+                )
+                if incremented is not (refined if refined is not None else self.linelocs):
+                    refined = incremented
             if refined is not None:
                 self._linelocs_hsync = self.linelocs
                 self.linelocs = refined
@@ -1292,6 +1406,12 @@ class FieldShared:
                     gain=lti_gain,
                     threshold=lti_params['threshold']
                 )
+
+            if getattr(self.rf, "_residual_channels_dir", None):
+                # The residual channels, downscaled to 4fsc on the final
+                # time base: after every correction above, on the
+                # corrected linelocs (see `residual_channels`).
+                residual_channels.export_field(self)
 
             dsout = self.hz_to_output(dsout)
             self.dspicture = dsout
@@ -2296,7 +2416,6 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
     def __init__(self, *args, **kwargs):
         super(FieldPALShared, self).__init__(*args, **kwargs)
         self.track_phase_set = False
-        self.ire0_backporch = (96, 160)
         self.burst_detected_line = 0
         self.fsc_ratio = self.rf.SysParams["outfreq"] / self.rf.SysParams["fsc_mhz"]
 
@@ -2375,9 +2494,29 @@ class FieldPALShared(FieldShared, ldd.FieldPAL):
         return linelocs
 
     def determine_field_number(self):
-        """Workaround to shut down phase id mismatch warnings, the actual code
-        doesn't work properly with the vhs output at the moment."""
-        return 1 + (self.rf.field_number % 8)
+        """PAL's eight-field sequence.
+
+        THIS RETURNED A CONSTANT. It read `self.rf.field_number`, which is set
+        to 0 once at `vhsdecode/process.py:768` and is never incremented
+        anywhere in the tree - the counter that DOES advance is the field's
+        own, at `field.py:1025`. So every PAL field was assigned
+        `1 + (0 % 8) = 1`, and the eight-field sequence was not represented at
+        all.
+
+        Its docstring called itself a workaround to silence phase-id mismatch
+        warnings. That reasoning no longer applies twice over: those warnings
+        come from the contract check in `buildmetadata`, and a constant ID
+        does not silence a mismatch so much as guarantee one the moment the
+        check is looked at.
+
+        Using the field's own number makes the sequence advance. It does not
+        make it MEASURED - NTSC's parity is now read from the burst phase in
+        `chroma.colour_frame_parity`, and PAL's eight states want the same
+        treatment plus the line-to-line V-switch. There is no PAL material in
+        this tree to develop that against, so this is the honest half of the
+        fix and the other half is named rather than guessed.
+        """
+        return 1 + (self.field_number % 8)
 
 
 class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
@@ -2385,7 +2524,6 @@ class FieldNTSCShared(FieldShared, ldd.FieldNTSC):
         super(FieldNTSCShared, self).__init__(*args, **kwargs)
         self.track_phase_set = False
         self.fieldPhaseID = None
-        self.ire0_backporch = (74, 124)
         self.burst_detected_line = 0
         self.fsc_ratio = self.rf.SysParams["outfreq"] / self.rf.SysParams["fsc_mhz"]
 

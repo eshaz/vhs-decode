@@ -152,6 +152,25 @@ import scipy.ndimage as ndi
 from numpy import fft as npfft
 
 from vhsdecode import luma_amplitude
+from vhsdecode import baseband_eq
+
+
+def _rf_response(rf):
+    """The RF response the demodulator actually sees.
+
+    The asymmetry kernel below models the pre-demodulation path, so it must
+    read the response as equalized rather than as stored: a table applied to
+    the block before the analytic signal is rebuilt changes exactly the band
+    shape T(f) describes, and a kernel built from the stored filter would
+    model a path that no longer exists. The envelope is the exception and is
+    not routed here - it is taken before that stage, deliberately, which is
+    why the amplitude measurement keeps reading the stored filter.
+    """
+    try:
+        from vhsdecode import channel_eq
+    except ImportError:
+        return rf.Filters["RFVideo"]
+    return channel_eq.effective_rf_response(rf)
 
 
 def _kernel(rf, n, carrier_bin):
@@ -164,7 +183,7 @@ def _kernel(rf, n, carrier_bin):
     both sidebands of the response have died there is no measurement to map,
     and T is set to zero there rather than divided to noise.
     """
-    h_full = np.asarray(rf.Filters["RFVideo"])
+    h_full = np.asarray(_rf_response(rf))
     grid = len(h_full)
     k = np.arange(n // 2 + 1)
     # rfft bin k of the block maps to full-grid bin k * grid / n; the block
@@ -212,7 +231,7 @@ def _kernels(rf, n, model):
     the kernel's own resolution; finer motion cannot change it.
     """
     ire0, tip, white = _anchors(rf, model)
-    grid = len(rf.Filters["RFVideo"])
+    grid = len(_rf_response(rf))
     quant = (int(round(ire0 * grid / rf.freq_hz)),
              int(round(tip * grid / rf.freq_hz)),
              int(round(white * grid / rf.freq_hz)), n)
@@ -225,21 +244,15 @@ def _kernels(rf, n, model):
     if k0 is None or k_tip is None or k_white is None:
         return None, None, None, ire0
     k1 = (k_white - k_tip) / max(white - tip, 1.0)
-    # The gain cap per band. The physical bound is on the TOTAL applied
-    # transfer: |W . K0| may not exceed the single-sideband limit f (one
-    # sideband carrying everything), so W itself is bounded by f/|K0| =
-    # 1/|T_model| - NOT by 1. The model's T omits the record-side lower-
-    # sideband truncation (the software band-pass is nearly symmetric at
-    # small offsets where the recorded signal is not), and the measured
-    # per-band transfer demands W = 1.4 in the 0.3-2 MHz bands that carry
-    # the picture; a cap at 1 was measured to withhold a third of the
-    # correction exactly there. Where the model carries no direction at
-    # all the cap is zero.
+    # The gain cap this once bounded is now applied directly to the measured
+    # transfer as |g| <= f, the single-sideband limit itself, rather than as
+    # a bound on a model-relative gain - the estimator stopped being a scalar
+    # on the model's shape when it became a per-band measurement. The slot is
+    # kept in the cache so the tuple's shape is stable for anything holding a
+    # reference to it, and carries the limit it always meant.
     freqs = np.arange(n // 2 + 1) * (rf.freq_hz / n)
-    mag = np.abs(k0)
-    w_cap = np.where(mag > 0.0, freqs / np.where(mag > 0.0, mag, 1.0), 0.0)
-    rf.__dict__["_head_switch_kernels"] = (quant, k0, k1, w_cap)
-    return k0, k1, w_cap, ire0
+    rf.__dict__["_head_switch_kernels"] = (quant, k0, k1, freqs)
+    return k0, k1, freqs, ire0
 
 
 def _calibration(rf, n):
@@ -307,6 +320,10 @@ def _boxmean(x, width):
 
 def locate(field):
     """Locate the head switch region(s) on an assembled field.
+
+    Returns regions in POSITIONAL order, of which the LAST is the switch -
+    see the comment at the selection below for the measurement that says so
+    and for why the first and the strongest are both unreliable.
 
     Identification, not correction: the correction is samplewise and needs
     no location, but the switch's own robust signature - the sustained
@@ -385,10 +402,16 @@ def locate(field):
     scored = sorted(
         merged, key=lambda r: float(np.sum(np.abs(off[r[0] : r[1]]))), reverse=True
     )
-    # The field's data overhangs into the next field by the extra process
-    # lines, so the array can hold one more switch region than the format
-    # counts per field - typically the field's own, at its first lines,
-    # AND the next field's, at the tail.
+    # THE SWITCH IS THE LAST REGION IN POSITIONAL ORDER, not the first and
+    # not the strongest. The switch sits near the END of the field - the
+    # drum turns once per frame, so the change of head lands at a fixed
+    # angle and therefore a fixed line - and one more region than the
+    # format counts is kept so a competing excursion cannot displace it.
+    # Measured over 24 fields of a colour-bar tape: the last region stands
+    # at line 260.2 +- 0.8, while the first wanders over 178 +- 109 (lines
+    # 15 to 262) and even the strongest by offset spreads 258 +- 10. So a
+    # consumer taking regions[0], or picking by magnitude, gets a different
+    # line every field; take regions[-1].
     keep = int(field.rf.SysParams.get("head_switches_per_field", 1)) + 1
     regions = []
     for a, b in sorted(scored[:keep]):
@@ -403,6 +426,170 @@ def locate(field):
             )
         )
     return regions
+
+
+def _estimate(rf, cal, n, k0):
+    """The measured per-band transfer from the accumulated calibration.
+
+    Returns the applied estimate g (Hz of demodulated frequency per neper of
+    residual log-amplitude, on the block's rfft grid) and its per-band
+    error variance se2. Pure function of the calibration store, so the
+    accessor below reads exactly what the correction applies.
+    """
+    ok = cal["ok"]
+    kern = cal["kern"]
+    num = (
+        np.convolve(cal["cross"].real * ok, kern, mode="same")
+        + 1j * np.convolve(cal["cross"].imag * ok, kern, mode="same")
+    )
+    den_d = np.convolve(cal["power"] * ok, kern, mode="same")
+    den_u = np.convolve(cal["seen"] * ok, kern, mode="same")
+    freqs = np.arange(n // 2 + 1) * (rf.freq_hz / n)
+    f_safe = np.maximum(freqs, freqs[1] if n > 1 else 1.0)
+    # The ridge's prior width is the single-sideband limit f; its CENTRE is
+    # zero unless a measured channel response is declared, in which case it
+    # is the model kernel times the measured channel as far as that
+    # measurement is believed - so the regression rules where it has
+    # evidence and the deterministic measurement fills where it has none.
+    # The ridge weight falls as 1/f^2, so the centre carries weight only at
+    # low frequency, where the regression's evidence is thin, and is
+    # negligible above ~1 MHz where the measured 1.4x coupling rules.
+    ridge = den_u / (2.0 * cal["j"] * cal["blocks"] * f_safe**2)
+    prior = np.zeros_like(num)
+    prior_amount = float(getattr(rf.options, "head_switch_prior", 0.0) or 0.0)
+    if prior_amount:
+        site = baseband_eq.site_transfer(rf, n)
+        if site is not None:
+            site_log, site_belief = site
+            prior = prior_amount * k0 * np.exp(site_belief * site_log)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        g = (num + ridge * prior) / (den_d + ridge)
+    g = np.nan_to_num(g)
+    g_mag = np.abs(g)
+    over = g_mag > freqs
+    g = np.where(over, g * np.where(over, freqs / np.where(over, g_mag, 1.0), 1.0), g)
+
+    # WHAT THIS GATE DOES NOT BOUND. The standard error below is formed
+    # from the scatter across blocks, so the garrote withholds what NOISE
+    # explains and nothing else. A bias that reproduces in every block -
+    # picture structure that repeats line after line and field after field,
+    # most of all on a static test pattern - has a small standard error
+    # precisely because it reproduces, and is admitted at full strength. So
+    # a band passing this gate is REPEATABLE, not thereby REAL. Only varying
+    # the suspected confound bounds confounding: different content, a
+    # different tape, a different capture. (Measured elsewhere in this lane:
+    # an eight-sigma difference between heads on one tape reversed its sign
+    # on another, and a residual coupling read sixty-six times too large
+    # until the line-harmonic notch removed the picture's own structure.)
+    # The notch above and the sweep gate earlier are this stage's defences
+    # against the commonest confound; they are not a general one.
+    #
+    # The garrote withholds whatever the estimate's own standard error
+    # explains, shrinking toward the prior centre (zero without a measured
+    # channel): shrink = 1 - se2/|g - prior|^2, floored at zero. Since it is
+    # zero or negative wherever |g - prior|^2 <= se2, the division is only
+    # ever taken where the departure exceeds its error - there the ratio is
+    # below one and cannot overflow, and a band with no evidence at all
+    # lands in the else branch as exactly zero rather than as an overflowed
+    # quotient.
+    g2 = g.real**2 + g.imag**2
+    residual = np.maximum(den_u - g2 * den_d, 0.0)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        se2 = residual / (
+            2.0 * cal["j"] * cal["blocks"] * np.maximum(den_d, np.finfo(np.float64).tiny)
+        )
+    delta = g - prior
+    d2 = delta.real**2 + delta.imag**2
+    evidence = d2 > se2
+    shrink = np.where(evidence, 1.0 - se2 / np.where(evidence, d2, 1.0), 0.0)
+    g = prior + np.clip(np.nan_to_num(shrink), 0.0, 1.0) * delta
+    return g, se2
+
+
+def measured_transfer(rf):
+    """The measured residual-to-demod transfer as the correction applies it.
+
+    The witness of the RF chain's asymmetry about the carrier: with E and O
+    the symmetric and antisymmetric parts of the channel about the carrier,
+    the amplitude residual converts to demodulated frequency through
+    T = -j O/E, and this is the measured value of that conversion per
+    band. Returns None until the calibration exists; otherwise a dict on
+    the block's rfft grid: `freqs` (Hz), `g` (complex, Hz per neper), `se`
+    (its standard error), `k0` (the model kernel - the decoder's own
+    band-asymmetry prediction, same units), `k1` (the carrier-slope term),
+    `blocks` (calibration depth), `ire0_hz`, `porch_hz`, `tip_hz`,
+    `hz_ire`, and `pooled_heads` = True: blocks carry no field parity, so
+    the estimate pools both heads. Read-only; nothing is recomputed that
+    the correction did not.
+
+    COMPARING `g` WITH `k0` NEEDS ONE CORRECTION FIRST. `k0` is the model
+    at the ONE carrier position of the 0 IRE anchor, while `g` is a
+    regression over blocks in which the carrier sweeps with the picture -
+    so the two are averages over different things, and the difference is
+    not small. The model must be re-evaluated at each carrier position the
+    decode actually visits and averaged with the weight the regression
+    gives it, which is the residual's POWER at that position (the
+    regression's own weighting), or occupancy as its first approximation.
+    Measured on a colour-bar tape, where the carrier's median sits 0.2 MHz
+    above blanking: averaging moves the model by a factor of two in some
+    bands and reverses the sign of its departure from the measurement in
+    others. `k1`, the carrier-slope secant, is the model's own statement
+    of how strongly this varies. Comparing the two as exported, at one
+    carrier, is a convention error rather than a measurement.
+    """
+    cal = rf.__dict__.get("_head_switch_cal")
+    # Strictly read-only: the kernels are taken from the cache the
+    # correction itself filled, never rebuilt here. Rebuilding from a
+    # field thread's view of the anchors was measured to hand the
+    # demodulation thread different kernels than it would otherwise have
+    # used (8% of output samples moved) - a mutating shared filter, the
+    # documented race class. Absent a cache there is nothing to report.
+    cached = rf.__dict__.get("_head_switch_kernels")
+    if cal is None or cal["blocks"] == 0 or cached is None:
+        return None
+    quant, k0, k1, _limit = cached
+    n = int(cal["n"])
+    if k0 is None or len(k0) != n // 2 + 1:
+        return None
+    grid = len(_rf_response(rf))
+    # The anchors the cached kernels were built on, in Hz, from their own
+    # bin quantization.
+    ire0_hz, tip, white = (q * rf.freq_hz / grid for q in quant[:3])
+    porch = ire0_hz
+    g, se2 = _estimate(rf, cal, n, k0)
+    # The level scale these anchors imply: porch to tip is the specified
+    # sync depth.
+    hz_ire = (porch - tip) / -float(rf.SysParams["vsync_ire"])
+    return {
+        "freqs": np.arange(n // 2 + 1) * (rf.freq_hz / n),
+        "g": g,
+        "se": np.sqrt(np.maximum(se2, 0.0)),
+        "k0": k0,
+        "k1": k1,
+        "blocks": int(cal["blocks"]),
+        "ire0_hz": float(ire0_hz),
+        "porch_hz": float(porch),
+        "tip_hz": float(tip),
+        "white_hz": float(white),
+        "hz_ire": float(hz_ire),
+        "pooled_heads": True,
+    }
+
+
+def export_measured_transfer(rf, path):
+    """Write `measured_transfer` to an npz, atomically; no-op until it exists."""
+    import os
+
+    witness = measured_transfer(rf)
+    if witness is None:
+        return False
+    witness = dict(witness)
+    witness["site"] = "demod_raw"
+    witness["units"] = "g: Hz of demodulated frequency per neper of residual log-amplitude"
+    tmp = f"{path}.tmp.npz"
+    np.savez(tmp, **witness)
+    os.replace(tmp, path)
+    return True
 
 
 def correct(rf, demod, envelope, amount, sweep_amount=0.0, calibrate=True):
@@ -441,7 +628,7 @@ def correct(rf, demod, envelope, amount, sweep_amount=0.0, calibrate=True):
         return None
 
     n = len(d)
-    k0, k1, w_cap, ire0_hz = _kernels(rf, n, model)
+    k0, k1, _limit, ire0_hz = _kernels(rf, n, model)
     if k0 is None:
         return None
 
@@ -504,32 +691,7 @@ def correct(rf, demod, envelope, amount, sweep_amount=0.0, calibrate=True):
     # withholds whatever the estimate's own standard error explains - so
     # bands with thin evidence apply nothing rather than Var(G)-scaled
     # noise.
-    ok = cal["ok"]
-    kern = cal["kern"]
-    num = (
-        np.convolve(cal["cross"].real * ok, kern, mode="same")
-        + 1j * np.convolve(cal["cross"].imag * ok, kern, mode="same")
-    )
-    den_d = np.convolve(cal["power"] * ok, kern, mode="same")
-    den_u = np.convolve(cal["seen"] * ok, kern, mode="same")
-    freqs = np.arange(n // 2 + 1) * (rf.freq_hz / n)
-    f_safe = np.maximum(freqs, freqs[1] if n > 1 else 1.0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        g = num / (
-            den_d + den_u / (2.0 * cal["j"] * cal["blocks"] * f_safe**2)
-        )
-    g = np.nan_to_num(g)
-    g_mag = np.abs(g)
-    over = g_mag > freqs
-    g = np.where(over, g * np.where(over, freqs / np.where(over, g_mag, 1.0), 1.0), g)
-
-    residual = np.maximum(den_u - (np.abs(g) ** 2) * den_d, 0.0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        se2 = residual / (
-            2.0 * cal["j"] * cal["blocks"] * np.maximum(den_d, np.finfo(np.float64).tiny)
-        )
-        shrink = 1.0 - se2 / np.maximum(np.abs(g) ** 2, np.finfo(np.float64).tiny)
-    g = g * np.clip(np.nan_to_num(shrink), 0.0, 1.0)
+    g, se2 = _estimate(rf, cal, n, k0)
 
     # The carrier-slope term rides the same measured calibration: the
     # model's carrier DEPENDENCE (how the kernel varies across the

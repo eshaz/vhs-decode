@@ -1,0 +1,675 @@
+# The correction pipeline, declared once.
+#
+# THIS FILE IS THE SINGLE SOURCE OF TRUTH. The graph plot renders it and
+# the executor (when it lands) runs it; there is no second list to keep in
+# step. A stage absent from here can neither run nor be drawn, which is the
+# property that stops the diagram drifting from the pipeline it documents.
+#
+# Every `site` is a real file and line in this tree. Every `gate` names the
+# option that enables the node and the predicate that reads it, so the
+# renderer can print the RESOLVED value - "--head_switch 0 (off)" - rather
+# than leaving a reader to guess which boxes are live.
+#
+# THREE KINDS OF EDGE, and conflating them is how a reordering breaks a
+# correction:
+#   reads/writes    a DATA edge. The consumer reads the producer's output.
+#   measures        a MEASUREMENT edge. The consumer reads a quantity taken
+#                   at a particular POINT, not the signal as it stands when
+#                   the consumer runs. The measurement's position is the
+#                   contract; the consumer's position is free.
+#   feeds_forward   state written for a LATER field. Deliberately delayed.
+#
+# `collapse` records which nodes fold into a single response, which is the
+# arc's central claim and the reason the graph is worth drawing:
+#   "The head/tape/preamp chain and every filter before the demodulator are
+#    LTI on the RF. But the FM demodulator is not linear... Correct before
+#    the demodulator and one filter should fix all levels at once."
+# Measured: the averaged sync pulse needs 34 of 120 DCT coefficients, and
+# after alignment no coefficient stands up consistently - one template
+# carries the pulse. That is the collapse, and it holds.
+
+[meta]
+version = 1
+system = "NTSC VHS SP"
+
+[[collapse]]
+name = "rf_lti"
+title = "one H_RF(f)"
+note = """Every filter before the demodulator is LTI on the RF, so they
+compose into a single response. This is why the correction belongs here:
+one filter fixes all levels at once, where a baseband filter derived from
+the sync edge can only be right at sync level."""
+
+[[collapse]]
+name = "boundary"
+title = "the demodulator breaks it"
+note = """The FM demodulator is not linear, so a fixed ringing in the RF
+appears in baseband as distortion that depends on where the carrier sits -
+3.4 MHz at sync tip, toward 4.4 MHz at white. Nothing either side of this
+node composes with anything on the other side."""
+
+[[collapse]]
+name = "baseband_lti"
+title = "one baseband response"
+note = """Linear and time-invariant on the demodulated video, so these
+compose among themselves - but not with the RF chain, and not with the
+nonlinear stages below."""
+
+[[collapse]]
+name = "nonlinear"
+title = "outside any linear model"
+note = """Level-dependent by design. No linear filter at any point in the
+chain undoes these, so they are what remains after the RF correction
+converges."""
+
+[[collapse]]
+name = "timing"
+title = "the time base"
+note = """Timing before anything spectral: misaligned edges fake a
+high-frequency roll-off, and correcting the time base first is what stops a
+ghost being deconvolved."""
+
+# =====================================================================
+# THE SOLVING BLOCKS - Ethan's staging
+#
+# "The luma and color under originate from the RF. Then we perform the
+#  channel identification there correctly. We then apply the VCR deemphasis
+#  controls AND the picture correction in one block after demodulation. The
+#  deemphasis controls will influence the picture correction, so these steps
+#  need to feed into each other and each separate residual component will be
+#  stored and derived out the entire stage."
+#
+# A block is the unit of SOLVING, which is not the same as the unit of
+# execution (scope) or the unit of composition (collapse). Two stages can
+# run in different scopes and still have to be solved together, and that is
+# exactly the case below.
+# =====================================================================
+
+[[block]]
+name = "rf_identification"
+title = "Block 1 - RF"
+note = """Both the luma and the colour-under originate here, before the
+paths separate, so the channel identification is done here and done once.
+Everything before the demodulator is linear and time-invariant on the RF,
+which is what lets a single response stand for all of it."""
+members = ["notch", "rf_video", "analytic", "high_boost", "rf_eq",
+           "chroma_under"]
+
+[[block]]
+name = "picture_solve"
+title = "Block 2 - after demodulation"
+note = """The VCR de-emphasis and the picture correction are ONE block,
+solved together, because de-emphasis changes what the picture correction
+sees. They currently sit in different scopes with nothing feeding between
+them - `deemphasis` in the RF block, `ringing` in the field - which is the
+gap this block names. Each component's residual is stored and derived
+across the whole stage rather than per stage."""
+members = ["deemphasis", "nldeemp", "subdeemp", "ringing", "luma_transient"]
+
+# =====================================================================
+# RF BLOCK SCOPE - demodblock(), on N worker threads, one RF block each
+# =====================================================================
+
+[[node]]
+name = "notch"
+scope = "rf_block"
+stage = "rf_playback"
+axis = ["frequency"]
+gate = { option = "notch", predicate = "is not None", default = "None" }
+site = "vhsdecode/process.py"
+anchor = "indata_fft *= self.Filters[\"FVideoNotchF\"]"
+reads = ["indata_fft"]
+writes = ["indata_fft"]
+collapse = "rf_lti"
+why = "An operator-declared interferer, notched out before anything measures the band."
+
+[[node]]
+name = "rf_video"
+scope = "rf_block"
+stage = "rf_playback"
+axis = ["frequency"]
+gate = "always"
+site = "vhsdecode/process.py"
+anchor = "indata_fft *= self.Filters[\"RFVideo\"]"
+reads = ["indata_fft"]
+writes = ["indata_fft"]
+collapse = "rf_lti"
+why = "The decoder's own band-pass around the luma FM carrier."
+
+[[node]]
+name = "analytic"
+scope = "rf_block"
+stage = "rf_playback"
+axis = []
+gate = "always"
+site = "vhsdecode/process.py"
+anchor = "# This is the same analytic signal the demodulator runs on"
+reads = ["indata_fft"]
+writes = ["hilbert"]
+collapse = "rf_lti"
+why = "The analytic signal, from which both the envelope and the demodulated frequency are read."
+
+[[node]]
+name = "envelope"
+scope = "rf_block"
+stage = "rf_playback"
+axis = ["amplitude"]
+gate = "always"
+kind = "measurement"
+site = "vhsdecode/process.py"
+anchor = "env = np.abs(hilbert)"
+reads = ["hilbert"]
+writes = ["env", "env_mean"]
+frozen_before = "rf_eq"
+why = """A MEASUREMENT of the tape, not a stage. Taken from the analytic
+signal AFTER RFVideo but BEFORE the equalizer, deliberately: folding the
+equalizer in ahead of it was measured to cost 17% of the chroma correction
+to buy 1.8% on the luma. Every amplitude-axis consumer binds to this point,
+whatever order it runs in."""
+
+[[node]]
+name = "effective_rf_response"
+scope = "rf_block"
+stage = "rf_playback"
+axis = ["frequency"]
+gate = "always"
+kind = "measurement"
+site = "vhsdecode/channel_eq.py"
+anchor = "def effective_rf_response(rf):"
+# Decoder STATE, not a signal channel - filter tables built once at
+# construction. Declared apart so a reads/writes check over the signal
+# graph does not have to carry an exemption list to step over them.
+state_reads = ["Filters.RFVideo", "Filters.ChannelEQ"]
+writes = ["rf_response"]
+why = """The response the DEMODULATOR actually sees: RFVideo times the
+equalizer's table where that stage is active. Anything modelling the
+pre-demodulator path must read THIS and not the stored filter, or it models
+a path that no longer exists once the table is applied."""
+
+[[node]]
+name = "high_boost"
+scope = "rf_block"
+stage = "rf_playback"
+axis = ["frequency", "amplitude"]
+gate = { option = "high_boost", predicate = "is not None", default = "format" }
+site = "vhsdecode/process.py"
+anchor = "high_part = sosfiltfilt_rust(self.Filters[\"RFTop\"]"
+reads = ["indata_fft", "env"]
+writes = ["indata_fft"]
+measures = [ { node = "envelope", as = "envelope" } ]
+collapse = "rf_lti"
+why = "Envelope-weighted high-frequency lift, applied where the carrier is weak."
+
+[[node]]
+name = "rf_eq"
+scope = "rf_block"
+stage = "rf_playback"
+axis = ["frequency"]
+gate = { option = "channel_eq", predicate = "!= 0", default = 0, alternate = "luma_eq" }
+site = "vhsdecode/process.py"
+anchor = "rf_eq = self.Filters.get(\"ChannelEQ\", luma_eq)"
+reads = ["indata_fft"]
+writes = ["indata_fft"]
+collapse = "rf_lti"
+must_follow = ["envelope"]
+why = """THE correction site. Applied before the demodulator, where the
+chain is still linear, so one response fixes every level at once."""
+
+[[node]]
+name = "demod"
+scope = "rf_block"
+stage = "rf_playback"
+axis = []
+gate = "always"
+site = "vhsdecode/process.py"
+anchor = "demod = unwrap_hilbert(hilbert, self.freq_hz)"
+reads = ["hilbert"]
+# `demod_raw` is the same signal under the field record array's name, not a
+# second channel and not an external input. Two nodes read it and nothing
+# declared it, which read as a hole in the graph.
+writes = ["demod", "demod_raw"]
+collapse = "boundary"
+must_follow = ["rf_eq"]
+why = """The FM demodulator. Amplitude-blind by construction - the angle of
+k*z is the angle of z - so a flat gain difference between heads passes
+through it as nothing at all, while the same gain is exactly visible on the
+envelope. This node is where the linear collapse ends."""
+
+[[node]]
+name = "head_switch"
+scope = "rf_block"
+stage = "rf_playback"
+axis = ["amplitude"]
+gate = { option = "head_switch", predicate = "!= 0", default = 0 }
+entry = "vhsdecode.head_switch:correct"
+site = "vhsdecode/process.py"
+anchor = "head_switch.correct("
+reads = ["demod"]
+writes = ["demod"]
+mutates_in_place = true
+measures = [ { node = "envelope", as = "envelope" }, { node = "effective_rf_response", as = "rf_response" } ]
+consumes_model = ["luma_amplitude.block_model"]
+accumulates = [ { key = "_head_switch_cal", race = "accepted", note = "head_switch.py:143-147" } ]
+must_precede = ["baseband_eq", "luma_transient", "deemphasis"]
+must_follow = ["demod"]
+collapse = "nonlinear"
+components = [
+  { name = "ridge", note = "the self-calibrating W(f) cancellation" },
+  { name = "prior", note = "re-centres the ridge from a baseband measurement (--head_switch_prior)" },
+  { name = "sweep", note = "the deterministic sweep-phase term; parked, nothing wires it" },
+]
+why = """The phase partner of the carrier amplitude residual, with head
+switch steps and dropout edges as its coherent extremes. Removed before
+every stage that corrects what lies underneath it."""
+
+[[node]]
+name = "baseband_eq"
+scope = "rf_block"
+stage = "rf_playback"
+axis = ["frequency"]
+gate = { option = "baseband_eq", predicate = "!= 0 and declared", default = 0.5 }
+entry = "vhsdecode.baseband_eq:correct"
+site = "vhsdecode/process.py"
+anchor = "baseband_eq.correct("
+reads = ["demod"]
+writes = ["demod"]
+mutates_in_place = true
+must_follow = ["head_switch"]
+collapse = "baseband_lti"
+components = [
+  { name = "flat_field", note = "the line-harmonic identification (--baseband_lf_response)" },
+  { name = "sync_step", note = "the sync-step response (--sync_step_response)" },
+]
+why = """Unity at DC by construction, because the output stage re-anchors
+black to the porch and a stage that reshaped the porch's DC would move
+picture levels."""
+
+[[node]]
+name = "luma_transient"
+scope = "rf_block"
+stage = "rf_playback"
+axis = ["time"]
+gate = { option = "luma_transient", predicate = "!= 0", default = 0 }
+entry = "vhsdecode.luma_transient:correct"
+site = "vhsdecode/process.py"
+anchor = "luma_transient.correct("
+reads = ["demod"]
+writes = ["demod"]
+mutates_in_place = true
+collapse = "baseband_lti"
+why = "The transient shape, from a model frozen at a field boundary."
+
+[[node]]
+name = "spike_replace"
+scope = "rf_block"
+stage = "rf_playback"
+axis = ["amplitude"]
+gate = { option = "disable_diff_demod", predicate = "is False", default = false }
+site = "vhsdecode/process.py"
+anchor = "replace_spikes("
+reads = ["demod", "hilbert"]
+writes = ["demod"]
+collapse = "nonlinear"
+why = "Demodulator spikes replaced from the half-bandwidth copy: a threshold effect, outside any linear model."
+
+[[node]]
+name = "video_eq"
+scope = "rf_block"
+stage = "picture"
+axis = ["frequency"]
+gate = { option = "sharpness", predicate = "!= 0", default = 0 }
+site = "vhsdecode/process.py"
+anchor = "if self._video_eq:"
+reads = ["demod"]
+writes = ["demod"]
+collapse = "baseband_lti"
+why = "Operator sharpness."
+
+[[node]]
+name = "chroma_trap"
+scope = "rf_block"
+stage = "picture"
+axis = ["frequency"]
+gate = { option = "chroma_trap", predicate = "is True", default = false }
+site = "vhsdecode/process.py"
+anchor = "demod = self.chromaTrap.work(demod)"
+reads = ["demod"]
+writes = ["demod"]
+collapse = "baseband_lti"
+why = "Notches the subcarrier out of the luma."
+
+[[node]]
+name = "deemphasis"
+scope = "rf_block"
+stage = "rf_recording"
+axis = ["frequency"]
+gate = "always"
+site = "vhsdecode/process.py"
+anchor = "out_video_fft = demod_fft * self.Filters[\"FVideo\"]"
+reads = ["demod"]
+writes = ["out_video", "demod_fft"]
+collapse = "baseband_lti"
+why = "The record-side pre-emphasis, inverted."
+
+[[node]]
+name = "nldeemp"
+scope = "rf_block"
+stage = "rf_recording"
+axis = ["amplitude", "frequency"]
+gate = { option = "nldeemp", predicate = "is True", default = false }
+site = "vhsdecode/process.py"
+anchor = "if self.options.nldeemp or self.options.subdeemp:"
+reads = ["out_video"]
+writes = ["out_video"]
+collapse = "nonlinear"
+why = """The record-side NON-LINEAR emphasis. Level-dependent by design, so
+no linear filter anywhere in the chain undoes it - this is what remains
+after the RF correction converges."""
+
+[[node]]
+name = "subdeemp"
+scope = "rf_block"
+stage = "rf_recording"
+axis = ["amplitude", "frequency"]
+gate = { option = "subdeemp", predicate = "is True", default = false }
+site = "vhsdecode/process.py"
+anchor = "sub_deemphasis("
+reads = ["out_video"]
+writes = ["out_video"]
+collapse = "nonlinear"
+why = "The second non-linear emphasis path, on its own separate law."
+
+[[node]]
+name = "video05"
+scope = "rf_block"
+stage = "picture"
+axis = ["frequency"]
+gate = "always"
+site = "vhsdecode/process.py"
+anchor = "out_video05 = npfft.irfft(demod_fft * self.Filters[\"FVideo05\"]).real"
+reads = ["demod_fft"]
+writes = ["out_video05"]
+why = "The half-bandwidth copy, used for sync detection and spike replacement. A genuine fork."
+
+[[node]]
+name = "chroma_under"
+scope = "rf_block"
+stage = "rf_playback"
+axis = ["frequency"]
+gate = { option = "color_under", predicate = "derived", default = true }
+site = "vhsdecode/process.py"
+anchor = "chroma_color_under_filter("
+reads = ["raw_data"]
+writes = ["out_chroma"]
+why = """The colour-under, taken from the RAW data rather than the
+demodulated luma - the chroma never passes through the FM demodulator, so
+this fork leaves before the collapse boundary."""
+
+# =====================================================================
+# FIELD SCOPE - lock_to_burst() and downscale(), one thread, serial
+# =====================================================================
+
+[[node]]
+name = "luma_amplitude"
+scope = "field"
+stage = "rf_playback"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "chroma_env_gain", predicate = "> 0, or luma_eq or luma_transient or head_switch, and the field is valid", default = 1 }
+kind = "measurement"
+entry = "vhsdecode.luma_amplitude:measured_amplitude_deviation"
+site = "vhsdecode/field.py"
+anchor = "measured_amplitude_deviation("
+reads = ["env", "demod_raw"]
+writes = ["per_head_response", "amplitude_deviation"]
+measures = [ { node = "envelope", as = "envelope" } ]
+# Written on the field thread, read across the decode - and, for the block
+# bundle, read by the RF workers while it is being replaced. `accepted` is
+# what section 10.1 of the design calls today's tolerated behaviour; nothing
+# here is claimed to be reproducible under threading.
+accumulates = [
+  { key = "_luma_eq_lines", race = "accepted", note = "luma_amplitude.py:1840-1843" },
+  { key = "_luma_dense_response", race = "accepted", note = "luma_amplitude.py:1869-1873, 1994-2003" },
+  { key = "_luma_field_count", race = "accepted", note = "luma_amplitude.py:1880-1882 - the bank index both dense tables are split on" },
+  { key = "_luma_sweep_residue", race = "accepted", note = "luma_amplitude.py:2028-2043" },
+  { key = "_luma_joint_residue", race = "accepted", note = "luma_amplitude.py:2050-2067" },
+  { key = "_luma_level_state", race = "accepted", note = "luma_amplitude.py:2069-2074" },
+  { key = "_luma_eq_reliability", race = "accepted", note = "luma_amplitude.py:2338-2364 - and the _luma_eq_trust factor it leaves" },
+  { key = "_luma_switch_line", race = "accepted", note = "luma_amplitude.py:2815-2817 - where the track axis has its origin" },
+  { key = "_luma_track_residue", race = "accepted", note = "luma_amplitude.py:2828-2829" },
+  { key = "_luma_time_base_residue", race = "accepted", note = "luma_amplitude.py:2842-2843" },
+  { key = "_luma_block_model", race = "accepted", note = "luma_amplitude.py:1610-1618 - replaced per field, read by every RF worker through block_model()" },
+]
+components = [
+  { name = "line", note = "the fitted response line, pooled per head (_luma_eq_lines)" },
+  { name = "dense", note = "the accumulated frequency departure from that line, per head (_luma_dense_response, read back through _head_model)" },
+  { name = "sweep", note = "the sweep residue indexed on the collapse formula's own theta^2 (_luma_sweep_residue, sweep_residue_of)" },
+  { name = "joint", note = "the frequency-by-theta product, rule R3: what neither margin carries (_luma_joint_residue, joint_residue_of)" },
+  { name = "track", note = "the amplitude residual along the track axis, binned from the head switch (_luma_track_residue, track_residue_of)" },
+  { name = "time_base", note = "the same axis' other residual - the measured line period against the SPEC period (_luma_time_base_residue)" },
+]
+why = """THE amplitude measurement, and a MEASUREMENT rather than a stage: it
+applies nothing to any signal. It reads the envelope frozen before the
+equalizer against the carrier's own frequency, divides out the path's
+response to that frequency, and what remains is the tape's multiplicative
+noise - so every amplitude-axis consumer binds HERE, whatever order it runs
+in. `chroma_env` scales the colour-under by it, `luma_eq_update` fits the
+next field's equalizer from the per-head response, `luma_transient_observe`
+states its model against it, and `head_switch` reads the pooled bundle in
+the RF workers. It is triggered from two places - the field's own hook and
+the chroma path - and memoized on the field, so which one asks first does
+not change what any of them get. Its absence from this declaration is what
+left `per_head_response` and `amplitude_deviation` read by nodes and written
+by none, and left the residual traversal with no parent to resolve."""
+
+[[node]]
+name = "chroma_env"
+scope = "field"
+stage = "rf_playback"
+axis = ["amplitude"]
+gate = { option = "chroma_env_gain", predicate = "> 0", default = 1 }
+entry = "vhsdecode.chroma:apply_chroma_envelope_gain"
+site = "vhsdecode/field.py"
+anchor = "apply_chroma_envelope_gain(self)"
+reads = ["out_chroma", "amplitude_deviation"]
+writes = ["out_chroma"]
+measures = [ { node = "envelope", as = "envelope" } ]
+components = [
+  { name = "gain", note = "the amplitude correction (--chroma_env_gain)" },
+  { name = "phase", note = "the quadrature rotation (--chroma_env_phase)" },
+]
+why = """The tape's amplitude noise, reversed on the colour-under: whatever
+in the luma carrier's amplitude does not follow its own frequency is tape
+noise, and the colour-under written beside it took the same loss."""
+
+[[node]]
+name = "luma_eq_update"
+scope = "field"
+stage = "rf_playback"
+axis = ["frequency"]
+gate = { option = "luma_eq", predicate = "!= 0", default = 0 }
+entry = "vhsdecode.luma_amplitude:update_luma_equalizer"
+site = "vhsdecode/field.py"
+anchor = "update_luma_equalizer("
+reads = ["per_head_response"]
+state_writes = ["Filters.LumaPathEQ"]
+# `per_head_response` is taken at a POINT - the luma amplitude
+# measurement - not read as the signal stands when this runs, so it is a
+# measurement edge. Without it this node has no parent and sits outside
+# the residual traversal entirely.
+measures = [ { node = "luma_amplitude", as = "per_head_response" } ]
+feeds_forward = [ { target = "rf_eq", via = "Filters.LumaPathEQ", delay = "one_field", freeze = "field_boundary" } ]
+why = """Fits the NEXT field's equalizer. The delay is unavoidable: the fit
+needs the head, and a demodulator running ahead of field assembly cannot be
+told which head is coming until a field later."""
+
+[[node]]
+name = "luma_transient_observe"
+scope = "field"
+stage = "rf_playback"
+axis = ["time"]
+gate = { option = "luma_transient", predicate = "!= 0", default = 0 }
+site = "vhsdecode/field.py"
+anchor = "luma_transient.observe(self)"
+reads = ["amplitude_deviation"]
+writes = ["_luma_transient_line"]
+measures = [ { node = "luma_amplitude", as = "amplitude_deviation" } ]
+feeds_forward = [ { target = "luma_transient", via = "_luma_transient_line", delay = "one_field", freeze = "write_once" } ]
+why = "Builds the transient model once and freezes it, so every block reads one version."
+
+[[node]]
+name = "burst_phase"
+scope = "field"
+stage = "picture"
+axis = ["time"]
+gate = { option = "write_chroma", predicate = "derived", default = true }
+site = "vhsdecode/field.py"
+anchor = "decode_chroma_phase_rotation("
+reads = ["out_chroma"]
+writes = ["track_phase", "phase_sequence"]
+why = "The chroma's phase rotation per line, and which of the four-field sequence this field is."
+
+[[node]]
+name = "carrier_tbc"
+scope = "field"
+stage = "picture"
+axis = ["time"]
+gate = { option = "carrier_tbc", predicate = "!= 0", default = 0 }
+entry = "vhsdecode.carrier_tbc:refine_linelocs"
+site = "vhsdecode/field.py"
+anchor = "carrier_tbc.refine_linelocs("
+reads = ["demod_raw", "linelocs"]
+writes = ["linelocs"]
+collapse = "timing"
+why = "Line positions refined against the carrier rather than the demodulated edge."
+
+[[node]]
+name = "resample"
+scope = "field"
+stage = "picture"
+axis = ["time"]
+gate = "always"
+site = "vhsdecode/field.py"
+anchor = "dsout, dsaudio, dsefm = super(FieldShared, self).downscale("
+reads = ["linelocs", "demod"]
+writes = ["dsout", "wowfactors"]
+collapse = "timing"
+must_follow = ["carrier_tbc"]
+why = """The time base correction itself: one spline yields both timing and
+level. Resampling on the sync-to-sync distance is what removes the residual
+RF phase, which is why timing precedes anything spectral."""
+
+[[node]]
+name = "y_comb"
+scope = "field"
+stage = "picture"
+axis = ["frequency"]
+gate = { option = "y_comb", predicate = "!= 0", default = 0 }
+site = "vhsdecode/field.py"
+anchor = "dsout = y_comb(dsout, self.outlinelen, y_comb_value)"
+reads = ["dsout"]
+writes = ["dsout"]
+why = "A vertical comb, blending each sample with the lines above and below."
+
+[[node]]
+name = "ringing"
+scope = "field"
+stage = "picture"
+axis = ["time"]
+gate = { option = "inverse_eq", predicate = "> -1", default = -1 }
+entry = "vhsdecode.addons.ringing_cancellation:process_field"
+site = "vhsdecode/field.py"
+anchor = "ringing_cancellation.process_field("
+reads = ["dsout"]
+writes = ["dsout"]
+accumulates = [ { key = "_ringing_state", race = "accepted", note = "ringing_cancellation.py:143-147" } ]
+components = [
+  { name = "smear", note = "the causal IIR shelf inverse, one stage per real pole" },
+  { name = "ring", note = "the gated feedforward subtraction of the certified resonances" },
+  { name = "ghost", note = "the echo taps" },
+  { name = "tail", note = "the dense FIR remainder the pencil cannot certify" },
+  { name = "landing_bank", note = "the synthesized per-landing kernels (sidecar: landing_bank)" },
+]
+why = """The sync-derived artifact model, subtracted. Calibrated on lines
+the geometry declares measurable and - a known defect - applied to the whole
+field buffer including the last line, whose tip carries the next field's
+equalizing pulse."""
+
+[[node]]
+name = "hz_to_output"
+scope = "field"
+stage = "picture"
+axis = ["amplitude"]
+gate = "always"
+site = "vhsdecode/field.py"
+anchor = "self.hz_to_output(dsout)"
+reads = ["dsout"]
+writes = ["dspicture"]
+why = """The black anchor. Levels are measured on spec-derived windows: the
+sync tip guarded off its own transitions, and the back porch from the burst
+end to one settling guard short of active video."""
+
+[[node]]
+name = "decode_chroma"
+scope = "field"
+stage = "picture"
+axis = ["frequency"]
+gate = { option = "write_chroma", predicate = "derived", default = true }
+entry = "vhsdecode.chroma:decode_chroma"
+site = "vhsdecode/chroma.py"
+anchor = "def decode_chroma("
+reads = ["out_chroma"]
+writes = ["uphet"]
+why = "Heterodyne up-conversion, de-emphasis, comb and automatic gain."
+
+[[node]]
+name = "luma_beat"
+scope = "field"
+stage = "picture"
+axis = ["amplitude"]
+gate = { option = "luma_beat", predicate = "!= 0 and burst present", default = 0 }
+entry = "vhsdecode.luma_beat:correct"
+site = "vhsdecode/chroma.py"
+anchor = "luma_beat.correct(field, uphet"
+reads = ["uphet", "dspicture"]
+writes = ["dspicture"]
+mutates_in_place = true
+must_follow = ["decode_chroma", "hz_to_output"]
+why = """A JOIN, not a tail stage: the chroma branch re-enters the luma. The
+colour-under's beat is removed from the picture, scaled by the chroma's own
+saturation - which is why it must read the chroma BEFORE the transient
+sharpener touches it."""
+
+[[node]]
+name = "cti"
+scope = "field"
+stage = "picture"
+axis = ["time"]
+gate = { option = "cti_mix", predicate = "!= 0", default = 1 }
+entry = "vhsdecode.chroma:apply_chroma_transient_improvement"
+site = "vhsdecode/chroma.py"
+anchor = "def apply_chroma_transient_improvement("
+reads = ["uphet"]
+writes = ["uphet"]
+mutates_in_place = true
+must_follow = ["luma_beat", "decode_chroma"]
+components = [
+  { name = "shaped", note = "per-pass radii with jointly solved weights; off falls back to the fixed geometric decay" },
+]
+why = """LAST, after every stage that measures the chroma. A cosmetic
+sharpener: it accelerates the sweep between colour states, so anything
+measuring a physical property of the chroma must read it first. Its reach is
+measured per field from the burst - the chroma path's own step response -
+rather than set by a knob."""
+
+[[node]]
+name = "residual_channels"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "residual_channels", predicate = "is not None", default = "None" }
+site = "vhsdecode/field.py"
+anchor = "residual_channels.export_field(self)"
+reads = ["dsout", "wowfactors", "out_chroma"]
+writes = ["npz_per_field"]
+kind = "export"
+why = "Every carried channel, on the final time base, for the offline identification loop."
