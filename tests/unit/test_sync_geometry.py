@@ -136,3 +136,133 @@ def test_the_entries_are_ordered_and_subtractable():
     # below the recorder's clip, which is where Ethan localises it
     from vhsdecode.models import clipping
     assert sg.CHAIN_POSITION < clipping.CHAIN_POSITION
+
+
+def test_a_real_pole_cannot_carry_a_ring_and_the_fit_says_so():
+    """Ethan: *"a complex pair is not interconnected ... showing as a ringing
+    and noise profile on the sync pulse's response."*
+
+    The sync edge and the back-porch tail are ONE channel - the porch is
+    where the edge's step settles - so a ring visible on the edge must be
+    present in the tail. A single real exponential has no frequency and
+    cannot represent one."""
+    t = np.linspace(0.0, 3.77, 55)
+    rng = np.random.default_rng(3)
+
+    pure = 6.5 - 2.4 * np.exp(-t / 1.3) + rng.normal(0.0, 0.21, t.size)
+    got = sg.relaxation_or_ringing(pure, t)
+    assert got["decided"] and not got["prefers_ringing"]
+
+    for frequency, decay in ((0.6e6, 1.3), (1.5e6, 0.8)):
+        ringing = (6.5 - 2.4 * np.exp(-t / decay)
+                   * np.cos(2 * np.pi * frequency * t * 1e-6)
+                   + rng.normal(0.0, 0.21, t.size))
+        got = sg.relaxation_or_ringing(ringing, t)
+        assert got["prefers_ringing"], frequency
+        assert got["ringing"]["frequency_hz"] == pytest.approx(
+            frequency, rel=0.10)
+
+
+def test_the_ring_test_is_not_fooled_by_noise():
+    """A ring has two more free parameters, so it fits better by
+    construction. Measured over sixty draws of pure noise it buys a median
+    +7.2 per cent and at most +15.9 - so a measurement must clear that, not
+    merely be positive."""
+    t = np.linspace(0.0, 3.56, 52)
+    rng = np.random.default_rng(11)
+    improvements = []
+    for _ in range(24):
+        got = sg.relaxation_or_ringing(rng.normal(0.0, 0.175, t.size), t)
+        improvements.append(got["improvement"])
+    assert float(np.median(improvements)) < 0.20
+    assert max(improvements) < 0.35, (
+        "chance must stay below the +37 per cent the real remainder gives")
+
+
+def test_the_crossover_between_the_two_probes_is_derived_not_chosen():
+    """Ethan: 'Use the eq pulses to get the longer value, and the hsync
+    pulses to refine the higher frequency details.' A probe of duration T
+    carries nothing below 1/T, so the sync pulse's own 4.7 microseconds is
+    the frequency beneath which only the vertical interval can speak."""
+    import numpy as np
+    from vhsdecode.models import sync_geometry as sg
+
+    edges = sg.crossover_hz()
+    assert edges["short_resolution_hz"] == pytest.approx(1.0 / 4.7e-6)
+    assert edges["long_resolution_hz"] == pytest.approx(1.0 / 572e-6)
+    assert edges["crossover_hz"] == edges["short_resolution_hz"]
+    assert edges["decades_below_crossover"] == pytest.approx(2.086, abs=0.01)
+    # a narrower pulse would move the join, which is the point of deriving it
+    assert sg.crossover_hz(short_probe_us=2.3)["crossover_hz"] > edges["crossover_hz"]
+
+
+def test_two_probes_join_into_one_response_and_the_level_step_is_measured():
+    import numpy as np
+    from vhsdecode.models import sync_geometry as sg
+
+    frequency = np.logspace(np.log10(500), np.log10(4e6), 2000)
+    # a corner at 50 kHz, below anything the sync pulse can resolve
+    truth = 1.0 / (1.0 + 1j * frequency / 50e3)
+    low = frequency < 3e5
+    high = frequency > 1.5e5
+    planted_offset = 0.3
+    out = sg.combined_response(frequency[low], truth[low],
+                               frequency[high], truth[high] * np.exp(planted_offset))
+    assert out["crossover_hz"] == pytest.approx(1.0 / 4.7e-6)
+    assert out["from_long_probe"] > 0 and out["from_short_probe"] > 0
+    # the gain difference between the two instruments is measured, not fitted
+    assert -out["level_offset_nepers"] == pytest.approx(planted_offset, abs=1e-6)
+    assert out["overlap_disagreement_nepers"] == pytest.approx(0.0, abs=1e-9)
+    joined = np.interp(frequency, out["frequency_hz"], np.abs(out["H"]))
+    assert np.abs(np.log(joined / np.abs(truth))).max() < 1e-6
+
+
+def test_the_whole_sync_region_is_masked_from_the_decode_and_not_assumed():
+    """Ethan: 'I need to measure the entire sync region, and mask out the
+    active area from this measurement.' The bounds come from the decode's
+    own JSON, and where they disagree with BT.1700 the disagreement is
+    reported rather than resolved."""
+    import numpy as np
+    from vhsdecode.models import sync_geometry as sg
+
+    out = sg.blanking_mask(field_width=910, active_start=134, active_end=894)
+    assert out["sync_region_samples"] == 150
+    assert out["active_samples"] == 760
+    assert out["mask"].sum() + out["active"].sum() == 910
+    # the region is the two ends of the line, not a middle span
+    assert out["mask"][0] and out["mask"][-1] and not out["mask"][500]
+    # BT.1700 wants 10.9 us and this decode gives 10.476: six samples short
+    assert out["sync_region_us"] == pytest.approx(10.476, abs=0.01)
+    assert out["shortfall_samples"] == 6
+    assert out["specified_mask"].sum() == out["sync_region_samples"] + 6
+    assert not out["within_specification"]
+    # and it refuses to guess when it is given nothing to read
+    with pytest.raises(ValueError, match="not assumed"):
+        sg.blanking_mask()
+
+
+def test_the_field_mask_keeps_only_timing_and_never_content():
+    """Ethan: 'Mask out the entire VBI and the active area, only the vsync
+    and sync pulse area should remain. Stop the mask just after the tail
+    end of the active area in the front porch.'"""
+    import numpy as np
+    from vhsdecode.models import sync_geometry as sg
+
+    out = sg.frame_mask(field_width=910, field_height=263,
+                        active_start=134, active_end=894)
+    assert out["vsync_rows"] == 9
+    assert out["vbi_rows_dropped"] == 13
+    assert out["picture_rows"] == 263 - 9 - 13
+    # the vertical sync block is kept whole; the VBI's test lines are gone
+    assert out["mask"][0].all() and out["mask"][8].all()
+    assert not out["mask"][9].all() and not out["mask"][21].any()
+    # a picture line keeps the sync pulse and the front porch's tail only
+    line = out["line_keep"]
+    assert line[:out["sync_pulse_end_column"]].all()
+    assert not line[134:894].any()                     # no active picture
+    assert not line[74:110].any()                      # no colour burst
+    assert line[out["keep_from_column"]:].all()        # the front porch tail
+    assert out["front_porch_samples_kept"] == 910 - out["keep_from_column"]
+    assert out["kept_fraction"] < 0.2
+    with pytest.raises(ValueError, match="not assumed"):
+        sg.frame_mask()

@@ -1,0 +1,265 @@
+# Deck log: one readable file per bench, edited by hand.
+# Read by vhsdecode/models/deck_log.py; the schema is described in
+# docs/DECK_LOG.md. Validate and list what it can separate with
+#   PYTHONPATH=/workspaces/vhs-decode python3 -m vhsdecode.models.deck_log tools/ringing_measure/deck_log.toml
+#
+# Ethan: "Log head swaps and maintenance dates. Gap geometry resets at a swap
+# while preamp and servo don't - that's a natural experiment for separating
+# head terms from deck terms." / "GPS/NTP-disciplined timestamps on captures.
+# Over a long acquisition, capture-chain drift becomes a hidden variable
+# correlated with everything; timestamps let you regress it out."
+#
+# Everything below is what is KNOWN about the existing captures. Where a
+# value is unrecorded the entry says so rather than guessing, and validate()
+# warns on every gap so the gaps stay visible. Sources: the capture file
+# names (deck, speed, sample rate), /testdata/test_patterns/vhs/readme.txt
+# and /testdata/test_patterns/cvbs/readme.txt (devices and settings), the
+# Sony schematic's parts list (crystals), the archive file names behind
+# home.flac and countdown.flac, and file modification times (the only
+# timestamps that exist, none of them disciplined).
+
+schema = 1
+
+[bench]
+name = "Ethan's bench"
+notes = "single deck for the test-pattern captures; the deck that played the two-hour captures is unrecorded"
+
+[clock]
+# LABELLED ASSUMPTIONS, not measurements: typical specification figures for
+# an AT-cut quartz crystal of the kind on a capture card or in a deck. They
+# bound what a crystal CAN do over a span; a fitted drift that exceeds the
+# bound is not the capture chain. Replace them with measured figures once a
+# reference has been checked against GPS or NTP, and say so in `status`.
+aging_ppm_per_year = 5.0
+thermal_ppm_per_kelvin = 0.5
+temperature_excursion_kelvin = 10.0
+status = "typical AT-cut crystal specification figures (ppm per year of aging, ppm per kelvin of temperature); not measured on any device in this log"
+
+# ---------------------------------------------------------------------------
+# capture devices
+# ---------------------------------------------------------------------------
+
+[[capture_devices]]
+id = "rigol-ds1202z-e"
+kind = "oscilloscope"
+make = "Rigol"
+model = "DS1202Z-E"
+bit_depth = 8
+# from /testdata/test_patterns/vhs/readme.txt (captures of 2025-07-12)
+[capture_devices.settings]
+timebase = "10 ms/div, giving 50 MS/s"
+channel = 1
+coupling = "AC"
+probe = "1X"
+vertical_scale = "adjusted per capture for the largest amplitude within the screen; the setting was not recorded"
+connection = "female Dupont-to-BNC coax from the RF test point; no amplifier, buffer, termination or scope probe"
+file_format = "waveform file with the first 2822 bytes of settings removed, saved as .u8 and compressed to FLAC"
+
+[[capture_devices]]
+id = "cx-white-stock"
+kind = "cxadc"
+make = "stock white CX card (Conexant CX2388x)"
+crystal_hz = 28636363
+bit_depth = 8
+# /sys/class/cxadc/cxadc0/device/parameters as recorded in
+# /testdata/test_patterns/cvbs/readme.txt for the CVBS captures of the
+# generator. Listed so a CX capture of a deck can be entered the same way.
+[capture_devices.settings]
+sixdb = 0
+tenbit = 0
+audsel = -1
+center_offset = 1
+latency = -1
+crystal = 28636363
+vmux = 1
+tenxfsc = 0
+level = 0
+
+# ---------------------------------------------------------------------------
+# decks
+# ---------------------------------------------------------------------------
+
+[[decks]]
+id = "slv-778hf"
+make = "Sony"
+model = "SLV-778HF"
+serial = ""                  # unrecorded
+# Crystals in the schematic's parts list ("Sony Slv777Hf 778Hf 788Hf
+# Schematic.pdf", read with pdftotext 2026-09-05): 3.579545 MHz, 16 MHz and
+# 32.768 kHz. Which one references the servo has not been traced.
+reference_crystals_hz = [3579545, 16000000, 32768]
+rf_taps = { record = "CN261 pin 1", playback = "CN261 pin 2" }
+notes = "Adaptive Picture Control disabled for the 2025-07-12 captures; composite in on L1 from the TSG-130A"
+# No head swap and no maintenance has been recorded for this deck. When one
+# happens, add it here WITH ITS DATE - the date is what makes it usable:
+#
+# [[decks.head_swaps]]
+# date = 2026-03-01
+# heads = "video pair"       # which heads were replaced: video pair, hifi pair, EP pair
+# part = ""                  # part number if known
+# notes = ""
+#
+# [[decks.maintenance]]
+# date = 2026-03-01
+# kind = "head cleaning"     # head cleaning | transport service | electronics repair | alignment
+# notes = ""
+
+[[decks]]
+id = "playback-deck-unrecorded"
+make = "unknown"
+model = ""
+serial = ""
+notes = "the deck that played home.flac and countdown.flac was not recorded; entered so the captures can be logged and the gap stays visible"
+
+# ---------------------------------------------------------------------------
+# tapes
+# ---------------------------------------------------------------------------
+
+[[tapes]]
+id = "zaroff-test-patterns-2025-07-12"
+stock = ""                   # unrecorded
+recorded = 2025-07-12
+recorded_on = "slv-778hf"
+source = "Tektronix TSG-130A Multiformat Signal Generator, composite out"
+
+[[tapes]]
+id = "home-1994"
+stock = ""                   # unrecorded
+recorded_from = 1994-01-01
+recorded_to = 1994-10-31
+recorded_on = ""             # the camcorder or deck is unrecorded
+notes = "recording period from the archive file name 1994-01_1994-10_ethan_01.raw_vhs_8bps_40000000sps.best.flac"
+
+[[tapes]]
+id = "sheena-easton"
+stock = ""                   # unrecorded
+recorded_on = ""
+notes = "off-air material: inserted test signals measured on lines 15-20 of every field (content_independence, 2026-09-05); archive name sheena_easton_01.raw_vhs_8bps_40000000sps.best.flac"
+
+# ---------------------------------------------------------------------------
+# captures
+# ---------------------------------------------------------------------------
+# timestamp_discipline is one of gps | ntp | none. Every timestamp below is
+# a file modification time - the END of the write on a clock nobody checked
+# - so it is "none". The readme dates the test-pattern session 2025-07-12,
+# and the modification times (UTC) fall on the evening of that date in the
+# United States, which is consistent but is not a disciplined clock.
+
+[[captures]]
+file = "zaroff-75bars-NTSC-SP-SLV-778HF-50msps-rf-pb.flac"
+path = "/testdata/test_patterns/vhs/playback/zaroff-75bars-NTSC-SP-SLV-778HF-50msps-rf-pb.flac"
+deck = "slv-778hf"
+tape = "zaroff-test-patterns-2025-07-12"
+source = "TSG-130A 75% colour bars"
+speed = "SP"
+tap = "playback"
+device = "rigol-ds1202z-e"
+sample_rate_hz = 50000000
+bit_depth = 8
+timestamp = 2025-07-13T04:02:57Z
+timestamp_source = "file modification time (end of write) on the capture host"
+timestamp_discipline = "none"
+
+[[captures]]
+file = "zaroff-75bars-NTSC-SP-SLV-778HF-50msps-rf-rec.flac"
+path = "/testdata/test_patterns/vhs/record/zaroff-75bars-NTSC-SP-SLV-778HF-50msps-rf-rec.flac"
+deck = "slv-778hf"
+tape = "zaroff-test-patterns-2025-07-12"
+source = "TSG-130A 75% colour bars"
+speed = "SP"
+tap = "record"
+device = "rigol-ds1202z-e"
+sample_rate_hz = 50000000
+bit_depth = 8
+timestamp = 2025-07-12T18:00:45Z
+timestamp_source = "file modification time (end of write) on the capture host"
+timestamp_discipline = "none"
+
+[[captures]]
+file = "zaroff-75bars-NTSC-EP-SLV-778HF-50msps-rf-pb.flac"
+path = "/testdata/test_patterns/vhs/playback/zaroff-75bars-NTSC-EP-SLV-778HF-50msps-rf-pb.flac"
+deck = "slv-778hf"
+tape = "zaroff-test-patterns-2025-07-12"
+source = "TSG-130A 75% colour bars"
+speed = "EP"
+tap = "playback"
+device = "rigol-ds1202z-e"
+sample_rate_hz = 50000000
+bit_depth = 8
+timestamp = 2025-07-13T04:17:02Z
+timestamp_source = "file modification time (end of write) on the capture host"
+timestamp_discipline = "none"
+
+[[captures]]
+file = "zaroff-bounce1-NTSC-SP-SLV-778HF-50msps-rf-pb.flac"
+path = "/testdata/test_patterns/vhs/playback/zaroff-bounce1-NTSC-SP-SLV-778HF-50msps-rf-pb.flac"
+deck = "slv-778hf"
+tape = "zaroff-test-patterns-2025-07-12"
+source = "TSG-130A 0% to 100% bounce"
+speed = "SP"
+tap = "playback"
+device = "rigol-ds1202z-e"
+sample_rate_hz = 50000000
+bit_depth = 8
+timestamp = 2025-07-13T04:03:54Z
+timestamp_source = "file modification time (end of write) on the capture host"
+timestamp_discipline = "none"
+
+[[captures]]
+file = "zaroff-bounce1-NTSC-SP-SLV-778HF-50msps-rf-rec.flac"
+path = "/testdata/test_patterns/vhs/record/zaroff-bounce1-NTSC-SP-SLV-778HF-50msps-rf-rec.flac"
+deck = "slv-778hf"
+tape = "zaroff-test-patterns-2025-07-12"
+source = "TSG-130A 0% to 100% bounce"
+speed = "SP"
+tap = "record"
+device = "rigol-ds1202z-e"
+sample_rate_hz = 50000000
+bit_depth = 8
+timestamp = 2025-07-13T03:26:57Z
+timestamp_source = "file modification time (end of write) on the capture host"
+timestamp_discipline = "none"
+
+[[captures]]
+file = "zaroff-bounce1-NTSC-EP-SLV-778HF-50msps-rf-pb.flac"
+path = "/testdata/test_patterns/vhs/playback/zaroff-bounce1-NTSC-EP-SLV-778HF-50msps-rf-pb.flac"
+deck = "slv-778hf"
+tape = "zaroff-test-patterns-2025-07-12"
+source = "TSG-130A 0% to 100% bounce"
+speed = "EP"
+tap = "playback"
+device = "rigol-ds1202z-e"
+sample_rate_hz = 50000000
+bit_depth = 8
+timestamp = 2025-07-13T04:18:55Z
+timestamp_source = "file modification time (end of write) on the capture host"
+timestamp_discipline = "none"
+
+[[captures]]
+file = "home.flac"
+path = "/testdata/home.flac"
+deck = "playback-deck-unrecorded"
+tape = "home-1994"
+source = "home recording"
+speed = "SP"                 # 125.0 minutes of material fits a T-120 at SP
+tap = "playback"
+# device unrecorded: 40 MSps 8-bit is a modified CX card's rate, but no record says so
+sample_rate_hz = 40000000
+bit_depth = 8
+timestamp = 2025-07-30T14:29:19Z
+timestamp_source = "modification time of the archive copy on the NAS, not the capture; the capture date is unrecorded"
+timestamp_discipline = "none"
+
+[[captures]]
+file = "countdown.flac"
+path = "/testdata/countdown.flac"
+deck = "playback-deck-unrecorded"
+tape = "sheena-easton"
+source = "off-air recording"
+speed = "SP"                 # 120.0 minutes of material fits a T-120 at SP
+tap = "playback"
+sample_rate_hz = 40000000
+bit_depth = 8
+timestamp = 2026-07-03T14:29:26Z
+timestamp_source = "modification time of the archive copy on the NAS, not the capture; the capture date is unrecorded"
+timestamp_discipline = "none"

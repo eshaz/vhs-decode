@@ -214,16 +214,32 @@ def orthogonal_level_signature(frequency_hz, level: float,
     `against` is the family to project out, as an iterable of complex
     signatures on the same grid.
     """
+    def complex_log(values):
+        """`log|H| + j arg H`, so a projection removes the direction the
+        family actually occupies rather than its magnitude's shadow.
+
+        This took `np.abs` of both sides. That is harmless while every entry
+        is phase-free and wrong the moment one is not: `head contact tilt`
+        carries pi of phase - a SIGN CHANGE - and projecting onto the
+        magnitude of a signature that goes negative removes the wrong
+        direction wherever it does.
+        """
+        values = np.asarray(values).ravel()
+        magnitude = np.log(np.maximum(np.abs(values), 1e-12))
+        if not np.iscomplexobj(values):
+            return magnitude.astype(np.complex128)
+        return (magnitude + 1j * np.unwrap(np.angle(values))
+                ).astype(np.complex128)
+
     value = level_signature(frequency_hz, level, writing_speed_m_s,
                             step=step, **kwargs)
-    logged = np.log(np.maximum(np.abs(value), 1e-12)).astype(np.complex128)
+    logged = complex_log(value)
     logged = logged - logged.mean()
     for other in against:
         reference = np.asarray(other).ravel()
         if reference.size != logged.size:
             continue
-        reference = np.log(np.maximum(np.abs(reference), 1e-12)
-                           ).astype(np.complex128)
+        reference = complex_log(reference)
         reference = reference - reference.mean()
         norm = float(np.linalg.norm(reference))
         if norm > 1e-12:

@@ -662,6 +662,9 @@ def plot_luma_noise(
     """
     import matplotlib.pyplot as plt
     import numpy as np
+    # R5's declared floor: derived and tested in one place rather
+    # than retyped at each call site
+    from vhsdecode.models import residual_floor
 
     envelope = np.asarray(envelope, dtype=float)
     demod = np.asarray(demod, dtype=float)
@@ -1098,17 +1101,24 @@ def plot_luma_noise(
             # robust, because dropouts sit in the low tail and would otherwise
             # set the scale
             here = deviation_window[sel]
-            noise.append(np.median(np.abs(here - np.median(here))) * 1.4826)
+            noise.append(residual_floor.robust_sigma(here))
 
         centres = np.asarray(centres)
         before, after = np.asarray(before), np.asarray(after)
         counts = np.asarray(counts, dtype=float)
-        # The standard error of each bin's own median, 1.2533 sigma / sqrt(n).
+        # The standard error of each bin's own median - R5's DECLARED FLOOR,
+        # now taken from `residual_floor` where the two factors are derived
+        # from the normal distribution and tested, rather than typed here.
+        # It was implemented twice in this tree with no test holding either
+        # to the relation, which is the wrong place for the rule that
+        # decides when the algorithm has finished.
+        #
         # Bins differ in population by a factor of a hundred here, so a trace
         # drawn without this reads its thinnest bin as response when it is
         # sampling: measured, the best sampled third of the bins is flat to
         # 0.26% rms where the thinnest third swings 7.5% peak to peak.
-        error = 1.2533 * np.asarray(noise) / np.sqrt(np.maximum(counts, 1.0))
+        error = (residual_floor.MEDIAN_STANDARD_ERROR_FACTOR
+                 * np.asarray(noise) / np.sqrt(np.maximum(counts, 1.0)))
         model_total = model_line = after_line = None
         if len(centres):
             mhz = centres / 1e6

@@ -1456,3 +1456,90 @@ def grid_control(system: str = "NTSC",
                 "of the shapes; if it moved with the sampling, the band "
                 "comparison would be reading the grid"),
     }
+
+
+# --------------------------------------------------------------------------
+# What the burst can and cannot tell us
+# --------------------------------------------------------------------------
+
+def carrier_reduction_db(system: str = "NTSC") -> float:
+    """The PERMANENT loss from recording the chroma at the colour-under
+    carrier instead of at the subcarrier.
+
+    Ethan: the colour phase and amplitude "should assume the burst has no
+    knowable envelope, and that it's permanently reduced due to the color
+    under carrier being lower than the NTSC carrier."
+
+    THE DERIVATION IS FARADAY'S, and it is a specification, not a fit. A
+    reproduce head is an inductive sensor: its output is the rate of change
+    of the flux threading it, so for a constant recorded flux amplitude the
+    voltage is proportional to FREQUENCY. Down-converting the chroma from
+    the subcarrier to the colour-under carrier therefore costs exactly the
+    ratio of those two frequencies, before any loss that depends on
+    wavelength:
+
+        NTSC   629370.63 / 3579545.45 = 0.175824   ->  -15.098 dB
+        PAL    626953.00 / 4433618.75 = 0.141409   ->  -16.991 dB
+
+    "PERMANENTLY" is the operative word and it is a statement about
+    information, not about gain. Playback equalisation multiplies the
+    signal back up and multiplies the head's own noise with it, so the
+    ratio is restored and the SIGNAL-TO-NOISE is not. Nothing downstream
+    recovers it, so no estimator should be built as though a better
+    measurement of the burst would.
+
+    This is why it belongs beside `envelope_amplitude` rather than inside
+    it: that function reads the head's WAVELENGTH-dependent losses and
+    deliberately removes its own mean, so the frequency-proportional term
+    is exactly the part it drops. Here it is, named.
+    """
+    return float(20.0 * np.log10(carrier_hz(system) / subcarrier_hz(system)))
+
+
+def burst_observables(system: str = "NTSC") -> Dict[str, object]:
+    """WHAT THE BURST CARRIES, and what it only appears to.
+
+    The burst is nine cycles of subcarrier at a specified amplitude, and it
+    is tempting to treat that specified amplitude as a reference. It is
+    not one, on this path, and building an estimator that assumes otherwise
+    is how a measured burst envelope gets used as though it meant
+    something.
+
+    THE ENVELOPE IS NOT KNOWABLE. Three independent multipliers stand
+    between the specified burst and the one that arrives, none of them
+    observable from the burst itself:
+
+      * the record-side and playback AGCs, which set the chroma level from
+        the whole line's content and move between fields;
+      * head-to-tape contact, which multiplies the envelope at the drum
+        rate and differs between the two heads;
+      * `carrier_reduction_db`, the fixed frequency-proportional loss
+        above, which no measurement of the burst can separate from the
+        other two because all three are scalars on the same quantity.
+
+    Three unknown gains and one measurement: the system is underdetermined
+    by construction, and no amount of averaging closes it. So the burst's
+    AMPLITUDE is usable only as a RATIO - against the same burst at another
+    time, another line, or another frequency - and never as a level.
+
+    THE PHASE IS A DIFFERENT MATTER. It is not multiplied by any of them:
+    a gain, however unknown, does not rotate a phasor. That is what makes
+    the burst the chroma path's only absolute reference, and it is a
+    reference for phase alone.
+
+    Returned as an explicit contract so a consumer can assert against it
+    rather than rediscover it.
+    """
+    return {
+        "phase_is_absolute": True,
+        "amplitude_is_absolute": False,
+        "envelope_is_knowable": False,
+        "usable_amplitude": "ratios only - burst against burst, or burst "
+                            "against another frequency in the same line",
+        "unknown_gains": ("record and playback AGC", "head-to-tape contact",
+                          "colour-under carrier reduction"),
+        "carrier_reduction_db": carrier_reduction_db(system),
+        "why": "three unknown scalar gains multiply one measured scalar, so "
+               "the level is underdetermined; phase is untouched by all "
+               "three and is therefore the only absolute the burst carries",
+    }

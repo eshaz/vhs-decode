@@ -1225,3 +1225,16 @@ def main(args=None, use_gui=False):
 
     cleanup()
     sys.exit(0)
+
+
+if __name__ == "__main__":
+    # SO THAT `python -m vhsdecode.main` RUNS THE DECODER. Without this the
+    # module executes its top level, defines `main`, calls nothing, and
+    # exits ZERO having written no output - which at a glance is
+    # indistinguishable from a decode that failed to produce anything, and
+    # cost this round a wrong conclusion about the working tree.
+    #
+    # It matters because the installed `vhs-decode` console script resolves
+    # to site-packages, so running the working TREE means going through the
+    # module - and that was the one route that silently did nothing.
+    main()

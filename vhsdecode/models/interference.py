@@ -862,6 +862,33 @@ def admission(frequency_hz, modules=None,
     }
 
 
+def key_after_admission(frequency_hz, verdict: Dict[str, object],
+                        mechanics: Optional[Dict[str, float]] = None,
+                        **kwargs) -> Dict[str, np.ndarray]:
+    """The key exactly as `admission` left it, rebuilt from its verdict.
+
+    `signatures(include=...)` takes whole modules, so an ENTRY-WISE verdict
+    could not be turned back into a key without re-running the admission.
+    This walks the admitted labels in the order they were admitted and
+    orthogonalises each against the key as it stood at that moment, which
+    is the same construction `admission` measured, so the effective count
+    and condition of the result are the ones its verdict reports.
+    """
+    key = dict(signatures(frequency_hz, mechanics=mechanics, **kwargs))
+    for label in verdict.get("admitted", []):
+        if verdict.get("granularity") == "entry":
+            module_name, name = str(label).split(":", 1)
+            entries = {name: _candidate_signatures(
+                module_name, frequency_hz, mechanics)[name]}
+        else:
+            entries = _candidate_signatures(str(label), frequency_hz,
+                                            mechanics)
+        established = list(key.values())
+        for name, value in entries.items():
+            key[name] = orthogonalised(value, established)
+    return key
+
+
 def span_completeness(residuals: Dict[str, np.ndarray],
                       frequency_hz, **kwargs) -> Dict[str, object]:
     """IS THE KEY COMPLETE? The share of a residual the modelled set spans.

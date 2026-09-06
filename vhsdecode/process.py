@@ -259,26 +259,27 @@ class VHSDecode(ldd.LDdecode):
     def buildmetadata(self, f, check_phase=True):
         """returns field information JSON and whether to duplicate or drop the field
 
-        THE PHASE CHECK IS BACK ON, and it was off for a reason that no longer
-        holds. The base class defaults it True (`lddecode/core.py:4529`) and
-        this override turned it off, which silenced the one contract that
-        verifies the colour framing ascends - `fieldPhaseID` must step by one
-        with wrap (`lddecode/core.py:4557`). With it off, 45 of the 683 NTSC
-        decodes in this repository's own output carry a wrong four-field
-        sequence and nothing said so; the largest, at 59021 fields, is wrong
-        throughout.
+        THE PHASE CHECK IS PERFORMED HERE, not inherited. This override never
+        calls `super().buildmetadata()`, so turning the parameter on did
+        nothing until the check itself was ported into the body below - see
+        the comment there. The base class defaults it True
+        (`lddecode/core.py:4529`) and this override used to turn it off,
+        silencing the one contract that verifies `fieldPhaseID` steps by one
+        with wrap. With it silent, 45 of the 683 NTSC decodes in this
+        repository's own output carry a non-ascending four-field sequence and
+        nothing said so.
 
-        Both reasons it was disabled are now addressed. NTSC's framing was a
-        free-running counter and is now measured from the burst phase
-        (`chroma.colour_frame_parity`), anchored so the sequence ascends. PAL's
-        `fieldPhaseID` was a constant 1 - it read an `rf.field_number` that is
-        never incremented - and now advances (`field.py`
-        `FieldPALShared.determine_field_number`).
+        One reason it was disabled is addressed: PAL's `fieldPhaseID` was a
+        constant 1 - it read an `rf.field_number` that is never incremented -
+        and now advances. The other is not, and the check is on anyway
+        precisely so it says so: NTSC's framing is still a free-running
+        counter, because the colour-under provably cannot carry the colour
+        frame (`chroma.colour_frame_parity` has the arithmetic), and a
+        counter is seek-dependent.
 
         The check only logs and sets decode-fault bit 2; it never aborts. So
         the cost of it being on is a warning on genuinely disturbed tape,
-        which is what a warning is for, and the benefit is that a framing slip
-        can no longer pass silently.
+        which is what a warning is for.
         """
         prevfi_1 = self.fieldinfo[-1] if len(self.fieldinfo) else None
         prevfi_2 = self.fieldinfo[-2] if len(self.fieldinfo) > 1 else None
@@ -327,6 +328,32 @@ class VHSDecode(ldd.LDdecode):
         # docs for this mysterious bitmap???
 
         decode_faults = 0
+
+        # THE PHASE CHECK, PORTED RATHER THAN INHERITED. Setting the
+        # `check_phase` parameter alone did nothing at all: this override
+        # never calls `super().buildmetadata()` and carried no sequence test,
+        # so the flag was accepted and ignored - a docstring claiming the
+        # check was back on while a 20-field decode with 13 non-ascending
+        # transitions logged nothing. That is worse than the honest `False`
+        # it replaced, and this is the eight lines from
+        # `lddecode/core.py:4556-4568` that make the parameter mean something.
+        #
+        # It is the guard that catches a wrong colour frame on the first
+        # field, and it only warns and sets bit 2 - it never aborts.
+        if check_phase and prevfi_1 is not None:
+            phases = self.rf.SysParams.get("fieldPhases")
+            ascends = (
+                (fi["fieldPhaseID"] == 1
+                 and prevfi_1["fieldPhaseID"] == phases)
+                or fi["fieldPhaseID"] == prevfi_1["fieldPhaseID"] + 1)
+            if phases and not ascends:
+                ldd.logger.warning(
+                    "At field #%d, Field phaseID sequence mismatch (%s->%s) "
+                    "(player may be paused)",
+                    len(self.fieldinfo), prevfi_1["fieldPhaseID"],
+                    fi["fieldPhaseID"])
+                decode_faults |= 2
+
         fi["vitsMetrics"] = self.computeMetrics(self.fieldstack[0], self.fieldstack[1])
         # interlaced video requires alternating fields, handle cases where fields are repeated
         #   this can happen due to breaks in recordings between fields, i.e. home recordings, and
@@ -994,6 +1021,19 @@ class VHSRFDecode(ldd.RFDecode):
             # the filters above use and never mutated (the demodulation
             # thread runs ahead of field assembly).
             channel_eq.load(self, self._channel_response, self.options.channel_eq)
+
+        # THE STAGE SELECTION REACHES THE RINGING STAGE HERE. It lives on
+        # the Options namedtuple, but `process_field` is handed only its
+        # own `shared_state` dict and no rf reference, so a component gate
+        # inside that stage cannot see the selection unless it is seeded -
+        # exactly as `channel_eq` seeds `channel_eq_active` into the same
+        # dict (channel_eq.py:219). Without this the flag parses, validates
+        # and is silently ignored, which is how the first version of the
+        # relaxation component shipped inert: the decode was byte-identical
+        # with the flag ON, and that reads like a working no-harm gate.
+        if getattr(self.options, "stage_selection", None):
+            self.__dict__.setdefault("_ringing_state", {})["stage_selection"] \
+                = self.options.stage_selection
 
         DP = self.DecoderParams
 

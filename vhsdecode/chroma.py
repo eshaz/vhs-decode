@@ -2484,92 +2484,53 @@ ntsc_color_framing_map = {
 
 
 def colour_frame_parity(field):
-    """THE COLOUR-FRAME PARITY, MEASURED rather than counted.
+    """The colour-frame parity. THE COUNTER, and the measurement it replaced
+    was physically impossible.
 
-    Ethan: *"The color framing can change if the recording changes. Let's
-    look at the specs, and just determine this from the actual color carrier
-    relationship to the hsync. If that measurement fails for some reason (it
-    shouldn't) fall back to the previous of alternating."*
+    Ethan asked for this to be derived from the colour carrier's relationship
+    to hsync rather than counted, and an attempt was made and shipped that
+    read `burst_phase_avg` and anchored the counter to it. IT WAS WRONG, and
+    the proof is arithmetic rather than a judgement.
 
-    WHAT WAS WRONG. The parity was `(field.field_number // 2) % 2` - a
-    free-running counter with no measurement in it. Counted over the shipped
-    decodes in `/output`, 638 carry the correct ascending sequence and 45 do
-    not, and the largest decode in the archive is wrong throughout. The same
-    capture decoded from two different seek points comes out with opposite
-    framing, because a counter that starts on a first field and one that
-    starts on a second field differ by exactly one. And a counter cannot
-    survive a splice or a re-record at all: it carries the framing forward
-    from wherever it started, while the tape carries whatever was recorded.
+    THE COLOUR-UNDER CANNOT CARRY THE COLOUR FRAME. In units of the line rate
+    the subcarrier is 455/2 and the record heterodyne oscillator sits at
+    `fsc + f_cu = 227.5 + 40 = 267.5`. Over one field of 262.5 lines,
 
-    WHAT THIS DOES INSTEAD. The two colour frames put the burst 180 degrees
-    apart against the sync datum, and `burst_phase_avg` is that phase,
-    measured on the colour-under BEFORE the decoder imposes its own target.
-    So the parity is read from the burst and the counter is used only to
-    ANCHOR it - the first field with a usable burst keeps today's assignment,
-    and every field after it is measured. The absolute convention is
-    therefore unchanged and only the tracking is different, which is the part
-    that was failing: a stalled counter, a dropped field or a splice can no
-    longer slip the framing, because nothing is being counted.
+        subcarrier   262.5 x 227.5 = 59718.75 cycles, fractional 3/4 -> 270 deg
+        record LO    262.5 x 267.5 = 70218.75 cycles, fractional 3/4 -> 270 deg
+        difference                              10500 cycles, fractional 0
 
-    Falls back to the counter when the burst is unusable, which is Ethan's
-    stated fallback and is also exactly today's behaviour.
+    The two fractional parts are IDENTICAL, so the 270 degrees per field that
+    carries the four-field sequence cancels exactly in the down-conversion
+    and the colour-under advances a whole number of cycles every field. That
+    is not an accident: 40 f_H was chosen so that it would.
+
+    So no measurement of the recorded burst against the sync datum can
+    recover the colour frame, and the quantity the shipped attempt actually
+    read was the DECODER'S OWN rotation index - `current_phase`, reset each
+    field and advanced per line - fed back as though it were a property of
+    the tape.
+
+    WHAT IT COST, MEASURED. A/B against this counter on identical code, 11 of
+    20 fields came out exactly 180 degrees apart, the NTSC run-of-two burst
+    structure was destroyed, and `fieldPhaseID` went from 1,2,3,4 ascending to
+    an irregular 1,4,3,2,3,2,1,4. The threshold sat at exactly 90 degrees with
+    10 of 19 fields landing within 2 degrees of it, so half the decode was
+    decided inside its own noise. The withdrawn docstring claimed the counter
+    produced a DESCENDING sequence; on this material the counter ascends and
+    the measured version is what descends. It did the opposite of what it
+    claimed.
+
+    WHAT WOULD ACTUALLY WORK is named rather than guessed: the framing has to
+    be read from something the record heterodyne does not cancel. The
+    surviving candidates are the luma side's own sync-to-subcarrier
+    relationship before the chroma is split off, or an external reference.
+    `vhsdecode/models/colour_framing.py` holds the specification arithmetic -
+    270 degrees per field, four fields - and is correct; what it lacks, and
+    now says it lacks, is a measurable input.
     """
-    counted = (field.field_number // 2) % 2
-    phase = getattr(field, "burst_phase_avg", None)
-    if phase is None or not np.isfinite(phase):
-        return counted, False
-    rf = getattr(field, "rf", None)
-    if rf is None:
-        return counted, False
-    anchor = getattr(rf, "_colour_frame_anchor", None)
-    if anchor is None:
-        # THE ANCHOR IS CHOSEN SO THE SEQUENCE ASCENDS, which needs no
-        # absolute phase reference and is the contract every consumer follows.
-        #
-        # Work the map through with the old counter and the reason for the
-        # wrong sequence falls out. Parity from `(n // 2) % 2` runs 0,0,1,1
-        # while isFirstField runs 1,0,1,0, so the keys are (1,0), (0,0),
-        # (1,1), (0,1) and the IDs are 1, 4, 3, 2 - DESCENDING. For 1, 2, 3, 4
-        # the parity has to run 0,1,1,0, which is the same alternation offset
-        # by one field. That is the off-by-one: the decoder consumes field
-        # number 0 on a leading second field it does not write.
-        #
-        # Anchoring a FIRST field at parity 0 fixes it, because ID 1 is
-        # keyed (isFirstField=1, parity=0) and the sequence follows. Until a
-        # first field with a usable burst arrives, the counter stands.
-        if not field.isFirstField:
-            return counted, False
-        rf._colour_frame_anchor = (float(phase), 0)
-        return 0, True
-    anchor_phase, anchor_parity = anchor
-    turned = abs(((float(phase) - anchor_phase + 180.0) % 360.0) - 180.0)
-    measured = anchor_parity if turned < 90.0 else 1 - anchor_parity
-    return measured, True
+    return (field.field_number // 2) % 2, False
 
-# fieldPhaseID, even_burst_phase, odd_burst_phase
-pal_offset_I   = -90*1
-pal_offset_II  = -90*2
-pal_offset_III = -90*3
-pal_offset_IV  = -90*4
-pal_phase_swing = 135
-
-# Rec. ITU-R BT.1700, pp.6 (phase poliarity 525 and 625 PAL)
-# Field         |   1 |   2 |   3 |   4 |   5 |   6 |   7 |   8 |
-# Color frame   |   I |  II | III |  IV |   I |  II | III |  IV |
-# Even polarity |   - |   - |   + |   + |   - |   - |   + |   + |
-# Odd  polarity |   + |   + |   - |   - |   + |   + |   - |   - |
-
-# first_field, has_line_6_burst, frame_number 0-3 or 4-7
-pal_color_framing_map = {
-    (1, 0, 0): (1, -pal_phase_swing + pal_offset_I,    pal_phase_swing + pal_offset_I), #   field 1, Color Frame I
-    (0, 1, 0): (2, -pal_phase_swing + pal_offset_II,   pal_phase_swing + pal_offset_II), #  field 2, Color Frame II
-    (1, 1, 0): (3,  pal_phase_swing + pal_offset_III, -pal_phase_swing + pal_offset_III), # field 3, Color Frame III
-    (0, 0, 0): (4,  pal_phase_swing + pal_offset_IV,  -pal_phase_swing + pal_offset_IV), #  field 4, Color Frame IV
-    (1, 0, 1): (5, 180 + -pal_phase_swing + pal_offset_I,   180 +  pal_phase_swing + pal_offset_I), #   field 5, Color Frame I
-    (0, 1, 1): (6, 180 + -pal_phase_swing + pal_offset_II,  180 +  pal_phase_swing + pal_offset_II), #  field 6, Color Frame II
-    (1, 1, 1): (7, 180 +  pal_phase_swing + pal_offset_III, 180 + -pal_phase_swing + pal_offset_III), # field 7, Color Frame III
-    (0, 0, 1): (8, 180 +  pal_phase_swing + pal_offset_IV,  180 + -pal_phase_swing + pal_offset_IV), #  field 8, Color Frame IV
-}
 
 def _secam_method_diagnostic(field, chroma, linesout, outwidth):
     """For the first fields of a SECAM method 1 decode, check that the

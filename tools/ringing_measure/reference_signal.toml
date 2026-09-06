@@ -1,0 +1,46 @@
+# Reference signal generator: one readable file for this tool, edited by hand.
+# Read by vhsdecode/models/reference_signal.py. Every key is optional - with
+# no file at all the generator is looked for on PATH and the cache falls back
+# to ~/.cache/vhs-decode/reference_signal.
+#
+# Ethan, 2026-09-06: "I want you to spawn a sub agent that uses our new model
+# and builds reference video signals using this program.
+# https://github.com/decode-orc/videosynth. The video signals can be generated
+# on the fly here when forming the residual against the rf."
+#
+# WHAT WAS DONE ON THIS MACHINE. The Flatpak release could not be used - there
+# is no flatpak here - so videosynth was cloned at commit 9051946 and built
+# from source with CMake and Ninja against the Debian 12 packages libyaml-cpp,
+# libspdlog, libsqlite3 and libopenexr, with the Qt 6 GUI and the Google Test
+# suites switched off (-DVIDEOSYNTH_BUILD_GUI=OFF -DVIDEOSYNTH_BUILD_TESTS=OFF)
+# and clang-format and clang-tidy disabled. It was then installed to the paths
+# below so it outlives the session scratchpad it was built in. Reproduce with:
+#
+#   sudo apt-get install -y cmake ninja-build libyaml-cpp-dev libspdlog-dev \
+#       libsqlite3-dev libopenexr-dev
+#   git clone https://github.com/decode-orc/videosynth
+#   cmake -S videosynth -B videosynth/build -G Ninja \
+#       -DVIDEOSYNTH_BUILD_GUI=OFF -DVIDEOSYNTH_BUILD_TESTS=OFF \
+#       -DVIDEOSYNTH_ENABLE_CLANG_FORMAT=OFF -DVIDEOSYNTH_ENABLE_CLANG_TIDY=OFF \
+#       -DCMAKE_INSTALL_PREFIX=$HOME/.local \
+#       -DVIDEOSYNTH_BUNDLED_ASSET_DIR=$HOME/.local/share/videosynth/assets
+#   cmake --build videosynth/build && cmake --install videosynth/build
+#
+# Check what is present with
+#   PYTHONPATH=/workspaces/vhs-decode python3 -m vhsdecode.models.reference_signal
+
+[generator]
+# The videosynth executable. Its --version prints the git commit of the build,
+# and that commit goes into every cache key, so a rebuild invalidates the
+# cache rather than silently reusing another build's samples.
+binary = "/home/vscode/.local/bin/videosynth"
+
+# Where the generator's "{bundled}" asset root resolves. The build above
+# compiles this path in, so the key is redundant here and is left in place
+# because a build made in a scratch directory needs it.
+asset_root = "/home/vscode/.local/share/videosynth/assets"
+
+# Generated references are kept here between runs, keyed by the project text
+# and the generator's commit. Outside the working tree on purpose: other
+# sessions hold uncommitted work in this repository.
+cache_dir = "/home/vscode/.cache/vhs-decode/reference_signal"

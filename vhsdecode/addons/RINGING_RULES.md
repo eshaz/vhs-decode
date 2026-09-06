@@ -365,3 +365,108 @@ subject to all rules above.
     identical picture. The independent check agrees: measured on the sync
     tip, where no picture reaches at all, the per-head gain reads +0.98 dB
     at 161 sigma. The general rule stands; that instance of it does not.
+44. **Never take the asymptote from inside the window.** Fitting a decay by
+    subtracting the trailing median of its own measurement window assumes
+    the tail has settled inside that window. On the back porch it has not -
+    the round opened with the finding that blanking is never reached before
+    active video starts - so the "settled level" is still up the curve, and
+    every time constant fitted against it comes back SHORT.
+
+    Measured, on planted truth in a 59-sample window: a tau of 9 samples,
+    which does settle inside it, recovered to 0.5 per cent; a tau of 33,
+    which does not, came back 29 per cent low. The bias is invisible on the
+    short constants and total on the long ones, which is why it survives a
+    first look - the estimator appears to work.
+
+    FIT THE OFFSET JOINTLY. For a fixed time constant the model
+    A exp(-t/tau) + C is linear in A and C, so a scan over tau with least
+    squares at each step is exact, needs no optimizer and no logarithm, and
+    recovers all four planted cases to about one per cent. And read a
+    RAILED scan as a rail, never as a measurement: a shape with no time
+    constant runs the scan to its bound, and the bound is not an answer.
+
+45. **A decay fitted over a window that contains its own driving edge
+    measures the EDGE.** The back porch's relaxation is driven by the sync
+    rise. `window_plan.back_porch` begins one sample after the rise
+    midpoint, so a joint fit over it must span the step, and it answers
+    with a time constant long enough to cover one: 2.94 us. The same fold,
+    read from after the rise's 10-90 transition and settle, gives 1.25 us,
+    and the fit rms falls by a factor of 2.8 - the excess was the edge.
+
+    THE 2.94 THEN MANUFACTURED A SECOND FALSE RESULT, which is how the
+    error nearly shipped. At that time constant it matched a section the
+    stage already fits at pole 0.976450, against the measurement's
+    0.976526 - agreement to four decimals, which read as proof of a double
+    correction. It was two fits of the same edge. The real decode A/B says
+    the opposite: the shipped correction removes one per cent of the tail
+    on head A and seven on head B.
+
+    Derive a fit window from the geometry, exclude the transition that
+    drives what is being fitted, and treat a striking agreement between
+    two fits as a reason to check they are not both fitting a third thing.
+
+46. **The installed console script is not the working tree.** `vhs-decode`
+    resolves to `/opt/venv/.../site-packages/vhsdecode`, a snapshot that
+    can be arbitrarily old - the copy present during this round has ZERO
+    occurrences of `inverse_eq`, so it predates the entire ringing arc and
+    silently decoded without any of it.
+
+    A decode run that way tests neither your change nor anyone else's. Run
+    the tree (`PYTHONPATH=/workspaces/vhs-decode`, calling `main()` - the
+    module has no `__main__` guard, so `python -m vhsdecode.main` exits
+    zero having done nothing), or reinstall - but reinstalling changes a
+    venv the other lanes are also running from, so prefer the path.
+
+47. **Isolate your change from the other lanes before claiming no-harm.**
+    With several sessions holding uncommitted work in the same tree, a
+    baseline decode from yesterday differs for their reasons as well as
+    yours, and `cmp` against it proves nothing either way. Neutralize your
+    own entry point instead - monkeypatch it to a no-op in a runner - and
+    compare two decodes of the SAME tree that differ only in that. It is
+    the only comparison that isolates one lane.
+
+    THE ASSERTION IS THE LOAD-BEARING PART, not the strip (23's finding,
+    and it had already bitten this runner). A gate that removes a feature
+    by patching or stripping it passes VACUOUSLY the moment its target
+    stops matching: nothing is removed, the two arms become identical, and
+    the gate reports exactly the byte-identity it exists to look for. This
+    lane's runner patched `measure_porch_relaxation` while the applied
+    path had moved to `accumulate_porch_relaxation` - it would have
+    certified an unisolated build. So the runner must REFUSE when a target
+    is absent rather than silently patch nothing, and 23's strip-based gate
+    is right to assert a count of what it removed and stop when it no
+    longer understands the tree. Detecting that you no longer understand
+    the tree is a better outcome than a pass.
+
+48. **Measure a correction on the signal it will LAND on, not on the one
+    upstream of it.** The back-porch relaxation was fitted on the raw
+    accumulated fold and subtracted from the ringing-corrected field. The
+    raw tail is -2.41 IRE on head A and -2.48 on head B; what SURVIVES the
+    ringing correction is -1.67 and -0.58. Subtracting the raw figure
+    flattened head A by 60 per cent and made head B 21 per cent WORSE with
+    the sign reversed.
+
+    The heads diverge because the stage's own fitted sections differ
+    between them, so the amount already removed differs - which means the
+    error is invisible on whichever head the upstream stage happens to
+    touch least, and looks like a working correction there. Both polarities
+    improving TOGETHER is the test that catches it, and it is the user's
+    own criterion for a correction applied before the demodulator.
+
+    Measure after every stage that precedes you, accumulate across fields,
+    and take the measurement BEFORE your own subtraction so the loop is
+    feed-forward and never stimulates its own kernel.
+
+49. **A gate that never reaches its stage is indistinguishable from a
+    working no-harm gate.** `--stages +ringing.relaxation` parsed,
+    validated against the declaration, and was silently ignored: the
+    selection lives on the Options namedtuple while `process_field`
+    receives only its own `shared_state` dict and no rf reference. The
+    decode came back byte-identical with the flag ON - which is exactly
+    what a correct default-off gate looks like from the outside.
+
+    So the no-harm check is only half the pair. ALWAYS run the flag-ON arm
+    too and require it to DIFFER; a component that changes nothing when
+    enabled has not been shown to be safe, it has been shown to be absent.
+    Seed a selection into the stage's own state the way `channel_eq` seeds
+    `channel_eq_active` (channel_eq.py:219).

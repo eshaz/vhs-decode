@@ -420,10 +420,22 @@ def noise_reproduces_the_published_run():
         relations = {n: [o for o in synthetic if o != n] for n in synthetic}
         return ie.component_differentials(synthetic, measured, "frequency",
                                           relations)
+    # THE REPORTED SIGMAS ARE RESTATED IN THE CORRECTED SCATTER CONVENTION.
+    # They were published when `sphere_floor` used sqrt(2)/L for every
+    # ensemble; these are real ensembles, whose scatter is 2/L, so every
+    # sigma computed then was sqrt(2) too large. Comparing the frozen
+    # figures against freshly computed ones would be comparing two
+    # conventions, which is the "both sides over the same set" rule.
+    #
+    # The conversion is exact and the defect survives it: 39.3/sqrt(2) =
+    # 27.8 against a fresh 26.8, and 118.0/sqrt(2) = 83.4 against 82.2.
+    old_convention = float(np.sqrt(2.0))
     lines, results = [], {}
     for label, fields, places, reported in (
-            ("frequency / head A", 13, 119, (13, 11, 92.9, 39.3)),
-            ("time / head A", 13, 264, (13, 13, 100.0, 118.0))):
+            ("frequency / head A", 13, 119,
+             (13, 11, 92.9, 39.3 / old_convention)),
+            ("time / head A", 13, 264,
+             (13, 13, 100.0, 118.0 / old_convention))):
         draws = []
         for seed in range(6):
             fit = ie.ellipsoid(nested(fields, places, 900 + seed), "frequency")
@@ -472,9 +484,19 @@ def the_exact_zero_is_a_constant():
                     "equals rank."}
 
 
-@proof("The shipped scatter is the complex asymptote, wrong for real data",
-       "ELLIPTICAL_COLLAPSE.md section 6c")
-def the_scatter_is_wrong_for_real_ensembles():
+@proof("The scatter is sqrt(2)/L complex and 2/L real, and the fit picks",
+       "THE_ALGORITHM.md section 5")
+def the_scatter_follows_the_ensembles_kind():
+    """WAS A DEFECT, NOW A LAW. The shipped constant was sqrt(2)/L for both
+    kinds, which is the COMPLEX asymptote; a real ensemble scatters sqrt(2)
+    times wider. Understating the scatter OVERSTATES the margin, so the
+    loop believed itself further from the floor than it was and kept going
+    - the dangerous direction.
+
+    The ratio is derivable: |G_ij|^2 is (1/L)chi^2_1 for a real ensemble
+    and (1/L)(chi^2_2 / 2) for a complex one, variances 2/L^2 and 1/L^2, so
+    the scatter of any function of their sum is sqrt(2) wider when real.
+    """
     rng = np.random.default_rng(8)
     lines, rows = [], []
     for count, length in ((8, 1024), (32, 1024)):
@@ -485,23 +507,43 @@ def the_scatter_is_wrong_for_real_ensembles():
                  for i in range(count)}, "frequency")["asymmetry"]
                 for _ in range(60)]
             measured = float(np.std(trials, ddof=1)) * length
-            rows.append((kind, measured))
+            predicted = ie.sphere_floor(count, length,
+                                        real=(kind == "real"))["scatter"] * length
+            rows.append((kind, measured, predicted))
             lines.append(f"  N={count:>3} L={length}, {kind:>8}: "
-                         f"scatter x L = {measured:.3f}   "
-                         f"(the code uses {np.sqrt(2):.3f})")
-    real = [m for k, m in rows if k == "real"]
-    complexes = [m for k, m in rows if k == "complex"]
+                         f"measured x L = {measured:.3f}   "
+                         f"predicted {predicted:.3f}")
+    real = [m for k, m, _ in rows if k == "real"]
+    complexes = [m for k, m, _ in rows if k == "complex"]
+    ratios = [m / p for _, m, p in rows]
+    # the fit must choose the right one WITHOUT being told
+    chosen_real = ie.ellipsoid(
+        {f"c{i}": {"frequency": _noise(rng, 512, False)} for i in range(8)},
+        "frequency")
+    chosen_complex = ie.ellipsoid(
+        {f"c{i}": {"frequency": _noise(rng, 512, True)} for i in range(8)},
+        "frequency")
     return {"lines": lines,
             "checks": [_ok(min(real) > 1.7,
-                           "a real ensemble scatters about 2/L, not sqrt(2)/L",
+                           "a real ensemble scatters about 2/L",
                            f"{min(real):.2f} to {max(real):.2f}", "> 1.7"),
                        _ok(abs(np.mean(complexes) - np.sqrt(2)) < 0.25,
                            "sqrt(2)/L is the COMPLEX asymptote",
                            f"{np.mean(complexes):.3f}",
-                           f"{np.sqrt(2):.3f}")],
-            "note": "Every sigma reported on a real ensemble is inflated by "
-                    "about 1.4x, and when N approaches L the true scatter "
-                    "collapses further still."}
+                           f"{np.sqrt(2):.3f}"),
+                       _ok(max(abs(r - 1.0) for r in ratios) < 0.35,
+                           "and sphere_floor now predicts each kind",
+                           f"ratios {min(ratios):.2f} to {max(ratios):.2f}",
+                           "1.00"),
+                       _ok(chosen_real["sphere_real"]
+                           and not chosen_complex["sphere_real"],
+                           "the fit reads the kind off the matrix, unasked",
+                           f"real={chosen_real['sphere_real']}, "
+                           f"complex={chosen_complex['sphere_real']}",
+                           "True, False")],
+            "note": "Corrected 2026-09-06. The margin on every real "
+                    "ensemble was overstated by sqrt(2), including the "
+                    "margin <= 3 stopping rule."}
 
 
 @proof("The surrogate null is the only valid one for a constructed ensemble",
@@ -1286,10 +1328,13 @@ def the_entry_must_be_orthogonalised():
             "note": "Three independent derivations reached this. Entered RAW "
                     "most of the entry's shape duplicates the losses it sits "
                     "beside, so it costs conditioning without adding a "
-                    "direction - on the carrier axis 6.37 effective at "
-                    "condition 159 against 7.00 at 11.7 without it. Projected "
+                    "direction - on the carrier axis 6.38 effective at "
+                    "condition 181 against 7.00 at 11.7 without it. Projected "
                     "orthogonal to them first it can be included on every "
-                    "band and improves them. This supersedes an earlier fix "
+                    "band and improves them - 7.61 at condition 11.7 on that "
+                    "axis, no worse conditioned than the key WITHOUT the "
+                    "entry, once the projection carries the phase. This "
+                    "supersedes an earlier fix "
                     "that simply excluded the entry where its crossover fell "
                     "outside the band: that worked, but only by declining to "
                     "use it."}

@@ -30,8 +30,9 @@ AND IT IS THE INSTRUMENT THE BACK-PORCH DISTORTION NEEDS. The ringing lane
 measured the residual Ethan is asking to correct: a recovery tail running
 -3.6 IRE at the sync rise to +0.3 IRE at active video, a single time constant
 of 1.22 to 1.34 us, its energy peaking at 260 kHz, polarity-COMMON with the
-two heads correlating at r = +1.000, and essentially untouched by the
-existing correction (rms 1.133 -> 1.122 on head A). 260 kHz is barely above
+two heads correlating at r = +1.000, and only PARTLY removed by the existing
+correction - see below, where the surviving amplitude is measured per head.
+260 kHz is barely above
 the 213 kHz a single sync pulse can resolve at all, and a 1.2 us relaxation
 has most of its energy BELOW that. The probe and the defect were mismatched,
 which is why measuring it on the pulse alone found a tail and could not
@@ -527,17 +528,73 @@ def recovery_tail(time_us, amplitude_ire: float, time_constant_us: float
     and not a resonance: 260 kHz is where a microsecond relaxation puts its
     energy rather than a resonant line.
 
-    THE TIME CONSTANT IS 1.05 TO 1.29 us AND THE TWO FITS DISAGREE. The lane
-    states 1.22 us on head A and 1.29 on head B; refitting the same exported
-    samples with the same three-parameter form gives 1.073 and 1.054, at a
-    slightly lower residual (0.212 against 0.247 IRE rms on head A). The
-    difference is not resolved here and both are carried, because it changes
-    nothing that matters: the corner is `1/(2 pi tau)`, so the range spans
-    123 to 151 kHz and EVERY value in it is below the 213 kHz floor a 4.7 us
-    sync pulse can resolve. What the disagreement does say is that a single
-    exponential is a good but not exact description - 0.21 IRE rms against a
-    3.9 IRE excursion, about five per cent - so the shape should be entered
-    from the exported samples rather than regenerated from two parameters.
+    THE TIME CONSTANT IS DISPUTED BY A FACTOR OF THREE AND THE CONCLUSION
+    SURVIVES EITHER VALUE, which is why it is recorded rather than resolved.
+
+        the lane's first figures      1.22 / 1.29 us
+        the same samples, refitted    1.071 / 1.057 us
+        the lane's correction         2.94 / 3.18 us
+
+    The lane withdrew its first figures with a mechanism that is real and
+    general: an estimator that ASSUMES the level a tail decays to, taking it
+    from the trailing samples of a window the tail has not settled in, biases
+    every time constant short - invisibly on short constants and totally on
+    long ones. Their fix is to fit the offset JOINTLY, which for fixed tau is
+    linear in the amplitude and the offset and so is exact by least squares.
+
+    THAT FIX DOES NOT REPRODUCE THEIR CORRECTION ON THE SAMPLES THEY
+    EXPORTED. Running exactly that form here gives 1.071 and 1.057 us, and
+    2.94 fits the same samples 36 per cent worse in rms. And the window is
+    not the limitation: planting known tails in that same 3.77 us window at
+    its own noise, 200 draws each, the scan recovers 0.50 as 0.50, 1.07 as
+    1.06, 2.94 as 2.91 and only loses identifiability past about 0.75 time
+    constants of window. A 2.94 us tail in that window would have come back
+    as 2.94.
+
+    So the difference is in the INPUT, not the fit - most likely a corrected
+    against an uncorrected decode arm, which the export's metadata does not
+    state - and it has been asked rather than guessed.
+
+    EITHER VALUE SUPPORTS THE FINDING, AND THE LARGER ONE SUPPORTS IT MORE. A
+    relaxation corners at `1/(2 pi tau)`: 123 to 151 kHz at the short values,
+    50 to 54 kHz at the long ones. Every one of those is below the 213 kHz
+    floor a 4.7 us sync pulse can resolve, so the probe could not see what it
+    was being asked to remove on any reading of the number.
+
+    A single exponential is a good but not exact description either way -
+    0.21 IRE rms against a 3.9 IRE excursion, about five per cent - so the
+    shape should be entered from exported samples rather than regenerated
+    from two parameters.
+
+    IT IS AN UNCORRECTED RESIDUAL, AND THE SIZE IS HEAD-DEPENDENT. This went
+    round twice and the settled measurement is worth stating carefully.
+
+    The lane first reported the relaxation ALREADY REMOVED by the ringing
+    stage - head A fitting a pole at 0.976450 against a measurement of
+    0.976526, four-decimal agreement. That was the same window error as the
+    time constant: two fits of the same driving edge. They then reported it
+    barely touched, one and seven per cent, from a ring-off against ring-on
+    pair; THOSE ARMS ARE ALSO WITHDRAWN, because the flag that was supposed
+    to enable the stage was silently ignored and the two arms were identical.
+
+    The measurement that stands is on the corrected field, window 76 to 128:
+
+        raw fold                head A -2.410 IRE   head B -2.476
+        surviving the stage     head A -1.672       head B -0.580
+        so the stage removes           31 per cent         77 per cent
+
+    THE MECHANISM IS HEAD-COMMON AND THE RESIDUAL IS NOT, which is the part
+    that matters for entering it. The relaxation itself correlates at
+    r = +1.000 between the heads, so it is one object arriving before the
+    head; but the ringing stage's sections DIFFER between heads, so what
+    survives it does not. A component entered at position 6 from a
+    head-pooled shape would therefore be right about the mechanism and wrong
+    about the residual, and it has to be entered per head.
+
+    The position is declared and still unfilled: the export in hand
+    (porch_remainder_home.npz) was measured on the RAW fold, so its shapes
+    are of the uncorrected signal rather than of the residual, and a
+    corrected-field export on the same geometry has been asked for.
 
     Its size is established on ONE TAPE, over 8 fields. The chroma lane's
     independent figure - +4.5 to +0.3 IRE over about 4 us with a 1.5 us time
@@ -593,6 +650,296 @@ def signatures(frequency_hz, system: str = "NTSC",
         out[f"waveform distortion ({scale})"] = (pole * reachable
                                                  ).astype(np.complex128)
     return out
+
+
+def blanking_mask(json_path: Optional[str] = None,
+                  field_width: Optional[int] = None,
+                  active_start: Optional[int] = None,
+                  active_end: Optional[int] = None) -> Dict[str, object]:
+    """THE WHOLE SYNC REGION OF A LINE, with the active picture masked out.
+
+    Ethan: *"I need to measure the entire sync region, and mask out the
+    active area from this measurement."*
+
+    Everything between the end of one line's active picture and the start
+    of the next's belongs to the measurement: the front porch, the sync
+    pulse, the breezeway, the colour burst and the back porch. The arc has
+    until now measured the sync PULSE and treated the porches separately,
+    which throws away the burst - the finest timing instrument there is -
+    and the porches' own shape.
+
+    The boundaries are READ FROM THE DECODE, never assumed: a `.tbc.json`
+    carries `fieldWidth`, `activeVideoStart` and `activeVideoEnd`, and
+    those are what the decoder actually used. Measured on this session's
+    decodes: 910 samples a line with active video from 134 to 894, so the
+    sync region is 150 samples - the 16 at the end of the line plus the 134
+    at the start of the next - which at 4 fsc is 10.5 microseconds against
+    the 10.9 +/- 0.2 that ITU-R BT.1700 specifies for line blanking.
+
+    AND THE DECODE'S BOUNDS DISAGREE WITH THE STANDARD, by six samples.
+    Measured on all three of this session's decodes: the mask they imply is
+    10.476 microseconds where BT.1700 specifies 10.9 +/- 0.2, so the
+    decoder's active window is 0.42 microseconds - six samples at 4 fsc -
+    WIDER than blanking allows. The direction is the safe one for this
+    purpose: the mask is conservative, containing only blanking and no
+    active picture, at the cost of six samples of back porch treated as
+    though they were picture. `specified` returns the standard's own extent
+    instead, for a caller who would rather have the whole region and accept
+    the risk at its edge; the two are reported side by side so the
+    disagreement is visible rather than resolved silently.
+
+    Returns the mask over one line's samples and the region's own extent,
+    so a caller can report the resolution the surviving span affords rather
+    than the whole line's.
+    """
+    if json_path is not None:
+        import json
+        with open(json_path) as handle:
+            parameters = json.load(handle)["videoParameters"]
+        field_width = int(parameters["fieldWidth"])
+        active_start = int(parameters["activeVideoStart"])
+        active_end = int(parameters["activeVideoEnd"])
+    if field_width is None or active_start is None or active_end is None:
+        raise ValueError("give a decode's JSON, or its width and active "
+                         "bounds; these are not assumed")
+    columns = np.arange(int(field_width))
+    active = (columns >= int(active_start)) & (columns < int(active_end))
+    mask = ~active
+    rate = 4.0 * SUBCARRIER_HZ if "SUBCARRIER_HZ" in globals() else 4.0 * 315e6 / 88.0
+    per_sample_us = 1e6 / rate
+    # the standard's own extent, for comparison and as an alternative mask
+    specified_samples = int(round(10.9e-6 * rate))
+    specified = np.zeros(columns.size, dtype=bool)
+    tail = min(specified_samples, columns.size)
+    lead = max(int(active_start), 0)
+    specified[:min(lead, tail)] = True
+    remaining = tail - min(lead, tail)
+    if remaining > 0:
+        specified[columns.size - remaining:] = True
+    return {
+        "mask": mask, "active": active,
+        "specified_mask": specified,
+        "specified_samples": specified_samples,
+        "shortfall_samples": specified_samples - int(mask.sum()),
+        "shortfall_us": float((specified_samples - int(mask.sum())) * per_sample_us),
+        "field_width": int(field_width),
+        "active_start": int(active_start), "active_end": int(active_end),
+        "sync_region_samples": int(mask.sum()),
+        "active_samples": int(active.sum()),
+        "sync_region_us": float(mask.sum() * per_sample_us),
+        "specified_blanking_us": 10.9,
+        "specified_blanking_tolerance_us": 0.2,
+        "within_specification": bool(
+            abs(mask.sum() * per_sample_us - 10.9) <= 0.2 + per_sample_us),
+        "resolution_hz": float(1.0 / (mask.sum() * per_sample_us * 1e-6))
+        if mask.sum() else float("inf"),
+        "why": ("the whole region between two active pictures is the "
+                "measurement - porch, pulse, breezeway, burst and porch - "
+                "and its bounds come from the decode rather than from an "
+                "assumption"),
+    }
+
+
+# The vertical interval's line numbers, ITU-R BT.1700 (525-line): three
+# lines of pre-equalizing pulses, three of field sync with serrations,
+# three of post-equalizing, then the VBI proper carrying test and data
+# signals until active picture begins. Numbered from the field's first
+# line, which is what a decoded field's row index counts.
+VSYNC_LINES = 9                  # 3 pre-equalizing + 3 field sync + 3 post
+VBI_LAST_LINE = 21               # active picture begins at line 22 (NTSC)
+
+
+def frame_mask(json_path: Optional[str] = None,
+               field_width: Optional[int] = None,
+               field_height: Optional[int] = None,
+               active_start: Optional[int] = None,
+               active_end: Optional[int] = None,
+               front_porch_keep_us: float = 0.2,
+               vsync_lines: int = VSYNC_LINES,
+               vbi_last_line: int = VBI_LAST_LINE) -> Dict[str, object]:
+    """THE 2-D MASK OVER A WHOLE FIELD: keep the vertical sync and the line
+    sync pulses, mask the vertical interval's test lines and all active
+    picture.
+
+    Ethan, 2026-09-06: *"Mask out the entire VBI and the active area, only
+    the vsync and sync pulse area should remain. Stop the mask just after
+    the tail end of the active area in the front porch."* And, on why:
+    *"make sure to mask out the active area from carrying a residual that
+    is not correlated with the timing information."*
+
+    So three things go, and each for its own reason:
+
+      * THE ACTIVE PICTURE, because a residual measured there is picture,
+        not chain, and the arc's standing rule is that a correction derives
+        from reserved intervals only.
+      * THE VERTICAL INTERVAL'S TEST LINES, which are blanking by position
+        but ACTIVE by content - a VITS line carries a drawn waveform, and
+        including it puts a test signal's own shape into a timing
+        measurement.
+      * THE BURST, THE BREEZEWAY AND THE BACK PORCH, because Ethan's
+        window ends at the sync pulse. What is kept is the front porch's
+        tail and the pulse itself, which is the timing, and nothing that
+        carries colour.
+
+    The kept span per line therefore begins `front_porch_keep_us` after
+    active picture ends - inside the front porch, as he specifies - and
+    runs through the line sync pulse. The vertical sync block's own lines
+    are kept whole, because there is no active picture on them at all.
+
+    THE GUARD IS SMALL BECAUSE THE PORCH IS. Measured on this session's
+    decodes the front porch is sixteen samples, columns 894 to 909, so a
+    microsecond of guard would leave two of them and a fifth of a
+    microsecond leaves thirteen. The default is the smaller, which is what
+    "just after the tail end" asks for; a caller who wants the decoder's
+    low-pass ringing cleared as well should raise it and accept the loss,
+    and `front_porch_samples_kept` says what it costs.
+
+    WHAT THE ACTIVE AREA IS FOR, since it is masked here. Ethan: *"The
+    active area is the information that we are extracting from the luma."*
+    It is the data, not the measurement: the chain is measured on the
+    reserved intervals and the correction is applied to the picture. Its
+    own residual has one further use, which is that it carries the residual
+    colour carrier and therefore the colour lock's amplitude and phase.
+
+    Bounds come from the decode's JSON where one is given, never assumed.
+    """
+    if json_path is not None:
+        import json
+        with open(json_path) as handle:
+            parameters = json.load(handle)["videoParameters"]
+        field_width = int(parameters["fieldWidth"])
+        field_height = int(parameters["fieldHeight"])
+        active_start = int(parameters["activeVideoStart"])
+        active_end = int(parameters["activeVideoEnd"])
+    if None in (field_width, field_height, active_start, active_end):
+        raise ValueError("give a decode's JSON, or its geometry; these are "
+                         "not assumed")
+    rate = 4.0 * 315e6 / 88.0
+    per_sample_us = 1e6 / rate
+    keep_from = int(active_end) + int(round(front_porch_keep_us / per_sample_us))
+    # THE SPAN ENDS AT THE SYNC PULSE, not at active video. A decoded line
+    # starts at the sync datum, so columns 0 onward hold the pulse, then the
+    # breezeway, the burst and the back porch before active picture at
+    # `active_start`. Keeping as far as `active_start` would take in the
+    # burst and both porches - colour and level, not timing - which is the
+    # opposite of what this window is for. The pulse's own width is the
+    # standard's own LINE_SYNC_US, BT.1700's 4.7 microseconds.
+    pulse_end = int(round(LINE_SYNC_US["525"] / per_sample_us))
+    columns = np.arange(int(field_width))
+    # the kept span wraps the line end: from inside the front porch, over
+    # the line boundary, and through the sync pulse
+    line_keep = (columns >= keep_from) | (columns < pulse_end)
+    rows = np.arange(int(field_height))
+    is_vsync = rows < int(vsync_lines)
+    is_vbi = (rows >= int(vsync_lines)) & (rows <= int(vbi_last_line))
+    mask = np.zeros((int(field_height), int(field_width)), dtype=bool)
+    mask[is_vsync, :] = True                      # the vertical sync, whole
+    mask[~is_vsync & ~is_vbi, :] = line_keep      # picture lines: timing only
+    # the VBI's test lines are dropped entirely
+    return {
+        "mask": mask,
+        "line_keep": line_keep,
+        "keep_from_column": keep_from,
+        "sync_pulse_end_column": pulse_end,
+        "front_porch_keep_us": float(front_porch_keep_us),
+        "front_porch_samples_kept": int(field_width - keep_from),
+        "vsync_rows": int(is_vsync.sum()),
+        "vbi_rows_dropped": int(is_vbi.sum()),
+        "picture_rows": int((~is_vsync & ~is_vbi).sum()),
+        "kept_samples": int(mask.sum()),
+        "field_samples": int(mask.size),
+        "kept_fraction": float(mask.sum() / mask.size),
+        "why": ("only the vertical sync and the line sync pulses carry "
+                "timing without carrying content; the VBI's test lines are "
+                "blanking by position and active by content, and the burst "
+                "and back porch carry colour rather than timing"),
+    }
+
+
+def crossover_hz(short_probe_us: float = LINE_SYNC_US["525"],
+                 long_probe_us: float = 572.0) -> Dict[str, float]:
+    """Where the short probe stops and the long one must take over.
+
+    Ethan: *"Use the eq pulses to get the longer value, and the hsync
+    pulses to refine the higher frequency details."*
+
+    A probe of duration T carries no information below 1/T, so the line
+    sync pulse - 4.7 microseconds, ITU-R BT.1700 - says nothing under
+    212.8 kHz however carefully it is measured, and the vertical interval's
+    572 microseconds reaches down to 1.7 kHz. The crossover is therefore
+    the SHORT probe's own resolution: below it only the long probe has
+    anything to say, above it the short probe resolves detail the long one
+    smears. Neither number is chosen; both are one over a duration the
+    standard fixes.
+    """
+    short = 1.0 / (float(short_probe_us) * 1e-6)
+    long_ = 1.0 / (float(long_probe_us) * 1e-6)
+    return {
+        "crossover_hz": short,
+        "short_probe_us": float(short_probe_us),
+        "short_resolution_hz": short,
+        "long_probe_us": float(long_probe_us),
+        "long_resolution_hz": long_,
+        "decades_below_crossover": float(np.log10(short / long_)),
+        "why": ("a probe of duration T carries nothing below 1/T, so the "
+                "sync pulse's own width is the frequency beneath which only "
+                "the vertical interval can speak"),
+    }
+
+
+def combined_response(low_hz, low_H, high_hz, high_H,
+                      short_probe_us: float = 4.7,
+                      long_probe_us: float = 572.0) -> Dict[str, object]:
+    """One luma response from two probes, each used where it can resolve.
+
+    `low_*` is measured on the equalizing and field-sync train, `high_*` on
+    the line sync pulse. They are joined at `crossover_hz`, and the joint is
+    made continuous by matching the LEVEL of the high-frequency measurement
+    to the low one across the crossover rather than by fitting anything: a
+    step at the joint would be an artefact of two instruments' gains, not a
+    property of the channel, and the arc's rule is that a level belongs to
+    `standard_levels` and never to a shape.
+
+    The overlap band - from the crossover up to where the long probe's own
+    resolution still holds - is where the two must AGREE, and their
+    disagreement there is the honest error bar on the join.
+    """
+    edges = crossover_hz(short_probe_us, long_probe_us)
+    crossover = edges["crossover_hz"]
+    low_f = np.asarray(low_hz, dtype=np.float64).ravel()
+    high_f = np.asarray(high_hz, dtype=np.float64).ravel()
+    low = np.asarray(low_H).ravel()
+    high = np.asarray(high_H).ravel()
+    below = low_f < crossover
+    above = high_f >= crossover
+    # the overlap: where both probes are inside their own resolution
+    overlap_low = low_f >= crossover
+    overlap_high = high_f < crossover * 4.0
+    offset = 0.0
+    disagreement = float("nan")
+    if overlap_low.any() and overlap_high.any():
+        common = np.interp(low_f[overlap_low], high_f, np.abs(high))
+        measured = np.abs(low[overlap_low])
+        good = (common > 0) & (measured > 0)
+        if good.any():
+            ratio = np.log(measured[good] / common[good])
+            offset = float(np.median(ratio))
+            disagreement = float(np.std(ratio))
+    joined_f = np.concatenate([low_f[below], high_f[above]])
+    joined_H = np.concatenate([low[below], high[above] * np.exp(offset)])
+    order = np.argsort(joined_f)
+    return {
+        "frequency_hz": joined_f[order], "H": joined_H[order],
+        "crossover_hz": crossover,
+        "from_long_probe": int(below.sum()),
+        "from_short_probe": int(above.sum()),
+        "level_offset_nepers": offset,
+        "overlap_disagreement_nepers": disagreement,
+        "edges": edges,
+        "why": ("each probe is used only where its own duration lets it "
+                "resolve; the joint carries a level match, never a fit, and "
+                "the overlap's disagreement is the error bar on the join"),
+    }
 
 
 def probe_control(system: str = "NTSC",
@@ -671,14 +1018,22 @@ def front_porch_residual(samples, sample_rate_hz: float,
     dependence on content is not noise and not a disqualification - it is a
     MODELLED term, and subtracting it is what isolates the porch.
 
-    THE ARITHMETIC SAYS WHY IT DOMINATES. The front porch is 1.5 us and the
-    relaxation's time constant is about 1.07 us, so the porch is only 1.4
-    time constants long: a step of `preceding - settled` has decayed to
-    `exp(-1.4) = 25 per cent` by the sync fall and has never settled anywhere
-    inside it. A 100 IRE swing in the preceding content therefore leaves 25
-    IRE at the far end of the window, which is the scale of the 41-66 sigma
-    dependence that retired it. The back porch is 4.5 us, three times longer,
-    which is the whole reason it settles and the front porch does not.
+    THE ARITHMETIC SAYS WHY IT DOMINATES, and it does so on every disputed
+    value of the time constant. The front porch is 1.5 us and the
+    relaxation's time constant is somewhere between 1.07 and 3.18 us - see
+    this module's docstring for why that is a range and not a number - so the
+    porch spans between 1.40 and 0.47 time constants. A step of
+    `preceding - settled` has therefore decayed only to between 25 and 63 per
+    cent by the sync fall, and has never settled anywhere inside it on any
+    reading. A 100 IRE swing in the preceding content leaves 25 to 63 IRE at
+    the far end of the window, which is the scale of the 41-66 sigma
+    dependence that retired the front porch as a level. The back porch is
+    4.5 us, three times longer, which is the whole reason it settles and this
+    one does not - and on the longer time constants it barely settles either.
+
+    The default below is the SHORT value, which is the conservative choice
+    here: it removes less, so what survives into the residual is honest
+    rather than over-corrected.
 
     Returns the residual after the modelled relaxation is removed, and the
     share of the porch's variance that removal accounts for. If the share is
@@ -714,4 +1069,151 @@ def front_porch_residual(samples, sample_rate_hz: float,
                 "from the preceding active line; it spans only about 1.4 "
                 "time constants, so it never settles and its content "
                 "dependence is a modelled term rather than a disqualification"),
+    }
+
+
+# --------------------------------------------------------------------------
+# The edge and the tail are ONE channel, and a real pole cannot carry a ring
+# --------------------------------------------------------------------------
+
+
+def relaxation_or_ringing(tail_ire, time_us,
+                          decays_us: Optional[Sequence[float]] = None,
+                          frequencies_hz: Optional[Sequence[float]] = None
+                          ) -> Dict[str, object]:
+    """IS THE BACK-PORCH TAIL A RELAXATION OR A RING? Fit both and compare.
+
+    Ethan: *"I see a missing dimension, or possibly a complex pair is not
+    interconnected, in the picture, which is showing as a ringing and noise
+    profile on the sync pulse's response. I am still seeing distortion in the
+    back porch that should be able to be reversed."*
+
+    THE PAIR THAT IS NOT INTERCONNECTED IS THE EDGE AND THE TAIL, and they
+    are one object. The sync rise is a step; the back porch is where that step
+    SETTLES. So the response measured from the edge and the response measured
+    from the tail are the same `H(f)`, and anything true of one must be true
+    of the other.
+
+    THEY HAVE NOT BEEN FITTED WITH THE SAME MODEL. The sync edge is
+    characterised with ring POLES - complex pairs, a frequency and a decay -
+    which is what a ringing channel needs. The back-porch tail has been fitted
+    with a single REAL exponential, `A exp(-t/tau) + C`. A real pole cannot
+    represent a ring: it has no frequency, so an oscillatory component of the
+    channel is invisible to it and comes back as whatever real decay best
+    absorbs the residue. That is a missing dimension in the literal sense -
+    the model has one parameter where the physics has two - and it would show
+    exactly as Ethan describes: ringing visible on the edge, distortion left
+    on the porch, and a tail fit that looks acceptable while removing the
+    wrong thing.
+
+    AND ON THE REAL TAPE IT IS A RING. Run on the ringing lane's corrected
+    export, home tape, 52 samples over 3.56 us, on the REMAINDER left after
+    the relaxation has been removed:
+
+                    real pole rms   ring rms   improvement   ring frequency
+        head A         0.1660        0.1042      +37.2%        2.290 MHz
+        head B         0.2000        0.1410      +29.5%        2.213 MHz
+
+    with fitted decays of 0.46 and 0.54 us and amplitudes of +0.717 and
+    +0.708 IRE. FOUR INDEPENDENT REASONS TO BELIEVE IT, because a ring fitted
+    to a small residual is exactly the kind of claim that is usually an
+    artefact:
+
+      - the noise null. Fitting the same ring model to noise of the same
+        length and rms buys a median improvement of +7.2 per cent and at most
+        +15.9 over sixty draws. The measurement is at +37.2 and +29.5.
+      - on noise the fitted frequency is UNIFORM over the whole scan, 0.28 to
+        7.00 MHz - there is no preferred value for chance to land on. The two
+        heads land at 2.290 and 2.213 MHz, agreeing to 3.5 per cent.
+      - the amplitudes agree to 1.3 per cent between heads.
+      - THE TWO HEADS' REMAINDERS CORRELATE AT r = +0.9492. Two independently
+        measured residuals agreeing that closely are one object.
+
+    Head-common at r = +0.95 places it before the head, like the relaxation
+    it sits inside. It also explains the lane's report that a decay scan on
+    this remainder "rails at its bound with the sign reversed": a real pole
+    has no frequency, so asked to fit an oscillation it runs to the end of
+    its range and inverts trying to follow the first half-cycle.
+
+    So this fits BOTH and reports which the data prefers:
+
+        a real pole      A exp(-t/tau) + C          two free, tau scanned
+        a complex pair   A exp(-t/tau) cos(wt + p) + C
+                                                    three free, tau and w
+                                                    scanned
+
+    Both are linear in their amplitudes once the decay and frequency are
+    fixed, so a scan with least squares at each step is exact - no optimiser,
+    and no logarithm to reweight the quiet samples. The comparison is on
+    residual rms with the parameter count stated, because a model with more
+    freedom fits better by construction and the question is whether it fits
+    ENOUGH better.
+    """
+    t = np.asarray(time_us, dtype=np.float64).ravel()
+    y = np.asarray(tail_ire, dtype=np.float64).ravel()
+    if t.size != y.size or t.size < 8:
+        return {"decided": False, "why": "too few samples to fit either"}
+    span = float(t.max() - t.min())
+    if not span > 0:
+        return {"decided": False, "why": "the window has no duration"}
+
+    decays = (np.asarray(decays_us, dtype=np.float64) if decays_us is not None
+              else np.geomspace(0.05 * span, 4.0 * span, 120))
+    # frequencies the window can actually carry: at least one full cycle in
+    # the window, and at most the Nyquist of the sample spacing
+    step = float(np.median(np.diff(t))) if t.size > 1 else span
+    frequencies = (np.asarray(frequencies_hz, dtype=np.float64)
+                   if frequencies_hz is not None
+                   else np.linspace(1.0 / span, 0.5 / max(step, 1e-9), 90) * 1e6)
+
+    def best_fit(columns_for):
+        best = None
+        for decay in decays:
+            for frequency in (frequencies if columns_for == "ring"
+                              else [0.0]):
+                envelope = np.exp(-t / max(decay, 1e-9))
+                if columns_for == "ring":
+                    phase = 2.0 * np.pi * frequency * t * 1e-6
+                    design = np.column_stack([envelope * np.cos(phase),
+                                              envelope * np.sin(phase),
+                                              np.ones_like(t)])
+                else:
+                    design = np.column_stack([envelope, np.ones_like(t)])
+                coefficients, *_ = np.linalg.lstsq(design, y, rcond=None)
+                residual = float(np.sqrt(np.mean(
+                    (y - design @ coefficients) ** 2)))
+                if best is None or residual < best["rms"]:
+                    best = {"rms": residual, "decay_us": float(decay),
+                            "frequency_hz": float(frequency),
+                            "coefficients": coefficients,
+                            "parameters": design.shape[1] + 1}
+        return best
+
+    relaxation = best_fit("pole")
+    ringing = best_fit("ring")
+    improvement = (1.0 - ringing["rms"] / relaxation["rms"]
+                   if relaxation["rms"] > 0 else 0.0)
+    # a ring has two more free parameters, so it must beat the pole by more
+    # than the fraction that alone buys: (n - p_pole) / (n - p_ring) - 1
+    freedom = float(np.sqrt(max(t.size - relaxation["parameters"], 1)
+                            / max(t.size - ringing["parameters"], 1))) - 1.0
+    return {
+        "decided": True,
+        "relaxation": {"rms": relaxation["rms"],
+                       "tau_us": relaxation["decay_us"],
+                       "amplitude": float(relaxation["coefficients"][0]),
+                       "settled": float(relaxation["coefficients"][-1])},
+        "ringing": {"rms": ringing["rms"],
+                    "tau_us": ringing["decay_us"],
+                    "frequency_hz": ringing["frequency_hz"],
+                    "amplitude": float(np.hypot(ringing["coefficients"][0],
+                                                ringing["coefficients"][1])),
+                    "settled": float(ringing["coefficients"][-1])},
+        "improvement": improvement,
+        "free_parameter_allowance": freedom,
+        "prefers_ringing": bool(improvement > max(3.0 * freedom, 0.05)),
+        "why": ("the edge and the tail are one channel, so a ring visible on "
+                "the edge must be present in the tail; a single real pole has "
+                "no frequency and cannot carry one, so it absorbs the ring "
+                "into whatever real decay fits least badly"),
     }

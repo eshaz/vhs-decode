@@ -301,6 +301,8 @@ class HsyncGeometry:
     # burst remnant - uncorrelated with the known input, excluded by
     # the instructions' gathering rule)
     luma_lowpass_mhz: float
+    luma_lowpass_order: int         # supergauss order; 0 = not supergauss,
+                                    # i.e. a causal filter with NO precursor
 
     # measurement guards and line selection
     transition_settle_samples: int  # samples a band-limited transition
@@ -399,6 +401,15 @@ def build_geometry(sys_params, decoder_params, samples_per_line,
         active_video_start_sample=active_start_us * microseconds_to_samples,
         sync_depth_ire=abs(float(sys_params["vsync_ire"])),
         luma_lowpass_mhz=luma_lowpass_hz / 1e6,
+        # ZERO-PHASE ONLY. The supergauss luma low-pass is applied as a
+        # MAGNITUDE, so its impulse response is exactly symmetric and it
+        # puts a precursor ahead of every transition. The Butterworth
+        # alternative is causal and puts none, so the order is recorded as
+        # zero there and the precursor term vanishes by construction
+        # rather than by a flag.
+        luma_lowpass_order=(
+            int(decoder_params.get("video_lpf_order", 0))
+            if decoder_params.get("video_lpf_supergauss", False) else 0),
         transition_settle_samples=transition_settle_samples,
         first_measurable_line=(line_offset if include_vertical_interval
                                else line_offset + lines_of_vertical_sync),
@@ -2195,6 +2206,362 @@ def _detail_inverse_kernel(detail_taps, tolerance):
         if float(np.max(np.abs(term))) < tolerance:
             break
     return inverse, (len(inverse) - 1) // 2
+
+
+
+PORCH_RELAXATION_MIN_TAU_SAMPLES = 4.0
+"""Below this a "relaxation" is the edge's own band-limited rise, not a
+separate mechanism, and fitting one there re-describes the transition."""
+
+PORCH_RELAXATION_TAU_SEARCH_SPAN = 3.0
+"""How far past the window's own length the time-constant scan reaches.
+The tail does not settle inside the back porch, so the true constant can
+be longer than the window that sees it, and a scan stopping at the window
+length would rail there and report the bound as a measurement."""
+
+PORCH_RELAXATION_TAU_STEPS = 96
+"""Geometric steps across that span. Geometric because a time constant is
+a scale, so equal RATIOS are equal resolution."""
+
+PORCH_RELAXATION_MIN_AMPLITUDE_IRE = 0.20
+"""What the fitted amplitude must clear to be applied at all. Below it the
+component is not worth the risk of applying a shape to blanking."""
+
+
+def active_transition_precursor(geometry, length):
+    """What the ACTIVE-VIDEO transition puts BEFORE itself, per IRE of step.
+
+    Derived, not guarded (e4's derivation, verified here). Everything
+    between the active transition and the back porch is the decoder's own
+    video chain, and exactly one stage of it is non-causal: the supergauss
+    luma low-pass is applied as a MAGNITUDE, zero phase, so its impulse
+    response is exactly symmetric (measured 1.4e-17) and its precursor is
+    the mirror of its postcursor. The de-emphasis biquad is minimum phase
+    and contributes none.
+
+    So the precursor is fully specified by two numbers the decoder already
+    holds - `video_lpf_freq` and `video_lpf_order` - and can be COMPUTED
+    from the first active sample's own amplitude and subtracted, instead
+    of being guarded against by shortening the window.
+
+    THE GUARD WAS NEVER GOING TO WORK, which is why this is worth the
+    arithmetic. Order 9 is close to a brick wall, so the impulse response
+    RINGS rather than decaying: against a 100 IRE transition the signed
+    precursor runs -4.22, +0.94, +0.25, -0.70, -0.74, -0.49, -0.28 IRE at
+    2, 4, 6, 8, 12, 16, 20 samples ahead, and does not fall under this
+    measurement's own standard error until 36 samples - 69 per cent of the
+    window. Worse, the sign ALTERNATES, so moving a window boundary by two
+    samples changes the sign of what is left in. That is why the empirical
+    optima on two tapes disagreed: both windows were contaminated.
+
+    Returns the precursor at 1, 2, ... `length` samples BEFORE the
+    transition, in IRE per IRE of step, or None where the low-pass is
+    causal and there is nothing to remove.
+    """
+    order = int(getattr(geometry, "luma_lowpass_order", 0))
+    if order <= 0 or length <= 0:
+        return None
+    nyquist_hz = geometry.sample_rate_mhz * 1e6 / 2.0
+    grid = 1 << 13
+    frequencies = np.linspace(0.0, nyquist_hz, grid // 2 + 1)
+    # the decoder's own supergauss, on the OUTPUT grid: the video is band
+    # limited well below 4fsc Nyquist before the downscale, so sampling
+    # the same continuous response here is exact rather than approximate
+    magnitude = np.exp(-2.0 * np.power(
+        (2.0 * frequencies * (math.log(2.0) / 2.0) ** (1.0 / (2 * order)))
+        / (geometry.luma_lowpass_mhz * 1e6), 2 * order))
+    impulse = np.fft.fftshift(np.fft.irfft(magnitude))
+    centre = len(impulse) // 2
+    total = impulse.sum()
+    if not np.isfinite(total) or total == 0.0:
+        return None
+    # the step response, for a step rising AT the centre: its value at
+    # +k is what appears k samples ahead of the transition
+    step = np.cumsum((impulse / total)[::-1])[::-1]
+    return np.asarray(step[centre + 1:centre + 1 + length], dtype=np.float64)
+
+
+def remove_active_precursor(profile, geometry, start, stop, transition):
+    """Subtract the active transition's computed precursor from a porch span.
+
+    FRAME-AGNOSTIC: every index is in the caller's own frame, because the
+    fold is in window coordinates and the field buffer is in line
+    coordinates, and the two differ by `sync_fall_index`. Conflating them
+    is the error that made a decay fitted over the sync rise read 2.94 us
+    instead of 1.25.
+
+    The step's amplitude is measured from the profile itself - the settled
+    active level against the settled porch - so the only fitted quantity is
+    a level the data already contains, and the SHAPE is entirely derived.
+    """
+    profile = np.asarray(profile, dtype=np.float64)
+    if not (0 <= start < stop <= len(profile)) or transition <= stop:
+        return profile, 0.0
+    precursor = active_transition_precursor(geometry, transition - start)
+    if precursor is None:
+        return profile, 0.0
+    tail = profile[start:stop]
+    porch_level = float(np.median(tail[-max(len(tail) // 4, 3):]))
+    after = profile[transition:min(transition + 8, len(profile))]
+    if not len(after) or not np.isfinite(porch_level):
+        return profile, 0.0
+    height = float(np.median(after)) - porch_level
+    # ALIGNMENT, spelled out because getting it backwards INJECTS the
+    # precursor instead of removing it - and the injected shape is the
+    # supergauss's own 3.3 MHz ringing, which reads as a clean narrowband
+    # component that was not there before.
+    #
+    # precursor[k-1] is the value k samples AHEAD of the transition, i.e.
+    # at index `transition - k`. Reversing it makes entry i correspond to
+    # index `start + i`, because entry 0 becomes k = transition - start.
+    # The span wanted is start .. stop-1, so it is the FIRST (stop - start)
+    # entries of the reversed array - not the last, which would take the
+    # entries nearest the transition and spread them across the whole span.
+    aligned = height * precursor[::-1]
+    contribution = aligned[:stop - start]
+    cleaned = profile.copy()
+    cleaned[start:stop] = tail - contribution
+    return cleaned, float(np.sqrt(np.mean(contribution ** 2)))
+
+
+def _fit_relaxation(tail):
+    """One relaxation fitted to a span: (tau, amplitude, settled, rms).
+
+    VARIABLE PROJECTION. For a fixed tau the model A exp(-t/tau) + C is
+    LINEAR in A and C, so least squares gives the exact best pair and only
+    the one nonlinear parameter is scanned - no logarithm, so no
+    reweighting of the quiet samples, and no optimizer. Vectorized over
+    the whole scan: the two-column normal equations have a closed form, so
+    every candidate is a few dot products against one matrix.
+
+    THE OFFSET IS FITTED, NOT ASSUMED. Taking it as the median of the
+    window's own trailing samples assumes the tail settles inside the
+    window, and the back porch does not settle before active video - so
+    that reads a level still up the curve and biases tau short. Planted
+    truth in a 59-sample window: tau 9 recovered to 0.5 per cent, tau 33
+    came back 29 per cent low.
+    """
+    tail = np.asarray(tail, dtype=np.float64)
+    lags = np.arange(len(tail), dtype=np.float64)
+    taus = np.geomspace(PORCH_RELAXATION_MIN_TAU_SAMPLES,
+                        PORCH_RELAXATION_TAU_SEARCH_SPAN * len(tail),
+                        PORCH_RELAXATION_TAU_STEPS)
+    decays = np.exp(-lags[None, :] / taus[:, None])
+    count = float(len(tail))
+    sum_ee = np.einsum("ij,ij->i", decays, decays)
+    sum_e = decays.sum(axis=1)
+    sum_ey = decays @ tail
+    sum_y = float(tail.sum())
+    determinant = sum_ee * count - sum_e ** 2
+    usable = np.abs(determinant) > 1e-12
+    if not usable.any():
+        return None
+    safe = np.where(usable, determinant, 1.0)
+    amplitudes = np.where(usable, (count * sum_ey - sum_e * sum_y) / safe, 0.0)
+    settleds = np.where(usable, (sum_ee * sum_y - sum_e * sum_ey) / safe, 0.0)
+    costs = np.where(usable, float(tail @ tail) - amplitudes * sum_ey
+                     - settleds * sum_y, np.inf)
+    chosen = int(np.argmin(costs))
+    return (float(taus[chosen]), float(amplitudes[chosen]),
+            float(settleds[chosen]),
+            float(np.sqrt(max(costs[chosen], 0.0) / count)))
+
+
+def accumulate_porch_relaxation(field_lines_ire, geometry, window_plan, state,
+                                average_fields):
+    """Measure the relaxation ON THE CORRECTED FIELD, and accumulate it.
+
+    THE ORDER IS THE WHOLE POINT, and getting it wrong is visible in the
+    picture. Measured on the RAW fold and subtracted from the corrected
+    signal, this over-subtracts by however much the ringing stage already
+    took: on the home tape the raw tail is -2.41 IRE on head A and -2.48 on
+    head B, while what SURVIVES the correction is -1.67 and -0.58. Applying
+    the raw figure flattened head A by 60 per cent and made head B 21 per
+    cent WORSE, with the sign reversed - a textbook over-correction, and
+    the heads differ because the stage's own sections differ between them.
+
+    So the measurement is taken on the ringing-corrected field, which is
+    what this correction actually lands on. It is NOT taken on this
+    component's own output: the accumulation runs before the subtraction,
+    so the loop never feeds itself. That distinction is why this is a
+    feed-forward and not the fixed point that stimulated its own kernel.
+    """
+    start, stop = porch_relaxation_window(geometry, window_plan)
+    anchor = int(window_plan.sync_fall_index)
+    low, high = start - anchor, stop - anchor
+    rows, samples = field_lines_ire.shape
+    if low < 0 or high > samples or high - low < 12:
+        return None
+    first = max(int(geometry.first_measurable_line), 0)
+    last = min(int(geometry.last_measurable_line), rows)
+    if last - first < MINIMUM_USABLE_LINES:
+        return None
+    mean_line = field_lines_ire[first:last].mean(axis=0)
+    # THE ACTIVE TRANSITION'S PRECURSOR IS REMOVED FIRST. The zero-phase
+    # luma low-pass puts up to 4.2 IRE of it inside this window, against a
+    # relaxation of about 2.4 - so fitting without removing it fits the
+    # next line's picture as much as the porch.
+    mean_line, precursor_ire = remove_active_precursor(
+        mean_line, geometry, low, high,
+        int(round(geometry.active_video_start_sample)))
+    state["porch_precursor_removed_ire"] = precursor_ire
+    profile = mean_line[low:high]
+    horizon = SLOW_HORIZON_FACTOR * max(average_fields, 1)
+    seen = int(state.get("porch_relaxation_fields", 0))
+    previous = state.get("porch_relaxation_profile")
+    if previous is None or len(previous) != len(profile):
+        blended = profile
+    else:
+        weight = 1.0 / min(seen + 1, horizon)
+        blended = previous * (1.0 - weight) + profile * weight
+    state["porch_relaxation_profile"] = blended
+    state["porch_relaxation_fields"] = seen + 1
+    fitted = _fit_relaxation(blended)
+    if fitted is None:
+        return None
+    tau, amplitude, settled, residual = fitted
+    if tau < PORCH_RELAXATION_MIN_TAU_SAMPLES \
+            or abs(amplitude) < PORCH_RELAXATION_MIN_AMPLITUDE_IRE:
+        return None
+    return {"pole": float(np.exp(-1.0 / tau)), "tau_samples": tau,
+            "amplitude_ire": amplitude, "window_start": start,
+            "window_stop": stop, "settled_ire": settled,
+            "residual_ire": residual, "fields": seen + 1,
+            "tau_us": tau / max(geometry.sample_rate_mhz, 1e-9)}
+
+
+def porch_relaxation_window(geometry, window_plan):
+    """Where the back porch's tail is read, in the fold's own coordinates.
+
+    IT EXCLUDES THE SYNC RISE, and that is the whole point of deriving it
+    rather than reusing `window_plan.back_porch`. That region starts one
+    sample after the rise midpoint, so a decay fitted over it spans the
+    edge that DRIVES the decay, and a joint fit answers with a time
+    constant long enough to cover the step. Measured on the same fold:
+    2.94 us over the back porch, 1.25 us starting after the rise. The edge,
+    not the tail.
+
+    From the end of the rise's own 10-90 transition plus the settle a
+    band-limited edge needs, to one settle before active video - the same
+    guard the level anchors take, for the same reason.
+    """
+    settle = float(geometry.transition_settle_samples)
+    anchor = int(window_plan.sync_fall_index)
+    start = int(math.ceil(geometry.sync_pulse_samples
+                          + 0.5 * geometry.sync_transition_samples
+                          + settle)) + anchor
+    stop = int(math.floor(geometry.active_video_start_sample - settle)) \
+        + anchor
+    return start, stop
+
+
+def _relaxation_enabled(shared_state):
+    """Whether the back-porch relaxation component runs.
+
+    Default OFF. It is a correction applied to blanking derived from an
+    accumulated model, and this project's rule is that the eye accepts a
+    visible change rather than a residual figure - so it ships switchable
+    and dark until Ethan has seen it.
+    """
+    selection = (shared_state or {}).get("stage_selection")
+    if not selection:
+        return False
+    return bool(selection.get("components", {}).get(("ringing", "relaxation"),
+                                                    False))
+
+
+def apply_porch_relaxation(field_lines_ire, relaxation, window_plan,
+                           amount=1.0):
+    """Subtract the fitted relaxation from every line's back porch.
+
+    THE FRAME. The fold's windows start `sync_fall_index` samples BEFORE
+    the line's sync fall (`window_starts = line * samples_per_line -
+    anchor`), so a window index is that far ahead of the buffer column it
+    names. The relaxation is measured in window coordinates and applied in
+    buffer coordinates.
+
+    THE UNITS. This runs on the IRE array, before the conversion back to
+    level units, because the fitted amplitude is in IRE.
+
+    What is subtracted is the fitted exponential, identically on every
+    line, rather than any per-line measurement - a correction derived from
+    an accumulated model and applied uniformly, which is what keeps it
+    from following the noise of the line it lands on.
+    """
+    if relaxation is None or amount == 0.0:
+        return 0.0
+    anchor = int(window_plan.sync_fall_index)
+    start = int(relaxation["window_start"]) - anchor
+    stop = int(relaxation["window_stop"]) - anchor
+    if start < 0 or stop > field_lines_ire.shape[1] or stop <= start:
+        return 0.0
+    lags = np.arange(stop - start, dtype=np.float64)
+    shape = (amount * relaxation["amplitude_ire"]
+             * np.exp(-lags / max(relaxation["tau_samples"], 1e-6)))
+    field_lines_ire[:, start:stop] -= shape[None, :]
+    return float(np.sqrt(np.mean(shape ** 2)))
+
+
+def measure_porch_relaxation(state, geometry, window_plan):
+    """The back porch's recovery tail, as ONE time constant.
+
+    THE PARAMETRISATION IS THE POINT. Measured three ways this week - here,
+    by the chroma lane, and by the luma lane - the back porch carries a
+    single relaxation after the sync rise: a few IRE decaying with a time
+    constant near 1.2 to 1.3 microseconds, polarity-common (the two heads
+    correlate at r = +1.000), and peaking around 260 kHz.
+
+    The derivation was describing it with SEVEN consecutive DCT bins,
+    evenly spaced at the window's own bin spacing, because a damped
+    sinusoid basis is the wrong shape for a relaxation. Seven basis
+    functions to say what one time constant says - and the residual sat
+    eight to twelve times its noise floor as a result. Fitted as what it
+    is, it costs one parameter.
+
+    Read off the RISE-ALIGNED fold, because that is the alignment the back
+    porch is sharp in: under fall alignment it is smeared by the
+    line-to-line sync-width jitter, which is why that second fold exists.
+
+    IT SURVIVES THE RINGING CORRECTION, which is what makes it a component
+    rather than a duplicate. Measured on the two real decode arms over this
+    window: the amplitude goes -2.931 to -2.899 IRE on head A and -2.954 to
+    -2.760 on head B - one and seven per cent. The stage is not removing
+    it, so removing it here is not removing it twice.
+
+    That took two wrong answers to establish, both from the fit window.
+    Fitted over `window_plan.back_porch`, which begins on the sync rise,
+    this reads tau 2.94 us and appears to match a section the stage already
+    fits at pole 0.976450 - a striking agreement that was two fits of the
+    same EDGE. Realized at unit strength over that window the correction
+    then looked like an overshoot. Neither survives a window that starts
+    after the rise.
+
+    Returns a dictionary in WINDOW coordinates (the fold's own frame), or
+    None when nothing separable is there.
+    """
+    mean = state.get("rise_interval_mean")
+    if mean is None:
+        return None
+    profile = np.asarray(mean, dtype=np.float64)
+    start, stop = porch_relaxation_window(geometry, window_plan)
+    if stop - start < 12 or stop > len(profile) or start < 0:
+        return None
+    profile, precursor_ire = remove_active_precursor(
+        profile, geometry, start, stop,
+        int(round(geometry.active_video_start_sample))
+        + int(window_plan.sync_fall_index))
+    fitted = _fit_relaxation(profile[start:stop])
+    if fitted is None:
+        return None
+    tau, amplitude, settled, residual = fitted
+    if tau < PORCH_RELAXATION_MIN_TAU_SAMPLES:
+        return None
+    if abs(amplitude) < PORCH_RELAXATION_MIN_AMPLITUDE_IRE:
+        return None
+    return {"pole": float(np.exp(-1.0 / tau)), "tau_samples": tau,
+            "amplitude_ire": amplitude, "window_start": start,
+            "window_stop": stop, "settled_ire": settled,
+            "residual_ire": residual,            "tau_us": tau / max(geometry.sample_rate_mhz, 1e-9)}
 
 
 def fit_artifact_model(state, geometry, window_plan, average_fields):
@@ -4237,6 +4604,12 @@ def fit_artifact_model(state, geometry, window_plan, average_fields):
 
     model = {
         "sections": sections,
+        # The back porch's recovery tail, as ONE time constant rather than
+        # the seven consecutive basis functions a damped-sinusoid model
+        # spends on it. Measured on the rise-aligned fold, where the back
+        # porch is sharp.
+        "porch_relaxation": measure_porch_relaxation(state, geometry,
+                                                     window_plan),
         "levels": levels,
         "edges": edges,
         "measured_sync_width": measured_sync_width,
@@ -6388,6 +6761,26 @@ def process_field(video_buffer, geometry, sync_tip_level, blanking_level,
             diagnostics=inversion_diagnostics,
             input_noise_ire=line_noise_ire)
         state["inversion_diagnostics"] = inversion_diagnostics
+        # THE BACK PORCH'S RECOVERY TAIL, measured on the corrected field
+        # and applied to it. On the IRE array, because the fitted amplitude
+        # is in IRE and the next line converts to level units.
+        #
+        # The measurement runs whenever the stage does - it is cheap and it
+        # is a reported quantity - while only the SUBTRACTION is gated
+        # (`--stages +ringing.relaxation`, default off). Accumulating
+        # regardless also keeps the two arms' measurements identical, so
+        # the flag changes what is applied and nothing about what is seen.
+        whole = len(corrected_ire) // samples_per_line
+        if whole:
+            rows = corrected_ire[:whole * samples_per_line].reshape(
+                whole, samples_per_line)
+            relaxation = accumulate_porch_relaxation(
+                rows, geometry, window_plan, state, average_fields)
+            model["porch_relaxation_applied"] = relaxation
+            if relaxation is not None and _relaxation_enabled(shared_state):
+                removed = apply_porch_relaxation(rows, relaxation, window_plan)
+                if removed:
+                    state["porch_relaxation_removed_ire"] = removed
         corrected = (corrected_ire * level_units_per_ire + blanking_level)
         if np.all(np.isfinite(corrected)):
             # THE CORRECTION GOES WHERE THE MEASUREMENT WENT, and nowhere
@@ -6413,6 +6806,7 @@ def process_field(video_buffer, geometry, sync_tip_level, blanking_level,
             # rows is deliberate and unchanged: a correction confined to
             # blanking hides its picture behaviour from every sync gauge.
             corrected = corrected.reshape(whole_lines, samples_per_line)
+
             first_row = max(int(geometry.first_measurable_line), 0)
             last_row = min(int(geometry.last_measurable_line), whole_lines)
             if last_row > first_row:

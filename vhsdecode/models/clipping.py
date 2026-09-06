@@ -125,6 +125,30 @@ THE CONSEQUENCE THAT MATTERS IS NOT A DIRECTION. It is that a detected clip
 truncates the IDEAL, not merely the measured signal - see `truncated_ideal`.
 A synthetic reference that was never clipped, compared against a recording
 that was, reports the clip as a defect of everything downstream of it.
+
+ETHAN'S REVISION, 2026-09-06: *"I no longer think it is possible to clip
+the sync pulse."* The evidence gathered since this module was written
+supports him on the RECORD side, from three directions that do not share
+an assumption:
+
+  * MEASURED. The videosynth reference agent found the SLV-778HF's dark
+    clip at 2.787 MHz, which is -125.8 IRE - eighty-six IRE BELOW the
+    sync tip at -40 IRE. The sync pulse never descends far enough to meet
+    it. No white clip was visible at the record tap at all.
+  * THE SPECIFICATION, read the other way. SMPTE 32M-2004 clause
+    3.9.1.1.3 puts the dark clip at 40 per cent of the sync-to-white
+    excursion measured FROM the tip, which is forty IRE ABOVE it. Either
+    reading places the clip out of the pulse's reach; they differ on which
+    side, and both agree it cannot be touched.
+  * THE CIRCUIT. The keyed AGC of JVC VTG82063 section 3 clamps ON the
+    sync tip, which is precisely what holds it away from either level.
+
+So `detect_tip_clip` and `tip_clip_from_lines` should be read as measuring
+whether a tip clip is PRESENT, and on this deck the answer is that it is
+not and cannot be. What remains open is only the TUNER site at chain
+position 5, which is a different machine whose evidence was a
+tip-flatness and noise detector rather than a level measurement, and which
+no capture in this repository can settle without a tuner to measure.
 """
 
 from typing import Dict, Optional

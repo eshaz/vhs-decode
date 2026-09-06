@@ -207,34 +207,69 @@ def test_the_hermitian_inner_product_would_have_lost_that_distinction(band):
     assert stacked["rank"] == 2
 
 
-def test_the_frequency_scaling_is_another_rate_not_another_kind(band):
-    """The finding this module exists to have measured. A rescaling of the
-    axis acting on a response built out of rate mechanisms is itself a rate,
-    so it lands inside the collinear family rather than beside it: 0.9976 with
-    the separation, and the two together span one direction."""
+def test_the_frequency_scaling_is_a_kind_in_its_phase_and_a_rate_in_its_magnitude(band):
+    """THE FINDING THIS MODULE EXISTS TO HAVE MEASURED, AND IT REVERSED.
+
+    It first read 1.8035 of 3 at condition 28.84 with the amplitude-frequency
+    pair at 0.9976, and the conclusion was that a rescaling of the axis acting
+    on a response built of rate mechanisms is itself a rate. That was measured
+    while `frequency_signature` built `exp(there - here)` from two log
+    MAGNITUDES and carried no phase at all.
+
+    A frequency scaling is the one case where that is not recoverable: the two
+    sides are the same response at two different frequencies, so the entry
+    carries `phi(s f) - phi(f)`, which the magnitude difference does not
+    imply. At a fractional scaling of 1e-3 the magnitude difference peaks at
+    0.00092 nepers and the phase difference at 0.00362 radians - four fifths
+    of the effect was missing.
+
+    With it carried the pair falls to 0.7054 and the scaling is another KIND
+    after all. The magnitude halves are still one direction, which is what the
+    separability argument always got right."""
     read = hd.distinguishable(band)
     assert read["count"] == 3
-    assert read["effective"] == pytest.approx(1.8035, abs=0.01)
-    assert read["condition"] == pytest.approx(28.84, rel=0.02)
+    assert read["effective"] == pytest.approx(2.2505, abs=0.01)
+    assert read["condition"] == pytest.approx(2.413, rel=0.02)
     assert set(read["worst_pair"]) == {"head differential amplitude",
                                        "head differential frequency"}
-    assert read["worst_coherence"] == pytest.approx(0.9976, abs=0.001)
+    assert read["worst_coherence"] == pytest.approx(0.7054, abs=0.002)
 
     shapes = hd._shapes(hd.signatures(band))
     pair = hd._participation({name: shapes[name] for name in
                               ("head differential amplitude",
                                "head differential frequency")})
-    assert pair["effective"] == pytest.approx(1.0024, abs=0.01)
+    assert pair["effective"] == pytest.approx(1.3355, abs=0.01)
+
+    # and against the PHASE it is essentially orthogonal, which is the half
+    # that was invisible
+    against_phase = hd._participation({name: shapes[name] for name in
+                                       ("head differential phase",
+                                        "head differential frequency")})
+    assert against_phase["effective"] == pytest.approx(1.996, abs=0.01)
 
 
-def test_adding_the_frequency_scaling_lowers_the_count(band):
-    """The rule the sub pre-emphasis taught, arriving again: an entry earns a
-    place in the key by the direction it adds. This one adds none and costs
-    the conditioning, which is why `key_signatures` leaves it out."""
+def test_the_frequency_scaling_adds_a_direction_but_does_not_pay_for_it(band):
+    """AN ENTRY EARNS ITS PLACE BY THE DIRECTION IT ADDS - and the reason this
+    one is held has changed even though the verdict has not.
+
+    It used to LOWER the count, 2.0000 of 2 becoming 1.8035 of 3, and cost
+    more than twenty times the conditioning. That was measured without its
+    phase. With the phase carried it RAISES the count to 2.2505 and costs
+    2.41 times the conditioning.
+
+    So it is still held, on a narrower argument that has to be stated rather
+    than inherited: `interference.admission` asks for more than half a
+    direction of gain at no more than 1.25 times the cost, and +0.25 for
+    2.41x clears neither."""
     two = hd._participation(hd._shapes(hd.key_signatures(band)))
     three = hd._participation(hd._shapes(hd.signatures(band)))
-    assert three["effective"] < two["effective"]
-    assert three["condition"] > 20.0 * two["condition"]
+    gain = three["effective"] - two["effective"]
+    cost = three["condition"] / two["condition"]
+    assert gain > 0.0, "it now adds a direction rather than removing one"
+    assert gain == pytest.approx(0.2505, abs=0.01)
+    assert cost == pytest.approx(2.413, rel=0.02)
+    # the arc's own admission gate, which it fails on both counts
+    assert not (gain > 0.5 and cost <= 1.25)
 
 
 def test_the_set_stands_against_the_magnetics_baseline(band):
@@ -581,3 +616,185 @@ def test_the_mechanics_come_from_the_head_model_and_are_not_restated():
     assert ours["drum_diameter_m"] == theirs["drum_diameter_m"]
     assert head_model.writing_speed(ours) == \
         head_model.writing_speed(theirs) == 5.80
+
+
+class TestTheTwoBandHeadDifference:
+    """Ethan: "We can use the difference between the color under and luma
+    components like we did before to measure the properties of the head.
+    The luma and chroma components are band measurements of each head."
+
+    Two bands, eleven wavelengths apart, written by the same head in the
+    same pass - so everything but the head cancels and the second band is
+    a second lever on what remains.
+    """
+
+    V = 5.8709
+
+    def _bands(self):
+        return (np.linspace(3.4e6, 4.4e6, 60), np.linspace(0.4e6, 0.9e6, 60))
+
+    def _departure(self, grid, gain_db, clearance_m):
+        gain = gain_db * np.log(10.0) / 20.0
+        return gain - 2.0 * np.pi * clearance_m * grid / self.V
+
+    def test_the_ratio_alone_names_the_mechanism(self):
+        """No fitting at all: a clearance difference is linear in frequency
+        and a gain difference is flat, so the ratio of the two bands'
+        departures lands on 6.0 or on 1.0."""
+        got = hd.band_ratio_discriminator()
+        assert got["clearance_predicts"] == pytest.approx(6.0, abs=0.01)
+        assert got["gain_predicts"] == 1.0
+
+    @pytest.mark.parametrize("gain_db,clearance_m", [
+        (0.98, 0.0), (0.0, 50e-9), (0.98, 50e-9), (-0.34, -20e-9),
+    ])
+    def test_it_recovers_planted_gain_and_clearance_together(
+            self, gain_db, clearance_m):
+        luma, cu = self._bands()
+        got = hd.two_band_difference(
+            luma, self._departure(luma, gain_db, clearance_m),
+            cu, self._departure(cu, gain_db, clearance_m))
+        assert got["gain_db"] == pytest.approx(gain_db, abs=1e-6)
+        assert got["clearance_m"] == pytest.approx(clearance_m, abs=1e-12)
+
+    def test_a_pure_gain_is_not_reported_as_a_clearance(self):
+        """The discrimination that one band cannot make - and the reason
+        the head difference was established as a flat gain."""
+        luma, cu = self._bands()
+        got = hd.two_band_difference(luma, self._departure(luma, 0.98, 0.0),
+                                     cu, self._departure(cu, 0.98, 0.0))
+        assert got["gain_significant"]
+        assert not got["clearance_significant"]
+        assert got["gain_share"] > 0.99
+
+    def test_a_pure_clearance_is_not_reported_as_a_gain(self):
+        luma, cu = self._bands()
+        got = hd.two_band_difference(luma, self._departure(luma, 0.0, 50e-9),
+                                     cu, self._departure(cu, 0.0, 50e-9))
+        assert got["clearance_significant"]
+        assert not got["gain_significant"]
+
+    def test_the_significance_floor_stops_dust_reading_as_a_measurement(self):
+        """On noiseless data the residual is zero, so three sigma is zero,
+        and a planted pure gain reported a significant clearance of 1e-17
+        metres until this floor existed."""
+        luma, cu = self._bands()
+        got = hd.two_band_difference(luma, self._departure(luma, 0.98, 0.0),
+                                     cu, self._departure(cu, 0.98, 0.0))
+        assert got["significance_floor"] > 0.0
+        assert abs(got["clearance_m"]) < 1e-12
+
+    def test_the_pair_beats_either_band_alone(self):
+        """Measured: sigma on the gain falls from 0.78 dB to 0.070, and on
+        the clearance from 186 nm to 23 - because over one band a constant
+        and a term linear in frequency are nearly the same shape."""
+        luma, cu = self._bands()
+        generator = np.random.default_rng(20260906)
+        noise_l = generator.normal(0.0, 0.01, len(luma))
+        noise_c = generator.normal(0.0, 0.01, len(cu))
+        both = hd.two_band_difference(
+            luma, self._departure(luma, 0.98, 20e-9) + noise_l,
+            cu, self._departure(cu, 0.98, 20e-9) + noise_c)
+        alone = hd.two_band_difference(
+            luma[:30], self._departure(luma[:30], 0.98, 20e-9) + noise_l[:30],
+            luma[30:], self._departure(luma[30:], 0.98, 20e-9) + noise_l[30:])
+        assert both["clearance_sigma_m"] < alone["clearance_sigma_m"] / 3.0
+        assert both["gain_sigma_nepers"] < alone["gain_sigma_nepers"] / 3.0
+
+    def test_it_states_what_the_difference_cancels(self):
+        """The head difference is worth taking because everything shared
+        goes with it."""
+        luma, cu = self._bands()
+        got = hd.two_band_difference(luma, self._departure(luma, 0.5, 0.0),
+                                     cu, self._departure(cu, 0.5, 0.0))
+        assert "tape" in got["cancels"]
+        assert "de-emphasis" in got["cancels"]
+
+    def test_mismatched_lengths_are_refused(self):
+        luma, cu = self._bands()
+        with pytest.raises(ValueError, match="one departure per frequency"):
+            hd.two_band_difference(luma, np.zeros(5), cu, np.zeros(len(cu)))
+
+
+class TestTheFixedResponse:
+    """Ethan: "The model of the VCR is fixed throughout recording and
+    playback depending on which circuit path is enabled on the VCR so a
+    fixed response for each head confirms this though testing."
+
+    The test, and its limit - which turns out to be the interesting part,
+    because the time scale is what separates the circuit from the
+    mechanics.
+    """
+
+    @staticmethod
+    def _halves(level, noise, seed, n=140):
+        generator = np.random.default_rng(seed)
+        pulse = -40.0 * np.exp(-np.arange(n) / 8.0)
+        return (pulse + level + generator.normal(0.0, noise, n),
+                pulse + level + generator.normal(0.0, noise, n))
+
+    def test_a_planted_per_head_level_is_resolved(self):
+        got = hd.fixed_response_verdict(self._halves(0.0, 0.02, 1),
+                                        self._halves(0.15, 0.02, 2))
+        assert got["between_level"] == pytest.approx(-0.15, abs=0.02)
+        assert got["level_resolved"]
+        assert got["fixed_per_head"]
+
+    def test_two_identical_heads_are_not_resolved(self):
+        """The distinction must fail when there is nothing to distinguish -
+        otherwise it is not a test."""
+        got = hd.fixed_response_verdict(self._halves(0.0, 0.05, 3),
+                                        self._halves(0.0, 0.05, 4))
+        assert not got["level_resolved"]
+        assert not got["fixed_per_head"]
+
+    def test_noisier_heads_raise_the_bar(self):
+        """The within-head variation is the yardstick, so a difference that
+        clears it on quiet data need not on noisy."""
+        quiet = hd.fixed_response_verdict(self._halves(0.0, 0.01, 5),
+                                          self._halves(0.06, 0.01, 6))
+        noisy = hd.fixed_response_verdict(self._halves(0.0, 0.20, 7),
+                                          self._halves(0.06, 0.20, 8))
+        assert quiet["level_ratio"] > noisy["level_ratio"]
+
+    def test_level_and_shape_are_judged_separately(self):
+        """Because they answer different questions, and on real tape the
+        level resolves on both tapes while the shape resolves on one."""
+        n = 140
+        generator = np.random.default_rng(9)
+        pulse = -40.0 * np.exp(-np.arange(n) / 8.0)
+        ripple = 0.3 * np.sin(2 * np.pi * np.arange(n) / 17.0)
+        a = (pulse + generator.normal(0, 0.01, n),
+             pulse + generator.normal(0, 0.01, n))
+        b = (pulse + ripple + generator.normal(0, 0.01, n),
+             pulse + ripple + generator.normal(0, 0.01, n))
+        got = hd.fixed_response_verdict(a, b)
+        assert got["shape_resolved"]
+        assert abs(got["between_level"]) < 0.05      # a pure shape difference
+
+    def test_a_short_span_does_not_speak_for_stability(self):
+        """THE LIMIT, and it is the finding. Sixteen fields is 0.27 s. The
+        transport's drift lives from a quarter second upward, so a verdict
+        from under a second speaks for the CIRCUIT only - which is exactly
+        the part Ethan's claim is about."""
+        short = hd.fixed_response_verdict(self._halves(0.0, 0.02, 10),
+                                          self._halves(0.15, 0.02, 11),
+                                          span_s=0.27)
+        assert short["span_covers_drift"] is False
+        long = hd.fixed_response_verdict(self._halves(0.0, 0.02, 12),
+                                         self._halves(0.15, 0.02, 13),
+                                         span_s=17.0)
+        assert long["span_covers_drift"] is True
+
+    def test_it_states_why_a_fixed_response_at_all_scales_would_refute(self):
+        """A response fixed at every scale would contradict the transport
+        model, not confirm it - the drum and the reels have to show."""
+        got = hd.fixed_response_verdict(self._halves(0.0, 0.02, 14),
+                                        self._halves(0.15, 0.02, 15))
+        assert "CIRCUIT" in got["limit"]
+        assert "stability" in got["limit"]
+
+    def test_mismatched_profile_lengths_are_refused(self):
+        with pytest.raises(ValueError, match="same profile length"):
+            hd.fixed_response_verdict((np.zeros(10), np.zeros(12)),
+                                      (np.zeros(10), np.zeros(10)))

@@ -207,3 +207,76 @@ class TestShapedSharpener:
         assert not usable[0]                       # DC never speaks
         assert np.count_nonzero(usable) < len(usable)
         assert np.all(log_response[~usable] == 0.0)
+
+
+class TestBurstEnvelopeIsNotAReference:
+    """The burst's LEVEL carries no information, so nothing may depend on it.
+
+    Ethan: the colour phase and amplitude "should assume the burst has no
+    knowable envelope, and that it's permanently reduced due to the color
+    under carrier being lower than the NTSC carrier."
+
+    Three unknown scalar gains stand between the specified burst and the
+    measured one - record and playback AGC, head-to-tape contact, and the
+    fixed colour-under carrier reduction - and one measurement cannot
+    separate three unknowns. `colour_under.burst_observables` states the
+    contract; these hold this module to it operationally, which is the only
+    form that survives a refactor: SCALE THE BURST AND NOTHING MAY MOVE.
+    """
+
+    @staticmethod
+    def _rf_field(**overrides):
+        from scipy.signal import butter
+
+        sos = butter(4, [60e3 / 20e6, 1.2e6 / 20e6], btype="bandpass",
+                     output="sos")
+        base = _field(**overrides)
+        base.rf.SysParams["outfreq"] = OUTFREQ
+        base.rf.DecoderParams = {"color_under_carrier": 629370.63}
+        base.rf.Filters = {"FVideoBurst": sos}
+        base.rf.freq_hz = 40e6
+        return base
+
+    @pytest.mark.parametrize("gain", [0.2, 0.5, 2.0, 7.0])
+    def test_the_measured_response_is_invariant_to_burst_gain(self, gain):
+        field, uphet = _burst_field(16.0, field=self._rf_field())
+        reference = c.chroma_path_response(field, uphet)
+        scaled = c.chroma_path_response(field, (uphet * gain).astype(np.float32))
+        assert reference is not None and scaled is not None
+        assert np.allclose(reference[1], scaled[1], atol=1e-9)
+        assert np.array_equal(reference[2], scaled[2])
+
+    @pytest.mark.parametrize("gain", [0.2, 5.0])
+    def test_the_measured_rise_is_invariant_to_burst_gain(self, gain):
+        """A 10-90 time is a ratio of the envelope to itself, so it is
+        already gain-free - asserted so it stays that way."""
+        field, uphet = _burst_field(16.0, field=self._rf_field())
+        plain = c.measured_chroma_rise(field, uphet)
+        scaled = c.measured_chroma_rise(field, (uphet * gain).astype(np.float32))
+        assert plain is not None and scaled is not None
+        assert scaled == pytest.approx(plain, rel=1e-6)
+
+    @pytest.mark.parametrize("gain", [0.3, 3.0])
+    def test_the_sharpener_bank_is_invariant_to_burst_gain(self, gain):
+        """The end of the chain, because an invariance that holds for the
+        measurement and is lost by its consumer is not an invariance."""
+        field, uphet = _burst_field(16.0, field=self._rf_field())
+        radii, weights = c.sharpener_passes(field, uphet, 16)
+        radii_scaled, weights_scaled = c.sharpener_passes(
+            field, (uphet * gain).astype(np.float32), 16)
+        assert np.array_equal(radii, radii_scaled)
+        assert np.allclose(weights, weights_scaled, atol=1e-9)
+
+    def test_the_carrier_reduction_is_a_specification(self):
+        """It is Faraday's law on two specified frequencies, so it is
+        derived rather than measured, and it is not small."""
+        from vhsdecode.models import colour_under
+
+        assert colour_under.carrier_reduction_db("NTSC") == pytest.approx(
+            -15.098, abs=0.01)
+        assert colour_under.carrier_reduction_db("PAL") == pytest.approx(
+            -16.990, abs=0.01)
+        contract = colour_under.burst_observables("NTSC")
+        assert contract["phase_is_absolute"] is True
+        assert contract["amplitude_is_absolute"] is False
+        assert contract["envelope_is_knowable"] is False

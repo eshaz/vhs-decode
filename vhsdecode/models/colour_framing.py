@@ -7,21 +7,23 @@ back to the previous of alternating."*
 
 WHAT IS WRONG TODAY, MEASURED. The decoder decides NTSC colour framing from a
 free-running counter - `(field.isFirstField, (field.field_number // 2) % 2)`
-at `vhsdecode/chroma.py` - with no measurement in it, and the contract check
-that would catch a wrong sequence is switched off (`check_phase=False`).
-Counted over the shipped decodes in `/output`: 638 carry the correct
-ascending 1,2,3,4 and 45 do not, and the largest decode in the archive
-(`countdown_on`, 59021 fields) is wrong throughout - 59015 descending steps
-against 5 ascending. The same capture decoded from two different seek points
-comes out with OPPOSITE framing, because a counter starting on a first field
-and one starting on a second field differ by exactly one.
+at `vhsdecode/chroma.py`. Counted over the shipped decodes in `/output`: 638
+carry the ascending 1,2,3,4 and 45 do not, and the same capture decoded from
+two different seek points comes out with OPPOSITE framing, because a counter
+starting on a first field and one starting on a second differ by exactly one.
 
-AND A COUNTER CANNOT BE RIGHT IN PRINCIPLE, which is Ethan's point. A counter
-carries the framing forward from wherever it started; a tape carries whatever
-was recorded, and a tape can hold more than one recording. A splice, a
-re-record, a stop and restart - each is a new source with its own framing,
-and no counter survives one. The framing has to be MEASURED, per field, from
-the signal.
+A COUNTER CANNOT BE RIGHT IN PRINCIPLE. It carries the framing forward from
+wherever it started; a tape carries whatever was recorded, and a tape can
+hold more than one recording. A splice, a re-record, a stop and restart -
+each is a new source with its own framing, and no counter survives one.
+
+AND THE FRAMING STILL CANNOT BE MEASURED FROM THE CHROMA, which is the part
+that took a withdrawn change to establish. Both statements are true at once:
+the counter is not right, and the obvious replacement is not available. The
+section below has the arithmetic. What follows from holding both is that the
+counter STAYS - as the least wrong thing available - and that its failures
+are made visible rather than silently corrected, which is why the contract
+check in `buildmetadata` is now performed rather than merely parameterised.
 
 THE ARITHMETIC, DERIVED AND NOT QUOTED. In 525/60 the subcarrier is
 `455/2` times the line rate, so along one line the subcarrier turns
@@ -41,31 +43,47 @@ In 625/50 the subcarrier is `1135/4 f_H + 25 Hz`, the quarter-cycle term
 forces eight fields, and the 25 Hz offset contributes exactly one extra cycle
 per frame, which is an integer and so does not change the sequence length.
 
-WHY THE TAPE STILL CARRIES IT, DESPITE THE COLOUR-UNDER BEING LINE-LOCKED.
-This is the objection that has to be answered, because on its face the
-colour-under carrier destroys the sequence: it is EXACTLY 40 f_H, so it
-advances exactly 40 whole cycles a line, which is zero degrees a line, and a
-carrier that advances nothing cannot carry a four-field pattern.
+THE TAPE DOES NOT CARRY IT, AND THIS MODULE ONCE ARGUED THAT IT DID.
 
-The answer is that the recording machine's APC does not synthesise the
-colour-under from the line rate alone - it locks it against the INCOMING
-BURST. So the phase written to tape is the difference between the source's
-subcarrier and the deck's line-locked local oscillator, and the source's
-subcarrier is exactly the thing that carries the SC/H sequence. What survives
-on tape is therefore the source's framing, folded into the colour-under
-phase measured AGAINST HSYNC - which is precisely the relationship Ethan
-names, and is why it must be read against hsync rather than in isolation.
+The objection is that the colour-under is EXACTLY 40 f_H, so it advances a
+whole number of cycles per line and per field, and a carrier that advances
+nothing cannot carry a four-field pattern. An earlier version of this
+docstring answered that the recording APC locks the colour-under against the
+INCOMING BURST, so the source's SC/H sequence survives folded into the
+recorded phase. THAT ANSWER WAS WRONG, and the arithmetic that settles it is
+short enough to state here.
 
-THAT ARGUMENT IS NOT A MEASUREMENT, and this module does not pretend it is.
-`decide` takes a measured SC/H phase and returns a framing; `confidence`
-says whether the measurement is worth believing; and when it is not, the
-caller falls back. The measurement that would settle the argument itself is
-named in `settle_the_question` below - it needs the burst phase BEFORE the
-decoder imposes its own target, over at least sixteen consecutive fields.
+In units of the line rate the subcarrier is 455/2 and the record heterodyne
+oscillator sits at `fsc + f_cu = 227.5 + 40 = 267.5`. Over one field of
+262.5 lines,
+
+    subcarrier    262.5 x 227.5 = 59718.75 cycles, fractional 3/4 -> 270 deg
+    record LO     262.5 x 267.5 = 70218.75 cycles, fractional 3/4 -> 270 deg
+    difference                            10500 cycles, fractional 0
+
+The two fractional parts are IDENTICAL. Whatever the APC locks to, the 270
+degrees per field cancels exactly in the down-conversion, and 40 f_H was
+chosen so that it would. No measurement of the recorded burst against the
+sync datum can recover the colour frame, because the quantity is not there.
+
+A decoder change built on the earlier argument was shipped and withdrawn. It
+read `burst_phase_avg`, which on a synthetic tape carrying no colour frame at
+all still alternates - because it carries the DECODER'S own rotation index,
+not the tape's. Measured against the counter it inverted 11 of 20 fields and
+destroyed the run-of-two structure. `chroma.colour_frame_parity` records
+that in full.
+
+SO THIS MODULE HOLDS THE ARITHMETIC AND NOT AN INSTRUMENT. `sequence`,
+`expected_phase` and `decide` are correct and are what a framing decision
+must satisfy; what is missing is a measurable input, and it has to come from
+somewhere the record heterodyne does not cancel - the luma side's own
+sync-to-subcarrier relationship before the chroma is split off, or an
+external reference. `settle_the_question` below names what would be needed
+and no longer claims the recorded burst can supply it.
 """
 
 from fractions import Fraction
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -116,11 +134,62 @@ def sequence(system: str = "NTSC") -> Dict[str, object]:
     }
 
 
-def expected_phase(field_index: int, system: str = "NTSC") -> float:
-    """The SC/H phase this field of the sequence should show, in degrees."""
+def reference_line_offset(field_index: int, system: str = "NTSC") -> int:
+    """How many WHOLE LINES the field's reference sync edge is from field
+    one's, which is where the burst is actually measured against sync.
+
+    BT.1700 (525-line, item "Field identification"): *"Field I is the field
+    in which the first zero crossing of burst on line 10 is positive going;
+    field III is negative going."* The reference for fields I and III is
+    line 10 and for fields II and IV it is line 273, so consecutive
+    reference edges are 263 lines apart (10 to 273) then 262 (273 to the
+    next frame's 10) - the ceiling and the floor of the 262.5-line field.
+    A sync edge is always a whole number of lines from another sync edge,
+    which is the whole point: the half-line only exists mid-line.
+    """
+    key = _system(system)
+    per_field = LINES_PER_FIELD[key]
+    frames, odd = divmod(int(field_index), 2)
+    frame_lines = int(per_field * 2)
+    first_step = int(-(-per_field // 1))          # ceiling: 263 for 525
+    return frames * frame_lines + (first_step if odd else 0)
+
+
+def expected_phase(field_index: int, system: str = "NTSC",
+                   at: str = "sync_edge") -> float:
+    """The SC/H phase this field of the sequence should show, in degrees.
+
+    `at="sync_edge"` (the default, and the only one an instrument can read)
+    advances the subcarrier by the WHOLE LINES between reference sync
+    edges: 227.5 cycles a line makes every whole-line advance a multiple of
+    180 degrees, so the 525-line sequence at the sync edge is
+    [0, 180, 180, 0] and its four states are (phase, field parity).
+
+    `at="half_line"` advances by the specification's 262.5 lines a field -
+    [0, 270, 180, 90] - which is the phase at the START of each field, and
+    on the odd fields that instant is mid-line where no sync edge and no
+    SC/H definition exists.
+
+    THE FIRST VERSION OF THIS RETURNED THE HALF-LINE SEQUENCE AS THE THING
+    TO VALIDATE A DECODER AGAINST, and `validate_mapping` then reported the
+    shipped map ninety degrees out on fields II and IV. The framing agent
+    measured the raw CVBS of three generator captures - about 31,700 lines
+    - and found the burst-to-sync phase taking exactly two values, 0 and
+    180, at every sync edge, ascending I, II, III, IV at all 123
+    consecutive field pairs; validated against the sync-edge sequence, the
+    shipped map has zero error on all four entries. The ninety degrees was
+    the half-line, 113.75 cycles, and it was this derivation's, not the
+    decoder's.
+    """
     spec = sequence(system)
-    advance = float(spec["degrees_per_field"])
-    return float((advance * int(field_index)) % 360.0)
+    if at == "half_line":
+        advance = float(spec["degrees_per_field"])
+        return float((advance * int(field_index)) % 360.0)
+    if at != "sync_edge":
+        raise ValueError("at must be 'sync_edge' or 'half_line'")
+    key = _system(system)
+    cycles = SUBCARRIER_RATIO[key] * reference_line_offset(field_index, key)
+    return float((cycles % 1) * 360)
 
 
 def decide(sch_phase_deg: float, system: str = "NTSC",
@@ -231,23 +300,105 @@ def framing(sch_phase_deg: Optional[float], field_number: int,
 
 
 def settle_the_question() -> Dict[str, str]:
-    """The measurement that decides whether the tape carries framing at all.
+    """WHERE A MEASURABLE COLOUR FRAME COULD STILL COME FROM.
 
-    Stated as a function so it cannot be lost in prose. The argument above -
-    that the recording APC locks the colour-under against the incoming burst,
-    so the source's SC/H sequence survives in the colour-under phase measured
-    against hsync - is a mechanism, not evidence.
+    The question of whether the RECORDED BURST carries it is settled and the
+    answer is no - the arithmetic is in this module's docstring and the
+    cancellation is exact. What is open is whether anything else does.
     """
     return {
-        "export": ("the pre-imposition burst phase against the sync datum, "
-                   "per field, for at least 16 consecutive fields"),
-        "not": ("anything measured after upconvert_chroma_phase_comp, which "
-                "adds the burst phase to the local oscillator and so returns "
-                "the decoder's own imposed target rather than the tape's"),
-        "test": ("a period-4 pattern of two states 180 degrees apart, keyed "
-                 "to field index; present means the tape carries the "
-                 "framing, absent means it does not"),
+        "settled": ("the colour-under cannot carry it: subcarrier and record "
+                    "oscillator both advance a fractional 3/4 cycle per "
+                    "field, so the difference advances a whole number and "
+                    "the four-field sequence cancels exactly"),
+        "not": ("anything derived from burst_phase_avg, which alternates "
+                "even on a synthetic tape carrying no colour frame, because "
+                "it carries the decoder's own per-line rotation index"),
+        "candidate": ("the LUMA side's sync-to-subcarrier relationship "
+                      "measured before the chroma is split off, which the "
+                      "record heterodyne never touches"),
+        "external": ("a reference outside the tape - the standard's line-10 "
+                     "burst zero-crossing rule, or a known colour in the "
+                     "picture, neither of which is available from the sync "
+                     "area alone"),
         "caution": ("a period-4 two-state pattern is cyclically identical to "
-                    "its own rotation, so the test establishes that the "
-                    "SEQUENCE is intact and not which field is first"),
+                    "its own rotation, so any such test establishes that a "
+                    "SEQUENCE is intact and never which field is first"),
+    }
+
+
+def validate_mapping(mapping: Dict[Tuple[int, int], Tuple[int, float]],
+                     system: str = "NTSC") -> Dict[str, object]:
+    """VALIDATE A DECODER'S FRAMING MAP AGAINST THE SPECIFIED SEQUENCE.
+
+    Ethan: *"I am seeing a miss-match in the color framing. Look at the spec
+    and use our color measurements, specifically genlocking to validate the
+    mapping."*
+
+    The mapping is `(isFirstField, parity) -> (fieldPhaseID, base phase)`.
+    `fieldPhaseID` names which field of the colour sequence this is, and the
+    base phase is what the decoder then IMPOSES on the chroma relative to
+    the line grid. The specification fixes the second given the first, AT
+    THE SYNC EDGE, because that is the only place a burst-to-sync phase is
+    defined (`expected_phase`).
+
+    THE SHIPPED NTSC MAP PASSES. Measured against the sync-edge sequence:
+
+        fieldPhaseID 1   spec   0 deg   map   0 deg    agrees
+        fieldPhaseID 2   spec 180 deg   map 180 deg    agrees
+        fieldPhaseID 3   spec 180 deg   map 180 deg    agrees
+        fieldPhaseID 4   spec   0 deg   map   0 deg    agrees
+
+    A previous version of this docstring reported fields II and IV ninety
+    degrees out and called the map's two base phases insufficient for four
+    states. That was this module's own error - it validated against the
+    half-line sequence [0, 270, 180, 90], whose odd entries fall mid-line
+    where there is no sync edge. The four states are (phase, field parity),
+    two phases each, and the map carries both. The genlock measurement that
+    settled it: the source's SC/H holds to 0 +- 2 degrees with a drift under
+    0.02 degrees a field, and the decoder's burst lock to 0.44 degrees a
+    line, so nothing in the measurement chain could have hidden a ninety
+    degree error had there been one.
+
+    What this does not decide is which SMPTE field a given identifier
+    names: cvbsdecode's identifiers were measured one colour frame off the
+    standard (its ID 1 lands on field III, deterministically, 48 of 48
+    aligned fields), and the tape cannot supply the sequence at all, so
+    vhsdecode's counter is seek-relative by necessity. Both are recorded
+    in `colour_frame_parity` and neither is a phase error.
+    """
+    spec = sequence(system)
+    states = int(spec["states"])
+    rows = []
+    for key, value in sorted(mapping.items()):
+        identifier, base = value[0], float(value[1])
+        wanted = expected_phase(identifier - 1, system)
+        error = ((base - wanted + 180.0) % 360.0) - 180.0
+        rows.append({
+            "key": key,
+            "field_phase_id": identifier,
+            "specified_deg": wanted,
+            "mapped_deg": base,
+            "error_deg": error,
+            "agrees": bool(abs(error) < 1.0),
+        })
+    distinct_mapped = sorted({row["mapped_deg"] for row in rows})
+    distinct_spec = sorted({expected_phase(i, system) for i in range(states)})
+    disagreeing = [row for row in rows if not row["agrees"]]
+    return {
+        "rows": rows,
+        "system": spec["system"],
+        "states_specified": len(distinct_spec),
+        "states_mapped": len(distinct_mapped),
+        "distinct_specified_deg": distinct_spec,
+        "distinct_mapped_deg": distinct_mapped,
+        "disagreeing": len(disagreeing),
+        "worst_error_deg": (max(abs(row["error_deg"]) for row in rows)
+                            if rows else 0.0),
+        "consistent": not disagreeing,
+        "why": ("fieldPhaseID names which field of the sequence this is and "
+                "the base phase is what gets imposed; the specification "
+                "fixes the second given the first, so a map with fewer "
+                "distinct phases than the sequence has states cannot keep "
+                "both promises"),
     }

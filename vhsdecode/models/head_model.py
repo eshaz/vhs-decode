@@ -276,6 +276,103 @@ def wavelength_ratio(wavelength: np.ndarray, length: float) -> np.ndarray:
                       dtype=np.float64)
 
 
+def sinc_sign_phase(frequency_hz: np.ndarray, speed_m_s: float,
+                    track_width_m: float, **parameters) -> np.ndarray:
+    """THE PHASE THE MINIMUM-PHASE RELATION CANNOT SUPPLY, in radians.
+
+    `log_response` takes `log|sinc(...)|` for both the gap and the azimuth
+    terms, so the sinc's SIGN is discarded there - correctly, because that
+    function returns a log MAGNITUDE. But a sinc that has gone negative is a
+    response with a `pi` phase flip in it, and no Hilbert transform of a log
+    magnitude can produce a jump: the minimum-phase relation reconstructs
+    only the phase implied by the magnitude's own shape, and a sign change
+    leaves the magnitude smooth.
+
+    So the sign has to be carried separately, which is what this does. Two
+    negatives cancel, so the sum is taken modulo two before being turned into
+    `pi`.
+
+    WHEN IT MATTERS, MEASURED, over 0.2 to 12 MHz at 5.800 m/s and a
+    58 micron track:
+
+        azimuth error   first null    sign flips in band   negative share
+        0.167 deg        34.38 MHz            0                 0.0%
+        0.500 deg        11.46 MHz            1                 4.6%
+        1.000 deg         5.73 MHz            2                48.5%
+        6.000 deg         0.95 MHz           12                48.4%
+
+    THE GAP CONTRIBUTES NOTHING IN BAND and the azimuth is the whole of it.
+    A 0.30 micron gap puts its first null at 21.5 MHz - above every frequency
+    the format uses - so `sinc` never changes sign there, and with the
+    azimuth error set to zero the combined sign is positive across the entire
+    band.
+
+    And the first row is the one to read carefully: at the format's own
+    tolerance of ten minutes of arc the null is at 34 MHz and this correction
+    is exactly INERT. It becomes load-bearing only above about half a degree
+    - which is precisely where this repository's own fitted azimuth sits, and
+    why that fit is recorded as an upper bound rather than a measurement.
+    """
+    frequency = np.asarray(frequency_hz, dtype=np.float64)
+    valid = frequency > 0
+    wavelength = np.where(valid, speed_m_s / np.maximum(frequency, 1e-9),
+                          np.inf)
+    negatives = np.zeros_like(frequency)
+
+    gap = float(parameters.get("gap_m", 0.0))
+    if gap > 0:
+        ratio = EFFECTIVE_GAP_FACTOR * gap / wavelength
+        negatives = negatives + (_sinc(ratio) < 0)
+
+    error = float(parameters.get("azimuth_error_degrees", 0.0))
+    if error != 0.0 and track_width_m > 0:
+        across = track_width_m * np.tan(np.radians(error))
+        negatives = negatives + (_sinc(across / wavelength) < 0)
+
+    return np.where(valid, np.mod(negatives, 2.0) * np.pi, 0.0)
+
+
+def phase_rad(frequency_hz: np.ndarray, speed_m_s: float,
+              track_width_m: float, **parameters) -> np.ndarray:
+    """THE HEAD'S FULL PHASE: the minimum-phase part plus the sinc signs.
+
+    This is what a COMPLEX head response needs, and what `log_response`
+    cannot give on its own because it returns a log magnitude and a magnitude
+    has no sign. The minimum-phase relation supplies the phase implied by the
+    magnitude's shape; `sinc_sign_phase` supplies the `pi` jumps it cannot,
+    which exist wherever the gap or azimuth sinc has gone negative.
+
+    Use this to build a complex response. Use `group_delay_s` for a delay -
+    it deliberately excludes the sign, because differentiating a step is an
+    impulse rather than a delay, and its docstring gives the measured cost of
+    doing otherwise.
+    """
+    frequency = np.asarray(frequency_hz, dtype=np.float64)
+    magnitude = log_response(frequency, speed_m_s, track_width_m, **parameters)
+    finite = np.isfinite(magnitude)
+    phase = np.zeros_like(frequency)
+    if finite.sum() > 3:
+        from scipy.signal import hilbert
+        phase[finite] = -np.imag(hilbert(magnitude[finite]))
+    return phase + sinc_sign_phase(frequency, speed_m_s, track_width_m,
+                                   **parameters)
+
+
+def complex_response(frequency_hz: np.ndarray, speed_m_s: float,
+                     track_width_m: float, **parameters) -> np.ndarray:
+    """The head's response as one complex array: `exp(log|H| + j arg H)`.
+
+    The magnitude from `log_response` and the phase from `phase_rad`, which
+    is the pairing the rest of this arc reads a component in. Not-a-number
+    below zero frequency is carried through rather than filled, so a caller
+    reaching outside the head's domain is masked rather than given a number.
+    """
+    magnitude = log_response(frequency_hz, speed_m_s, track_width_m,
+                             **parameters)
+    phase = phase_rad(frequency_hz, speed_m_s, track_width_m, **parameters)
+    return np.exp(magnitude + 1j * phase)
+
+
 def group_delay_s(frequency_hz: np.ndarray, speed_m_s: float,
                   track_width_m: float, **parameters) -> np.ndarray:
     """The TIME axis of the same model: the group delay implied by the
@@ -283,9 +380,34 @@ def group_delay_s(frequency_hz: np.ndarray, speed_m_s: float,
 
     The loss mechanisms are minimum phase, so the phase follows from the
     magnitude and the delay follows from the phase. The gap and azimuth
-    terms are the exception - their sinc nulls flip sign rather than
-    turning the phase smoothly - and they are handled by carrying the sign
-    explicitly."""
+    terms are the exception - their sinc nulls flip sign rather than turning
+    the phase smoothly - and they are carried explicitly by
+    `sinc_sign_phase`.
+
+    THAT LAST SENTENCE USED TO BE UNTRUE. The docstring claimed the sign was
+    carried and no code carried it: `log_response` had already taken `abs` of
+    both sincs and this function only Hilbert-transformed the result. The
+    prose described the right thing and the code did something else, which is
+    the most reliable way this class of defect announces itself.
+
+    AND THE SIGN IS DELIBERATELY NOT IN THE DELAY. Making the code match the
+    prose by adding the sign phase here was tried first and is wrong, for a
+    reason worth stating: a group delay is `-dphi/domega`, and differentiating
+    a `pi` STEP gives an impulse, not a delay. Measured at an azimuth error of
+    half a degree, adding it took the delay's rms from 1974 ns to 3697 ns and
+    its peak to 183 microseconds - numbers that describe the differentiation
+    of a discontinuity rather than the head.
+
+    The 1974 ns that REMAINS at that azimuth is not the sign and is not a
+    defect: it is the minimum-phase delay around the magnitude's own null,
+    which is a real feature of the response. At the format's tolerance of ten
+    minutes of arc, where no null is in band, the delay is 443 ns.
+
+    So the delay stays smooth and carries the minimum-phase part alone, and
+    the sign is available separately as `sinc_sign_phase`. A caller that wants
+    the head's COMPLEX response wants `phase_rad`, which is the sum; a caller
+    that wants a delay wants this, which is not.
+    """
     frequency = np.asarray(frequency_hz, dtype=np.float64)
     magnitude = log_response(frequency, speed_m_s, track_width_m, **parameters)
     finite = np.isfinite(magnitude)

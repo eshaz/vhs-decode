@@ -62,6 +62,8 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from vhsdecode.models import composite_channel
+
 
 def _segments(channel: np.ndarray, count: int) -> np.ndarray:
     """A channel cut into `count` equal segments, as rows."""
@@ -450,8 +452,186 @@ def spec_burst(sample_rate_hz: float, length: int,
             * np.exp(1j * (2.0 * np.pi * carrier * t + float(phase_rad))))
 
 
+def analytic(values) -> np.ndarray:
+    """A real burst given its quadrature partner before it is projected.
+
+    THE SECOND FACTOR OF TWO, and it arrives from the opposite direction to
+    the first. A real cosine projected onto a complex exponential returns
+    HALF its amplitude, because only one of its two sidebands overlaps the
+    reference. That is the same SIZE of error as the record-side doubler
+    and the opposite SIGN, so the two very nearly cancel and leave a level
+    that is right for the wrong reason. NEARLY, and the margin is the whole
+    danger: the halving is exactly 2 and the doubler is specified as 6.0 dB
+    rather than 6.0206, so the product is 0.9976 and the residue is 0.24
+    per cent - a fifth of the standard's own half-decibel tolerance, and
+    far too small to be noticed as the pair of factor-of-two errors it is.
+
+    `burst_dimension` upcasts a real measurement with `astype`, which sets
+    the imaginary part to zero rather than building it. Here the partner is
+    built, by the same `-j sgn(f)` multiplier `hypercomplex.hilbert` uses,
+    so the projection sees the whole of what it is measuring.
+
+    MEASURED, on this module's own specified burst at 40 MSps, 4096
+    samples: the real part upcast with `astype` projects onto the analytic
+    reference at |g| = 0.5005, and made analytic first at |g| = 1.0005.
+    The five parts in ten thousand are the gate's own spectral leakage at
+    the window's ends and not the factor of two, which is exact.
+    """
+    x = np.asarray(values)
+    if np.iscomplexobj(x):
+        return x.astype(np.complex128)
+    x = x.astype(np.float64).ravel()
+    n = x.size
+    weight = np.zeros(n)
+    weight[0] = 1.0
+    if n % 2 == 0:
+        weight[1:n // 2] = 2.0
+        weight[n // 2] = 1.0
+    else:
+        weight[1:(n + 1) // 2] = 2.0
+    return np.fft.ifft(np.fft.fft(x) * weight)
+
+
+def burst_amplitude(measured_burst: np.ndarray, sample_rate_hz: float,
+                    doubler_applied: bool = True,
+                    **kwargs) -> Dict[str, object]:
+    """THE AMPLITUDE DIMENSION OF THE BURST PAIR, which the transfer omits.
+
+    `burst_dimension` returns a Wiener transfer, and a transfer is the
+    FREQUENCY dimension: it says how the channel is shaped and it carries
+    whatever common gain the two sides differ by without ever naming it
+    against the standard. The burst is specified in amplitude as well as in
+    frequency and phase - 40 IRE peak to peak, `BURST_AMPLITUDE_IRE` - so
+    the level is a dimension that can be read, and until this function
+    existed the module asserted it and never measured it.
+
+    THE RECORD-SIDE DOUBLER IS WHY IT MATTERS AND WHY IT IS TESTABLE. SMPTE
+    32M-2004 clause 3.9.2.1.3 raises the burst 6.0 +/- 0.5 dB BEFORE
+    recording, so what a tape holds is a burst twice the chroma beside it.
+    `burst_dimension`'s docstring says the pair lands on the colour-under
+    path - the recorded burst - while its synthetic side is the composite
+    specification, which has not been doubled. MEASURED, on a UNITY channel
+    carrying nothing but the specified doubler: `burst_dimension` reports
+    |T| = 1.9953, and the specification's own linear factor is 1.9953. The
+    whole of that reading is the doubler and none of it is the channel.
+    `doubler_applied` says whether the measurement still carries it; the
+    returned `chroma_referred_ire` is what the picture's colour is scaled
+    against either way, on the same convention
+    `burst_instrument.amplitude` already uses.
+
+    ONE COMPLEX GAIN, NOT A MAGNITUDE. The level is read as the
+    least-squares projection of the measurement onto the specified burst,
+
+        g = <ref, measured> / <ref, ref>
+
+    which is complex: `|g|` is the amplitude and `arg g` is the phase, and
+    they come out of one operation because they are one number. Taking
+    `|measured|` and averaging it instead would be the reduction that made
+    an earlier burst instrument rank two of four (`chroma._complex_envelope`),
+    and it would also make the answer depend on how much blanking the
+    window happens to include, which the projection does not: MEASURED,
+    padding the same burst from 4096 to 16384 samples of blanking divides a
+    mean-of-magnitudes level by exactly 4.00 and leaves `|g|` unmoved to
+    twelve decimal places.
+
+    AND THE TWO INSTRUMENTS IN THE TREE DISAGREE, which is what makes this
+    a pair rather than a restatement of the specification.
+    `burst_instrument.amplitude` reads `2 mean|envelope|` over whatever
+    window it is handed. MEASURED on the same specified burst carrying the
+    same doubler, both chroma-referred, at 40 MSps:
+
+        window 4096 samples    projection 40.000    mean  0.865
+        window 2048            projection 40.000    mean  1.730
+        window 1024            projection 40.000    mean  3.460
+        the burst's support alone, 100 samples
+                               projection 40.000    mean 35.429
+
+    The mean doubles as the window halves - it is a level per sample of
+    window and not a level - and even on the burst's own support it reads
+    0.8857 of the projection, which is exactly the mean-to-peak of the
+    specified raised-cosine gate. Neither reading is wrong; they are
+    different quantities, and nothing in the tree reconciles them, so a
+    correction taking its scale from one and its shape from the other is
+    out by that factor.
+
+    `residual_fraction` is what the single gain does not explain, so the
+    two sides of this pair can disagree in a way a bare ratio cannot show:
+    a channel that has changed the burst's SHAPE returns a believable
+    `ratio` and a residual that is no longer small.
+
+    ON REAL TAPE, and this is what the dimension was missing. Run over the
+    reserved interval alone (samples 0 to `activeVideoStart`, so no active
+    picture takes part) of three decoded chroma time bases in
+    /output/decodes, lines 20 to 261 of every field, split by field parity
+    - VHS lays alternate fields with alternate heads, the same split
+    `field_averages.chroma_transfer_for` uses:
+
+        decode        head A |g|   head B |g|   A - B      t
+        base_off        381.86       379.04     2.82 +- 0.45    6.28
+        cd_all          415.18       410.68     4.50 +- 0.38   11.74
+        all_on          377.84       375.06     2.78 +- 0.47    5.96
+
+    The two heads disagree about the chroma level by 0.7 to 1.1 per cent,
+    the same head is the higher one in all three, and it replicates across
+    two tapes. `residual_fraction` sits at 0.11 to 0.14 throughout, which
+    is the difference between the specified raised-cosine gate and the real
+    one and not a fault. Nothing in the tree reads this difference today.
+    """
+    measured = analytic(measured_burst).ravel()
+    reference = spec_burst(sample_rate_hz, measured.size, **kwargs)
+    energy = float(np.vdot(reference, reference).real)
+    gain = complex(np.vdot(reference, measured) / max(energy, 1e-30))
+    residual = measured - gain * reference
+    total = float(np.vdot(measured, measured).real)
+
+    amplitude_ire = float(kwargs.get("amplitude_ire", BURST_AMPLITUDE_IRE))
+    doubler = 10.0 ** (composite_channel.BURST_DOUBLER_DB / 20.0)
+    tolerance = 10.0 ** (composite_channel.BURST_DOUBLER_TOLERANCE_DB / 20.0)
+    measured_ire = abs(gain) * amplitude_ire
+    chroma_referred_ire = (measured_ire / doubler if doubler_applied
+                           else measured_ire)
+    ratio = (chroma_referred_ire / amplitude_ire if amplitude_ire
+             else float("nan"))
+
+    carrier = float(kwargs["carrier_hz"]) if kwargs.get("carrier_hz") \
+        else subcarrier_hz(kwargs.get("line_rate_hz", NTSC_LINE_RATE_HZ))
+    per_degree_s = 1.0 / (360.0 * carrier)
+    phase_deg = float(np.degrees(np.angle(gain)))
+    return {
+        "gain": gain,
+        "measured_ire": measured_ire,
+        "specified_ire": amplitude_ire,
+        "doubler_applied": bool(doubler_applied),
+        "doubler_db": composite_channel.BURST_DOUBLER_DB,
+        "doubler_linear": doubler,
+        "chroma_referred_ire": chroma_referred_ire,
+        "ratio": ratio,
+        "ratio_db": 20.0 * np.log10(ratio) if ratio > 0 else float("-inf"),
+        # the standard's own +/- 0.5 dB on the doubler, which is the error
+        # bar this pair is entitled to and not a threshold of my choosing
+        "tolerance_linear": tolerance,
+        "agrees": bool(1.0 / tolerance <= ratio <= tolerance),
+        "phase_rad": float(np.angle(gain)),
+        "phase_deg": phase_deg,
+        "per_degree_s": per_degree_s,
+        "seconds": phase_deg * per_degree_s,
+        "residual_fraction": float(np.vdot(residual, residual).real
+                                   / max(total, 1e-30)),
+        "carrier_hz": carrier,
+        "cite": ("SMPTE 32M-2004 clause 3.9.2.1.3 for the 6.0 +/- 0.5 dB "
+                 "record-side doubler, carried by "
+                 "composite_channel.BURST_DOUBLER_DB; SMPTE 170M-2004 and "
+                 "ITU-R BT.1700 for the 40 IRE peak to peak"),
+        "why": ("the transfer carries the common gain without naming it "
+                "against the standard, so the level is a separate dimension "
+                "- and on the colour-under path the whole of that gain is "
+                "the record-side doubler until the doubler is undone"),
+    }
+
+
 def burst_dimension(measured_burst: np.ndarray, sample_rate_hz: float,
-                    segments: int = 8, **kwargs) -> Dict[str, np.ndarray]:
+                    segments: int = 8, doubler_applied: bool = True,
+                    **kwargs) -> Dict[str, np.ndarray]:
     """THE BURST AS SPECIFIED AGAINST THE BURST AS IT CAME BACK.
 
     The same pair the sync dimension forms, and it needs no new machinery
@@ -485,7 +665,17 @@ def burst_dimension(measured_burst: np.ndarray, sample_rate_hz: float,
     transfer = pair_transfer(reference, measured, segments=segments)
     transfer["reference"] = reference
     transfer["absolute_phase"] = True
+    # THE AMPLITUDE DIMENSION, added beside the transfer rather than folded
+    # into it. Nothing above moves: `transfer` still measures the channel's
+    # SHAPE against the composite specification, doubler and all, and the
+    # level referred to the chroma is stated separately because they are
+    # two dimensions and a single number cannot carry both.
+    transfer["amplitude"] = burst_amplitude(
+        measured_burst, sample_rate_hz, doubler_applied=doubler_applied,
+        **kwargs)
     transfer["why"] = ("the only pair whose synthetic side specifies a "
                        "PHASE, so its transfer's phase is absolute rather "
-                       "than relative to another measurement")
+                       "than relative to another measurement - and, with "
+                       "`amplitude`, the only one whose synthetic side "
+                       "specifies a LEVEL as well")
     return transfer

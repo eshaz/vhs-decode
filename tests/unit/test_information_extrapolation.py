@@ -48,6 +48,56 @@ def test_residual_channels_cover_every_axis_and_the_chroma():
     }
 
 
+def test_the_transport_supplies_components_on_the_axes_magnetics_cannot():
+    """Ethan: "the tape speed difference from its expected as another
+    component, this is what ties in the tapes mechanical model".
+
+    The tie-in is an identifiability argument. Speed is EXACTLY degenerate
+    with a common scaling of every magnetic length on the frequency axis,
+    so it must be carried on time - and the transport is what measures it
+    there.
+    """
+    components = {c.name: c for c in ie.transport_components()}
+    assert len(components) == 5
+    speed = components["tape speed against its expected"]
+    assert set(speed.residual) == {"time", "frequency"}
+    assert "TIME AXIS IS THE IDENTIFIER" in speed.criterion
+    assert "degenerate" in speed.criterion
+
+
+def test_the_transport_components_are_split_across_the_two_machines():
+    """Speed and spacing belong to the deck reading the tape; the
+    transition length was written into the medium and belongs to the deck
+    that recorded it."""
+    components = {c.name: c for c in ie.transport_components()}
+    assert components["tape speed against its expected"].machine \
+        == ie.PLAYBACK_MACHINE
+    assert components["head-to-tape distance over time"].machine \
+        == ie.PLAYBACK_MACHINE
+    assert components["recorded transition length"].machine == ie.RECORDING
+    assert components["recorded transition length"].stage == ie.RF_RECORDING
+
+
+def test_the_transport_carries_tracking_and_the_reels_too():
+    """Ethan: "Variations between tape speed and head speed, and tracking
+    miss-match will be components within this set of data." Both are here,
+    and the reel is a POSITION witness rather than a rate."""
+    components = {c.name: c for c in ie.transport_components()}
+    assert "tracking mismatch" in components
+    assert "reel pack radius" in components
+    assert "NO GUARD BAND" in components["tracking mismatch"].criterion
+    assert "POSITION" in components["reel pack radius"].criterion
+
+
+def test_the_spacing_component_carries_time_not_just_amplitude():
+    """Its static value is not separable from the other magnetic lengths;
+    its TIME variation is, and that variation IS the dropouts."""
+    spacing = {c.name: c for c in ie.transport_components()}[
+        "head-to-tape distance over time"]
+    assert set(spacing.residual) == {"amplitude", "time"}
+    assert "dropouts" in spacing.criterion
+
+
 def test_chroma_components_are_linear_and_named():
     names = [component.name for component in ie.chroma_components()]
     assert names[:2] == ["color-under envelope amplitude", "chroma burst pilot"]
@@ -760,6 +810,43 @@ def _ensemble(rng, length, count, departures, noise_scale):
             value = value + weight * vector
         out[f"c{index}"] = {"frequency": value}
     return out
+
+
+def test_the_scatter_is_wider_for_a_real_ensemble():
+    """The stopping rule's own constant, corrected 2026-09-06.
+
+    `|G_ij|^2` is `(1/L) chi^2_1` for a real ensemble and `(1/L)(chi^2_2/2)`
+    for a complex one - variances `2/L^2` and `1/L^2` - so the asymmetry's
+    scatter is exactly sqrt(2) wider when real. The shipped constant was
+    the complex value for both, which UNDERSTATES the scatter and so
+    OVERSTATES the margin: the loop believes itself further from the floor
+    than it is and keeps going, fitting noise.
+    """
+    complex_ = ie.sphere_floor(8, 1024, real=False)
+    real = ie.sphere_floor(8, 1024, real=True)
+    assert complex_["scatter"] == pytest.approx(np.sqrt(2.0) / 1024)
+    assert real["scatter"] == pytest.approx(2.0 / 1024)
+    assert real["scatter"] / complex_["scatter"] == pytest.approx(np.sqrt(2.0))
+    # the floor itself does not depend on the kind - only its scatter does
+    assert real["asymmetry"] == pytest.approx(complex_["asymmetry"])
+
+
+def test_the_fit_reads_the_ensembles_kind_off_the_matrix():
+    """Not from the caller's flag. `real_parameters=True` certainly gives a
+    real matrix, but so does passing real residuals with the flag off, and
+    the scatter law follows the matrix rather than the intent."""
+    generator = np.random.default_rng(20260906)
+    real = {"a": {"frequency": generator.normal(size=256)},
+            "b": {"frequency": generator.normal(size=256)},
+            "c": {"frequency": generator.normal(size=256)}}
+    complex_ = {k: {"frequency": v["frequency"]
+                    + 1j * generator.normal(size=256)}
+                for k, v in real.items()}
+    assert ie.ellipsoid(real, "frequency")["sphere_real"] is True
+    assert ie.ellipsoid(complex_, "frequency")["sphere_real"] is False
+    # and stacking a complex ensemble as real parameters makes it real
+    assert ie.ellipsoid(complex_, "frequency",
+                        real_parameters=True)["sphere_real"] is True
 
 
 def test_the_sphere_floor_is_closed_form():

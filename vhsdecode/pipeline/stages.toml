@@ -205,7 +205,7 @@ name = "rf_eq"
 scope = "rf_block"
 stage = "rf_playback"
 axis = ["frequency"]
-gate = { option = "channel_eq", predicate = "!= 0", default = 0, alternate = "luma_eq" }
+gate = { option = "channel_eq", predicate = "!= 0", default = 1, alternate = "luma_eq" }
 site = "vhsdecode/process.py"
 anchor = "rf_eq = self.Filters.get(\"ChannelEQ\", luma_eq)"
 reads = ["indata_fft"]
@@ -240,7 +240,7 @@ name = "head_switch"
 scope = "rf_block"
 stage = "rf_playback"
 axis = ["amplitude"]
-gate = { option = "head_switch", predicate = "!= 0", default = 0 }
+gate = { option = "head_switch", predicate = "!= 0", default = 1 }
 entry = "vhsdecode.head_switch:correct"
 site = "vhsdecode/process.py"
 anchor = "head_switch.correct("
@@ -267,7 +267,7 @@ name = "baseband_eq"
 scope = "rf_block"
 stage = "rf_playback"
 axis = ["frequency"]
-gate = { option = "baseband_eq", predicate = "!= 0 and declared", default = 0.5 }
+gate = { option = "baseband_eq", predicate = "!= 0 and declared", default = 1 }
 entry = "vhsdecode.baseband_eq:correct"
 site = "vhsdecode/process.py"
 anchor = "baseband_eq.correct("
@@ -289,7 +289,7 @@ name = "luma_transient"
 scope = "rf_block"
 stage = "rf_playback"
 axis = ["time"]
-gate = { option = "luma_transient", predicate = "!= 0", default = 0 }
+gate = { option = "luma_transient", predicate = "!= 0", default = 1 }
 entry = "vhsdecode.luma_transient:correct"
 site = "vhsdecode/process.py"
 anchor = "luma_transient.correct("
@@ -317,7 +317,7 @@ name = "video_eq"
 scope = "rf_block"
 stage = "picture"
 axis = ["frequency"]
-gate = { option = "sharpness", predicate = "!= 0", default = 0 }
+gate = { option = "sharpness", predicate = "!= 0", default = 1 }
 site = "vhsdecode/process.py"
 anchor = "if self._video_eq:"
 reads = ["demod"]
@@ -486,7 +486,7 @@ name = "luma_eq_update"
 scope = "field"
 stage = "rf_playback"
 axis = ["frequency"]
-gate = { option = "luma_eq", predicate = "!= 0", default = 0 }
+gate = { option = "luma_eq", predicate = "!= 0", default = 1 }
 entry = "vhsdecode.luma_amplitude:update_luma_equalizer"
 site = "vhsdecode/field.py"
 anchor = "update_luma_equalizer("
@@ -507,7 +507,7 @@ name = "luma_transient_observe"
 scope = "field"
 stage = "rf_playback"
 axis = ["time"]
-gate = { option = "luma_transient", predicate = "!= 0", default = 0 }
+gate = { option = "luma_transient", predicate = "!= 0", default = 1 }
 site = "vhsdecode/field.py"
 anchor = "luma_transient.observe(self)"
 reads = ["amplitude_deviation"]
@@ -533,7 +533,7 @@ name = "carrier_tbc"
 scope = "field"
 stage = "picture"
 axis = ["time"]
-gate = { option = "carrier_tbc", predicate = "!= 0", default = 0 }
+gate = { option = "carrier_tbc", predicate = "!= 0", default = 1 }
 entry = "vhsdecode.carrier_tbc:refine_linelocs"
 site = "vhsdecode/field.py"
 anchor = "carrier_tbc.refine_linelocs("
@@ -588,6 +588,7 @@ components = [
   { name = "ghost", note = "the echo taps" },
   { name = "tail", note = "the dense FIR remainder the pencil cannot certify" },
   { name = "landing_bank", note = "the synthesized per-landing kernels (sidecar: landing_bank)" },
+  { name = "relaxation", note = "the back porch's recovery tail as ONE time constant - about -2.9 IRE at tau 1.05-1.08 us, polarity-common, cornering near 130 kHz; survives the ringing correction (1-7% removed) so it is a residual, not a duplicate; default off" },
 ]
 why = """The sync-derived artifact model, subtracted. Calibrated on lines
 the geometry declares measurable and - a known defect - applied to the whole

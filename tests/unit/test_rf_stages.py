@@ -402,21 +402,27 @@ def test_the_magnetics_baseline_is_reproduced_here():
 
 
 def test_the_two_stages_are_the_same_collinear_family_seen_twice():
-    """THE ANSWER TO THE COUNT. Six more members buy 0.23 of a direction:
-    1.576 of 6 becomes 1.803 of 12. Every entry but two is another monotone
+    """THE ANSWER TO THE COUNT. Six more members buy 0.81 of a direction:
+    1.576 of 6 becomes 2.391 of 12. Every entry but two is another monotone
     function of one length over the recorded wavelength, which is the law
-    that a family is collinear when its members differ only in a rate."""
+    that a family is collinear when its members differ only in a rate.
+
+    RECHARACTERISED WHEN THE PHASE WAS CARRIED. These read 1.803 of 12 at
+    condition 6.8e13 while three places in `rf_stages` discarded it - two
+    `dtype=np.float64` casts and a `log(abs(...))`. The conclusion is
+    unchanged and the arithmetic is no longer singular: 6.8e13 had no usable
+    inverse, 6.6e4 does."""
     result = rf_stages.distinguishable(RF)
     assert result["baseline"]["effective"] == pytest.approx(1.576, abs=0.02)
     assert result["with_both"]["count"] == 12
-    assert result["with_both"]["effective"] == pytest.approx(1.80, abs=0.05)
-    assert result["gain_over_the_baseline"] < 0.5
+    assert result["with_both"]["effective"] == pytest.approx(2.39, abs=0.05)
+    assert result["gain_over_the_baseline"] < 1.0
     # neither stage on its own does better
-    assert result["with_record"]["effective"] < 1.8
-    assert result["with_playback"]["effective"] < 1.9
-    # and the ensemble is rank deficient, which is the two exact nulls
-    # arriving as arithmetic
-    assert result["condition"] > 1e10
+    assert result["with_record"]["effective"] < 2.2
+    assert result["with_playback"]["effective"] < 2.2
+    # still strongly ill-conditioned - the family really is collinear - but
+    # no longer numerically singular, which is what the phase bought
+    assert 1e3 < result["condition"] < 1e7
 
 
 def test_the_two_entries_that_earn_their_place():
@@ -432,12 +438,23 @@ def test_the_two_entries_that_earn_their_place():
     for i, name in enumerate(names[6:], start=6):
         others = [coherence[i, j] for j in range(len(names)) if j != i]
         worst[name] = max(others)
-    assert worst["record level dependence"] < 0.5
-    assert worst["playback equalisation"] < 0.7
+    assert worst["record level dependence"] < 0.5          # 0.402
+    assert worst["playback equalisation"] < 0.5            # 0.412
     # while the rest are collinear with the family that already collapsed
-    assert worst["record head write response"] > 0.99
-    assert worst["record amplifier"] > 0.99
-    assert worst["playback preamplifier"] > 0.99
+    assert worst["record amplifier"] > 0.99                # 0.998
+    assert worst["playback preamplifier"] > 0.99           # 0.998
+    assert worst["playback head differentiation"] > 0.99   # 0.999
+
+    # RECORD HEAD WRITE IS THE ONE THAT MOVED, 0.99+ TO 0.910, and the
+    # distinction is worth stating because it is easy to overclaim. This is
+    # the coherence of PARAMETER-DERIVATIVE rows taken within their full
+    # stage cascades, and those cascades differ, so their phase derivatives
+    # differ. It is NOT a statement that the record transition and the
+    # playback spacing have become separable - they have not. Those two
+    # compose in the exponent so only their sum is identifiable, and
+    # `null_space` still measures them at EXACTLY 1.000000000 coherent with
+    # the phase carried, unchanged to nine decimals.
+    assert 0.85 < worst["record head write response"] < 0.95
 
 
 def test_the_two_level_dependent_record_stages_are_nearly_one_axis():
@@ -580,3 +597,56 @@ def test_the_speed_switch_decides_whether_the_extra_emphasis_runs():
     # the SP and EP record keys differ by a whole processing stage, which is
     # exactly what makes an SP-versus-EP comparison not a controlled one
     assert set(at_ep) - set(at_sp) == {nonlinear}
+
+
+def test_carrying_the_phase_did_not_move_the_null_space():
+    """THE CHECK THAT MAKES THE PHASE FIX TRUSTWORTHY.
+
+    Three places in `rf_stages` were discarding the phase, and fixing them
+    took the effective count from 1.803 to 2.391 and the condition from
+    6.8e13 to 6.6e4. The obvious worry about a change that large is that it
+    manufactured separability rather than recovering it.
+
+    It did not, and this is how that is known: every exact null the module
+    measures is EXACTLY unmoved. The record transition and the playback
+    spacing compose in the exponent, so only their sum is identifiable and
+    their coherence must be exactly one; the emphasis pair are exact
+    negatives and must be exactly one; and every split residual must be
+    exactly zero. If the phase were leaking separability into the ensemble,
+    these would be the first numbers to sag.
+    """
+    baseband = np.linspace(1e4, 5e6, 1024)
+    result = rf_stages.null_space(RF, baseband)
+    assert result["wavelength_loss_coherence"] == pytest.approx(1.0, abs=1e-9)
+    assert result["emphasis_pair_coherence"] == pytest.approx(1.0, abs=1e-9)
+    for name in ("wavelength_split_residual_nepers",
+                 "flat_gain_split_residual_nepers",
+                 "emphasis_pair_residual_nepers"):
+        assert result[name] == pytest.approx(0.0, abs=1e-9), name
+    assert result["pure_delay_split_residual_radians"] == pytest.approx(
+        0.0, abs=1e-9)
+    # And the one that is near but not exactly one is unmoved too. It is
+    # BAND-DEPENDENT, and the value belongs to this test's own RF grid:
+    # 0.99939 over 0.5-8.0 MHz against 0.99887 over 0.5-12 MHz. Quoting the
+    # wrong band's figure is how this assertion first failed.
+    assert result["band_limit_coherence"] == pytest.approx(0.9993858, abs=1e-6)
+
+
+def test_the_builders_actually_carry_a_phase():
+    """The fixes above are only worth anything if there is a phase to carry.
+    Every loss-type entry is minimum phase and none of them is real."""
+    carried = {
+        "record amplifier": rf_stages.record_amplifier(RF),
+        "record head write": rf_stages.record_head_write(RF),
+        "playback head differentiation": rf_stages.playback_head_differentiation(RF),
+        "playback preamplifier": rf_stages.playback_preamplifier(RF),
+        "playback equalisation": rf_stages.playback_equalisation(RF),
+    }
+    for name, value in carried.items():
+        assert np.iscomplexobj(value), name
+        assert np.abs(np.angle(value)).max() > 0.1, name
+
+    # and the escape hatch reproduces the old magnitude-only value exactly
+    plain = rf_stages.record_head_write(RF, minimum_phase=False)
+    assert np.abs(np.angle(plain)).max() == pytest.approx(0.0, abs=1e-12)
+    assert np.allclose(np.abs(plain), np.abs(carried["record head write"]))

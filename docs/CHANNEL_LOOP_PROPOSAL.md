@@ -1490,3 +1490,394 @@ first, ship if it converges". It converges. The picture stage today
 identifies by matrix pencil and stops on a slot budget; this identifies by
 DCT and stops on the residual, and reaches a floor the stage does not
 currently reach.
+
+### Random RF noise in the complex plane (2026-09-04)
+
+Ethan: *"I think I can represent the final residual using a random noise
+distribution theorem. If we have a residual after all of our modeling steps
+what remains, if above [the] chain's result, is unknown and likely random.
+I want to remove the model of random RF noise in the complex plane."*
+
+`tools/ringing_measure/rf_noise.py`. The point is that the floor a
+derivation stops at should be PREDICTED, not fitted. Every stopping rule in
+this arc so far compared the residual against the accumulated cross-line
+variance - an empirical scalar, which is a measurement of the residual by
+another name and cannot say whether what is left is noise or merely small.
+
+**The theorem.** Thermal and front-end noise on the RF is circularly
+symmetric complex Gaussian, and three things follow without fitting
+anything: the envelope is Rayleigh, the phase is uniform, and against a
+carrier the noise resolves into an amplitude part of variance sigma^2 and a
+phase part of variance sigma^2/A^2. The demodulator differentiates the
+phase, so a flat phase noise becomes a demodulated density rising as f^2 -
+the triangular noise every FM system has.
+
+**Checked against realisations rather than asserted**, at three noise
+levels: envelope mean 0.0250 against the Rayleigh 0.0251, squared envelope
+0.00080 against 2 sigma^2 = 0.00080, phase spread 1.8156 against the
+uniform 1.8138, spectrum slope 1.95 against the law's 2.00, and the level
+predicted to within 0.7 per cent with nothing tuned.
+
+**"Remove the model" cannot mean subtracting a waveform.** The phase being
+uniform IS the statement that no realisation is knowable. What is
+subtracted is the predicted POWER, band by band, and what remains is the
+only part that can be modelled at all.
+
+**A trap worth the record.** The first comparison read the law as wrong by
+a factor of 0.690 - and it was 0.690, 0.690, 0.691 at three different noise
+levels, which should have said "a constant, not physics" immediately. It is
+ln(2): a periodogram bin of Gaussian noise is EXPONENTIALLY distributed, so
+its median is 0.693 of its mean, and I was comparing a measured median
+against a predicted mean. Compare means to means. The bins are exponential
+to within a per cent - normalised power sd 0.991 against 1, and 4.82 per
+cent above three times the mean against exp(-3) = 4.98 - so the
+discrepancy was the distribution confirming itself.
+
+**Applied to the sync-pulse derivation**, replacing the scalar floor:
+
+  head A, C/N 44.6 dB              head B, C/N 43.9 dB
+  pass  residual  at the floor     pass  residual  at the floor
+   1    2.6842    75%               1    2.6122    75%
+   4    1.1617    81%               4    1.1346    82%
+   7    0.6420    91%               7    0.6137    93%
+
+The share of bands at their predicted floor climbs as the residual falls,
+which is the behaviour a correct floor has. The empirical scalar declared
+the derivation finished at pass 6; the predicted floor says 91 to 93 per
+cent of bands have reached it and the rest have not. It is the stricter and
+more informative rule, and it is the one that answers "is this noise?"
+rather than "is this small?".
+
+**One error on the way, and its signature.** The first application read
+about 65 per cent of bands above the floor at EVERY pass, unmoved while the
+residual fell by a factor of four. A share that does not move as the
+residual falls is a mis-scaled floor, not remaining structure. The cause:
+sigma/A was inverted from the measured variance over 0 to Nyquist, when
+under the f^2 law the variance is dominated by the top of whatever band the
+noise actually occupies - and the decoded luma is limited to about 3 MHz,
+not 7.16. Corrected, the carrier-to-noise reads 44 dB rather than an
+implausible 54, and the share moves.
+
+### The constants, the band, and the geometry (2026-09-04)
+
+Ethan: *"I think these constants are significant. Search for existing
+theories that can explain these constants ... Additionally we can try
+inverting over the Nyquist band. Does this reduce down to a hyper cube
+essentially, multi dimensional complex shape?"*
+
+**THE THEORY IS ALREADY NAMED IN HIS OWN PROPOSAL.** The constants are not
+incidental - every one of them belongs to the same body of work the
+Appendix cites, and they are the constants of MAXIMUM ENTROPY and SPHERE
+PACKING:
+
+  ln 2 = 0.6931    the median of an exponential over its mean. The
+                   exponential is the maximum-entropy distribution for a
+                   fixed mean on the half-line, which is exactly why a
+                   periodogram bin of Gaussian noise has it - and ln 2 is
+                   the same constant that converts nats to bits.
+  pi/sqrt(3)       the standard deviation of a uniform phase. The uniform
+                   distribution is maximum-entropy on the circle, which is
+                   the formal statement that the noise carries no
+                   direction and no realisation of it is knowable.
+  sqrt(pi/2)       the Rayleigh mean over its scale - the envelope of a
+                   circular complex Gaussian, itself maximum-entropy for
+                   fixed power.
+  chi-square 2N    the distribution of an averaged periodogram, and the
+                   reason a bound rather than a level decides whether a
+                   band stands above its floor.
+
+The circular complex Gaussian being maximum-entropy for a given power is
+the load-bearing one: it is the WORST-CASE noise, which is what makes it a
+floor at all rather than merely a description. That is Shannon's Gaussian
+channel, and the Cramer-Rao bound and the root-N averaging law are its
+estimation-theory companions - all three already listed in the Appendix.
+
+**INVERTING OVER THE NYQUIST BAND.** Tried, and it exposed something
+larger. The residual's own spectrum FALLS with frequency - local slopes of
+-6.2, +0.1, +1.1, -0.9 - where the unshaped law predicts a steady +2. That
+is not the law failing; it is the law evaluated at the wrong point in the
+chain. De-emphasis exists precisely to flatten the demodulator's triangular
+noise, and the residual is measured after it, so the prediction has to be
+carried through the same de-emphasis the signal was. `through_deemphasis`
+does that now. (Written first with the shelf inverted, which put a NINE
+DECIBEL BOOST where de-emphasis exists to cut - the tell being that the
+"de-emphasis" made the predicted noise larger exactly where it should make
+it smaller.)
+
+**AND THE FLOOR WAS WRONG BY A FACTOR OF 45.** Chasing the band question
+found it. The residual is the mean of an accumulated fold - 252 lines a
+field over 8 fields, 2016 lines - but it was being stopped against the
+CROSS-LINE variance, which is the noise of ONE line:
+
+  cross-line noise, per line          0.9218 IRE
+  noise of the MEAN, that over root N 0.0205 IRE
+  where the derivation stopped        0.6420 IRE
+
+So the residual sits 31 times above the floor of the average it is measured
+on, and the rule was stopping it about 45 times early. Root-N is the whole
+reason for accumulating in the first place, and the stopping rule was
+throwing the benefit away. There is substantially more structure
+recoverable than the derivation has been allowed to take.
+
+**THE HYPERCUBE: yes, and the shape it contains is a sphere.** Each
+component carries a COMPLEX amplitude, so K components span d = 2K real
+dimensions. The resolution limits are independent per axis - an amplitude
+step, a frequency bin, a time sample - so the reachable set is a product of
+intervals, a HYPERCUBE. The noise is circularly symmetric in every
+component, so its level sets are isotropic: a HYPERSPHERE inscribed in it.
+
+  K components   d dims   sphere / cube volume
+       1            2          0.785
+       3            6          0.081
+       6           12          3.3e-04
+      12           24          1.2e-10
+      34           68          9.2e-43
+
+The sphere fills less and less of the cube. At six components the noise
+occupies three hundredths of a per cent of the space the resolution allows;
+at the 34 the DCT rank found on the sync pulse, unmeasurably little. THAT
+IS WHY A MULTI-DIMENSIONAL DERIVATION SEPARATES WHAT A THRESHOLD CANNOT -
+not because any single axis discriminates better, but because noise and
+structure occupy geometrically different fractions of the space, and the
+gap widens with every axis added.
+
+And the noise does not fill its ball: Gaussian noise concentrates on a thin
+shell at radius sigma*root d. Signal points are separable exactly when
+their shells do not overlap, which is Shannon's sphere-packing argument for
+capacity - the same theorem, arrived at from the residual's own geometry.
+
+### The derivation run to the real floor (2026-09-04)
+
+The stopping rule is corrected and the process continued against it.
+
+**THE FLOOR WAS WRONG BY 45x.** The residual is the mean of an accumulated
+fold - 252 lines a field over 8 fields, 2016 lines - and it was being
+stopped against the CROSS-LINE variance, which is the noise of ONE line.
+Root-N is the entire reason for accumulating and the rule was discarding
+it:
+
+  cross-line noise, per line            0.9218 IRE
+  noise of the MEAN, that over root N   0.0205 IRE
+
+**WHAT THE PROCESS FINDS WITH THE FLOOR CORRECTED.** Fitting the support
+and every amplitude on one half and judging on the other:
+
+  head A   11.17 IRE -> 0.1181 held-out, 144 components over 25 passes
+  head B   10.95 IRE -> 0.1769 held-out, 144 components over 24 passes
+
+Against the 0.6420 it used to stop at, that is a further factor of five,
+and it reaches 5.7 to 8.4 times the floor of the mean. WHAT STOPS IT IS NOT
+THE NOISE - it is generalisation: the pass where the held-out residual
+stops falling while the fitted one keeps going is the pass that began
+learning its own noise, and the process is halted one pass earlier.
+
+**THE JOINT SOLVE OVER THE FULL SUPPORT DOES NOT GENERALISE, AND I CANNOT
+YET SAY WHY.** Re-solving all 144 components together against the original
+residual - which is what "corrected as a whole" asks for - drives the
+FITTED residual to exactly 0.0000 and the held-out to 1.62 IRE, against
+0.118 for the sequential passes. Sequential wins at every depth tested,
+from 24 components upward.
+
+Two explanations were tested and BOTH ARE FALSE:
+
+  ill-conditioning   the basis condition number is 11.8, which is well
+                     conditioned, and a ridge scanned over eleven decades
+                     never beats sequential - the best is at lambda -> 0
+  aliasing           fitting on every other sample halves the Nyquist the
+                     fit sees, so a component above quarter-rate would be
+                     unconstrained between samples. None is: the
+                     identified frequencies are 0.07 to 0.25 MHz against
+                     an even-sample Nyquist of 3.58 MHz
+
+So the empirical fact stands - sequential deflation generalises far better
+here - and the mechanism is not established. The next test is the one my
+hold-out design does not currently do: SPLIT FIELDS, NOT SAMPLES. Holding
+out alternate samples of one accumulated profile is not an independent
+measurement of the same thing; holding out half the FIELDS and folding
+each half separately is, and it preserves the sampling grid. Until that is
+run, "the whole support cannot be solved as a whole on a 200 sample
+window" is a description of what happened and not an explanation of it.
+
+**WHAT THIS POINTS AT.** 144 components in quadrature is 289 parameters
+against a 200 sample interval, and no amount of care makes a window
+determine more than it holds. The luma lane's arithmetic is the way past
+it: the sync pulse spans 4.7 us and resolves 213 kHz, while the vertical
+interval spans 572 us and resolves 1.7 kHz - a factor of 122 in span, and
+the same factor in how many components the window can support.
+
+### Taking the limit (2026-09-04)
+
+Ethan: *"I think we are finding the parametric fit but at a higher
+dimension, so we need to take the limit at this point."*
+
+Right, and choosing a pass to stop at answers the wrong question. The
+held-out sequence itself converges, and ITS limit is the quantity: what
+this model class leaves on this window however many dimensions it is given.
+Two laws fitted to the sequence, `r(K) = L + A K^-p` and
+`L + A exp(-K/tau)`, with L the limit in both.
+
+  head A   power law  L = 0.000, fit residual 0.151
+           geometric  L = 0.132 IRE, fit residual 0.072   (6.4x the floor)
+  head B   power law  L = 0.000, fit residual 0.110
+           geometric  L = 0.218 IRE, fit residual 0.069   (9.8x the floor)
+
+The geometric law fits about twice as well, but **the two disagree
+completely - zero against six times the floor - and that disagreement is
+the result**: the sequence has not entered its asymptotic regime after 24
+passes, so the extrapolation is not yet supported by it. Reporting the
+better-fitting law's number alone would have been a figure with no evidence
+behind it.
+
+(Unbounded, the power law first returned a limit of MINUS 1.21 IRE - an rms
+cannot be negative - and the verdict logic read that as comfortably below
+the floor and declared the model class complete. A fit free to go
+unphysical will, and a comparison that does not check the sign will believe
+it. The limit is now bounded at zero.)
+
+**ROOT-N VERIFIED, AND THE GAP DOES NOT CLOSE.** Accumulating the same head
+from two, four and eight fields:
+
+  fields   floor of the mean   held-out reached   geometric limit
+     2          0.04225             0.2899        0.347   (8.2x floor)
+     4          0.02947             0.2715        0.355   (12.1x floor)
+     8          0.02053             0.1609        0.163   (7.9x floor)
+
+The floor falls by 0.698 and 0.697 per doubling against the 0.707 root-N
+predicts - exact. The achieved residual improves with fields too. But THE
+RATIO STAYS AT EIGHT TO TWELVE TIMES THE FLOOR and does not trend toward
+one.
+
+So the gap is not a data shortage. More fields lower the floor and the
+achieved residual together, leaving the ratio where it was, which means the
+limit is set by the MODEL CLASS AND THE WINDOW rather than by the noise:
+144 components in quadrature is 289 parameters against a 200 sample
+interval, and no accumulation makes a window determine more than it holds.
+
+The way past it is the one the luma lane's arithmetic already gives: the
+sync pulse spans 4.7 us and resolves 213 kHz; the vertical interval spans
+572 us and resolves 1.7 kHz. A factor of 122 in span, and with it in how
+many components the window can carry.
+
+### The phase, and what actually fills the gap (2026-09-04)
+
+Ethan: *"I think we still need to find the phase ... Consider the complex
+relationship while taking the limit if that is not already done."*
+
+It was not. Everything until now fitted a REAL profile with a cosine and a
+sine column per component, which recovers a phase implicitly but never
+carries one - the residual had no phase of its own for anything to be
+compared against. The residual is now its analytic signal, and a component
+is ONE COMPLEX COLUMN whose coefficient carries magnitude and phase
+together.
+
+**THE PHASE REPRODUCES, EXACTLY.** The test that means anything is not
+comparing a component's phase from one pass to the next - each pass
+identifies a different frequency set, so matching by index compares
+unrelated things, and that broken measure gave 0.16, 0.51, 0.42, 0.28 and
+read as an incoherent phase. The right test folds the SAME head from two
+DISJOINT HALVES of its fields, chooses the support on the first half only,
+and fits both:
+
+  head A   8 of 8 components hold within a quarter turn, resultant 1.000
+  head B   8 of 8, resultant 1.000
+
+Phase differences of -0.01 to -0.09 radians, and amplitudes agreeing to
+about six per cent. Circular noise has no preferred phase, so this is the
+discriminator: these components have a real phase and are not the fit
+chasing noise.
+
+**BUT THEY ARE NOT SEPARATE COMPONENTS.** The identified frequencies are
+0.072, 0.107, 0.143, 0.179, 0.215, 0.251, 0.286 MHz - spacings of 0.035,
+0.036, 0.036, 0.036, 0.036, 0.035. That is the DCT's own bin spacing on a
+200 sample window (35.8 kHz), so they are CONSECUTIVE BINS. The derivation
+is not finding seven resonances; it is spending seven basis functions
+describing one smooth object lying between them.
+
+**AND THE CANDIDATE CURVES SAY WHAT THAT OBJECT IS.** Fitted to the excess
+over the predicted noise floor, scored in the log so no single bin decides:
+
+  head A   relaxation log-rms 2.177 (corner 269 kHz)   flicker 3.781   white 4.322
+  head B   relaxation log-rms 1.003 (corner 191 kHz)   flicker 2.029   white 2.857
+
+A SINGLE RELAXATION fits best on both heads, and its corner - 191 to 269
+kHz - is the back-porch recovery tail measured independently this week at
+tau 1.22 to 1.34 us and a 260 kHz peak, and reported by the chroma lane at
+tau ~1.5 us peaking 0.1 to 0.3 MHz. Three instruments, one object.
+
+**SO THE GAP IS NOT UNREACHABLE STRUCTURE - IT IS A PARAMETRISATION
+MISMATCH.** The residual sits eight to twelve times the floor because a
+damped-sinusoid basis is the wrong shape for a single relaxation, and pays
+for it in components: seven consecutive bins to say what one time constant
+says. Adding the relaxation as an explicit component - one parameter, not
+seven - is the change that follows, and it is the same object the luma lane
+wants entered at chain position 6.
+
+
+---
+
+# Ethan's statements, 2026-09-06 — SAID TWICE, and both are directives
+
+Recorded here because he has had to say each of these twice, which is a
+failure of this record rather than of the statement. Verbatim, with the
+earlier occurrence of each cited so the pair reads as one instruction.
+
+## 1. The burst is locked ABSOLUTELY to the sync pulse
+
+> it is directly tied to frequency, i.e. burst is a constant phase, and
+> time is known across the period of the burst, it should be locked
+> absolutely to the sync pulse with in the field by comparing the position
+> relative to the position in the burst
+
+FIRST SAID (this file, "On the vertical sync and the phase lock"):
+
+> What if I am at the step where I am using the vertical sync to get the
+> long equalization? I think the color burst to sync pulse phase
+> relationship determines the phase lock exactly. Add that as an
+> additional component to use
+
+**WHAT IT MEANS, and why the earlier reading was not enough.** This lane
+had settled on "the burst's phase is absolute and its amplitude is not",
+which is true and is only half of it. The stronger statement is that the
+burst's phase and the sync pulse's POSITION are the same measurement in
+two units:
+
+  * the burst is a CONSTANT PHASE - the specification fixes it, so any
+    departure is the channel's, not the signal's;
+  * TIME IS KNOWN ACROSS THE BURST - it is a gated subcarrier of known
+    frequency, so phase and elapsed time are interchangeable within it,
+    which is the "directly tied to frequency" clause: phi = 2 pi f t makes
+    phase, frequency and time one relation and not three;
+  * therefore the burst's phase, read against the sync pulse's position,
+    is an ABSOLUTE lock WITHIN THE FIELD - not a per-line relative
+    measurement that has to be integrated up.
+
+The operative words are "absolutely" and "within the field". A per-line
+burst phase drifts because each line's own timing is unknown; the burst
+POSITION relative to the SYNC POSITION does not, because both are read on
+the same line against the same clock. That comparison is the component he
+is asking for.
+
+## 2. The sync pulse shape is a COMPONENT WITH ALL THREE PARTS
+
+> the luma one about noise and it's relationship to the sync pulse shape.
+> the shape is a component with all parts, amplitude, frequency, time
+
+FIRST SAID (this file, on the band limit):
+
+> The luma and chroma are band limited, so the data outside this
+> bandlimited area is noise, that can use as the differential
+
+**WHAT IT MEANS.** The sync pulse's shape is not an amplitude object that
+happens to have a spectrum. It is one component carried on all three axes
+at once - amplitude, frequency and time - which is the same three-axis
+model `docs/THE_ALGORITHM.md` already states for everything else, applied
+to the pulse itself. So the pulse shape must be measured, differenced and
+corrected on all three, and a treatment that reads only its amplitude
+profile has measured a third of it.
+
+The noise clause is the other half: the luma is band limited, so whatever
+lies outside that band is noise BY CONSTRUCTION, and it is usable as the
+differential rather than being something to discard. The noise and the
+shape are related through the band - the shape occupies the band, the
+noise is what is outside it, and the boundary between them is a format
+constant rather than a threshold to be chosen.

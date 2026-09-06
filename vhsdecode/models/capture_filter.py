@@ -45,29 +45,43 @@ exactly: a sample-and-hold of aperture equal to the sample period has
 response `sinc(f/fs)`, -3.92 dB at Nyquist, with no parameters at all. It is
 the yardstick because it is FIXED.
 
-AND THE CONTROL SAYS THE TWO ARE NOT SEPARABLE ON THIS EVIDENCE. A first
-version of this docstring argued that a sinc and a pole cascade differ in
-KIND - the sinc has nulls and linear phase, the cascade has neither - and are
-therefore well separated by the separability law. `separability` was written
-to demonstrate that and REFUTED IT. Measured over 0.05 to 0.99 of Nyquist,
-the aperture's coherence against Butterworth cascades is
+THE TWO DIFFER IN KIND AND ARE SEPARABLE - BUT NOT BY THIS EVIDENCE, AND THE
+DIFFERENCE BETWEEN THOSE TWO STATEMENTS IS THE WHOLE POINT.
 
-    2 poles 0.9965    4 poles 0.9692    6 poles 0.9511    8 poles 0.9413
+This took three passes to get right and the wrong turns are kept because they
+are instructive. The first version argued that a sinc and a pole cascade
+differ in KIND - the sinc has nulls and linear phase, the cascade has neither
+- and are therefore well separated. `separability` was written to demonstrate
+that and appeared to REFUTE it, reporting the aperture 0.94 to 0.997 coherent
+with Butterworth cascades, as collinear with them as they are with each
+other. That refutation was recorded and the claim withdrawn.
 
-against 0.955 to 0.999 for the cascades among THEMSELVES, which differ only
-in a rate. The aperture is as collinear with them as they are with each
-other. The reason is that the sinc's distinguishing features are outside the
-evidence: its first null is at `fs`, which is twice Nyquist and so beyond
-every frequency the capture holds, and its linear phase is absent from a
-magnitude-only noise spectrum. Within the band and on magnitude alone it is
-simply a gentle low-pass, and gentle low-passes are all alike.
+THE CONTROL WAS ITSELF THE DEFECT. It compared LOG MAGNITUDES only, so it was
+measuring the one half in which a sinc and a pole cascade genuinely do look
+alike - both are smooth, monotone and gentle below Nyquist. Carrying the
+phase each actually has, the same comparison over the same band reads
 
-WHAT THAT COSTS, STATED PLAINLY: the order below is CONDITIONAL on the
-aperture being exactly the assumed `sinc(f/fs)`. It is not independently
-identified, and it cannot be from a magnitude spectrum below Nyquist. Two
-things would break the degeneracy and neither is available here - the phase,
-which the noise floor does not carry, or evidence above Nyquist, which is
-where the sinc's null lives and which no capture at this rate can reach.
+    2 poles 0.4038    4 poles 0.4916    6 poles 0.5154    8 poles 0.5239
+
+against 0.934 to 0.999 for the cascades among themselves. The aperture is
+plainly a different kind of object and the cascades are plainly one family
+differing in a rate, which is the separability law reading exactly as it
+should. The original claim was right; the instrument that appeared to refute
+it was blind in the half that carries the answer.
+
+The KIND difference is specific and derivable rather than asserted: a
+sample-and-hold is a half-sample delay, so its phase is exactly LINEAR,
+`-pi f / fs`. A pole cascade is minimum phase, so its phase follows its own
+magnitude. Those cannot be confused once both are looked at.
+
+AND THE ORDER BELOW IS STILL CONDITIONAL, FOR A DIFFERENT REASON THAN FIRST
+RECORDED. Not because the two are collinear - they are not - but because THE
+EVIDENCE HERE IS A NOISE POWER SPECTRUM, and a power spectrum has no phase at
+all. The half that separates them is exactly the half a noise floor cannot
+supply. So the fitted order remains conditional on the aperture being the
+assumed `sinc(f/fs)`, and the way to break that is not a better fit but a
+different measurement: a phase-bearing probe through the same path, or
+evidence above Nyquist where the sinc's null lives.
 
 THE FIT, on the floor above, over 5 to 19.9 MHz, 6104 points:
 
@@ -306,18 +320,38 @@ def separability(sample_rate_hz: float, corner_hz: float,
     expected to be strongly coherent with each other; that contrast is what
     makes the aperture's low coherence meaningful rather than a scale.
     """
+    from scipy.signal import hilbert
+
     grid = np.linspace(0.05 * nyquist_hz(sample_rate_hz),
                        0.99 * nyquist_hz(sample_rate_hz), 1024)
 
-    def shape(values):
-        logged = np.log(np.maximum(np.abs(values), 1e-30))
-        logged = logged - logged.mean()
-        norm = float(np.linalg.norm(logged))
-        return logged / norm if norm > 0 else logged
+    def shape(log_magnitude, phase):
+        """A unit shape carrying BOTH parts, stacked real-then-imaginary.
 
-    aperture = shape(aperture_response(grid, sample_rate_hz))
-    poles = {n: shape(butterworth_magnitude(grid, corner_hz, n))
-             for n in orders}
+        The first version of this took only the log magnitude, which is why
+        it reported the two as collinear - it was measuring the one half in
+        which they genuinely do look alike.
+        """
+        vector = np.concatenate([log_magnitude - log_magnitude.mean(),
+                                 phase - phase.mean()])
+        norm = float(np.linalg.norm(vector))
+        return vector / norm if norm > 0 else vector
+
+    aperture_log = np.log(np.maximum(
+        np.abs(aperture_response(grid, sample_rate_hz)), 1e-30))
+    # A SAMPLE-AND-HOLD IS A HALF-SAMPLE DELAY, so its phase is exactly
+    # LINEAR in frequency: -pi f / fs. That is the KIND difference, and it is
+    # derived rather than Hilbert-transformed because a sinc is not minimum
+    # phase and the minimum-phase relation would be the wrong construction
+    # for it.
+    aperture = shape(aperture_log, -np.pi * grid / float(sample_rate_hz))
+
+    poles = {}
+    for n in orders:
+        logged = np.log(np.maximum(
+            butterworth_magnitude(grid, corner_hz, n), 1e-30))
+        # a pole cascade IS minimum phase, so its phase follows its magnitude
+        poles[n] = shape(logged, -np.imag(hilbert(logged)))
     against = {f"{n} poles": float(abs(aperture @ v)) for n, v in poles.items()}
     names = list(poles)
     among = [float(abs(poles[a] @ poles[b]))

@@ -7,6 +7,8 @@ Ethan: "The 'dimensions' are the Weiner transform of each complex pair
 import numpy as np
 import pytest
 
+from vhsdecode.models import burst_instrument as bi
+from vhsdecode.models import composite_channel as cc
 from vhsdecode.models import information_extrapolation as ie
 from vhsdecode.models import pair_dimension as pd
 
@@ -206,3 +208,186 @@ def test_a_complex_pair_keeps_its_negative_frequencies():
     real = pd.pair_transfer(np.cos(2 * np.pi * 1e6 * t),
                             np.cos(2 * np.pi * 1e6 * t) * 0.5, segments=4)
     assert real["transfer"].size == n // 4 // 2 + 1
+
+
+# --------------------------------------------------------------------------
+# The AMPLITUDE dimension of the burst pair
+#
+# The burst is specified in all three dimensions, and until `burst_amplitude`
+# existed this module measured two of them. The transfer is the frequency
+# dimension - it says how the channel is shaped and carries whatever common
+# gain the two sides differ by without ever naming it against the standard -
+# and on the colour-under path the whole of that gain is the record-side
+# doubler of SMPTE 32M clause 3.9.2.1.3.
+# --------------------------------------------------------------------------
+
+RATE = 40e6
+LENGTH = 4096
+
+
+def _specified_burst(**kwargs):
+    return pd.spec_burst(RATE, LENGTH, **kwargs)
+
+
+def test_the_record_side_doubler_is_the_whole_of_the_transfer_gain():
+    """A UNITY channel carrying nothing but the specified doubler reads as a
+    factor of two in the transfer, because the synthetic side is the
+    composite specification and the composite has not been doubled."""
+    doubler = 10.0 ** (cc.BURST_DOUBLER_DB / 20.0)
+    got = pd.burst_dimension(_specified_burst() * doubler, RATE)
+    live = got["coherence"] > 0.9
+    assert np.abs(got["transfer"][live]).mean() == pytest.approx(doubler,
+                                                                 rel=1e-9)
+    # and the amplitude dimension names it and takes it out
+    assert got["amplitude"]["ratio"] == pytest.approx(1.0, rel=1e-12)
+    assert got["amplitude"]["agrees"]
+    assert got["amplitude"]["chroma_referred_ire"] == pytest.approx(
+        pd.BURST_AMPLITUDE_IRE, rel=1e-12)
+
+
+def test_leaving_the_doubler_in_is_a_clean_factor_of_two():
+    doubler = 10.0 ** (cc.BURST_DOUBLER_DB / 20.0)
+    measured = _specified_burst() * doubler
+    left_in = pd.burst_amplitude(measured, RATE, doubler_applied=False)
+    assert left_in["ratio"] == pytest.approx(doubler, rel=1e-12)
+    # the standard allows the doubler +/- 0.5 dB and nothing more, so a
+    # whole factor of two is outside its own tolerance and must be refused
+    assert not left_in["agrees"]
+    assert left_in["tolerance_linear"] == pytest.approx(
+        10.0 ** (cc.BURST_DOUBLER_TOLERANCE_DB / 20.0), rel=1e-12)
+
+
+def test_the_doubler_tolerance_is_the_error_bar_and_not_a_chosen_threshold():
+    """The standard's own +/- 0.5 dB is what decides `agrees`, so a burst
+    inside the tolerance is accepted and one just outside it is not."""
+    tolerance_db = cc.BURST_DOUBLER_TOLERANCE_DB
+    for offset_db, expected in ((0.0, True), (tolerance_db * 0.9, True),
+                                (-tolerance_db * 0.9, True),
+                                (tolerance_db * 1.1, False),
+                                (-tolerance_db * 1.1, False)):
+        measured = _specified_burst() * 10.0 ** (
+            (cc.BURST_DOUBLER_DB + offset_db) / 20.0)
+        assert pd.burst_amplitude(measured, RATE)["agrees"] is expected
+
+
+def test_the_amplitude_is_one_complex_gain_so_the_phase_is_not_discarded():
+    """`|g|` is the amplitude and `arg g` is the time, out of one operation,
+    because they are one number. A magnitude-only fit would see nothing at
+    all here - which is the reduction that made an earlier burst instrument
+    rank two of four."""
+    reference = _specified_burst()
+    for degrees in (0.0, 30.0, 90.0, -45.0, 179.0):
+        got = pd.burst_amplitude(reference * np.exp(1j * np.deg2rad(degrees)),
+                                 RATE, doubler_applied=False)
+        assert abs(got["gain"]) == pytest.approx(1.0, rel=1e-12)
+        assert got["phase_deg"] == pytest.approx(degrees, abs=1e-9)
+        assert got["seconds"] == pytest.approx(
+            degrees * got["per_degree_s"], rel=1e-12)
+    # a degree of subcarrier is 0.776 ns, the same clock burst_instrument uses
+    assert pd.burst_amplitude(reference, RATE)["per_degree_s"] * 1e9 == \
+        pytest.approx(0.776, abs=0.002)
+
+
+def test_a_real_measurement_is_made_analytic_before_it_is_projected():
+    """THE SECOND FACTOR OF TWO. A real cosine projected onto a complex
+    exponential returns half its amplitude, which is the same size as the
+    doubler and the opposite sign, so the two would cancel and leave a
+    level that is right for the wrong reason."""
+    reference = _specified_burst()
+    real_only = np.real(reference)
+    made_analytic = pd.burst_amplitude(real_only, RATE, doubler_applied=False)
+    assert abs(made_analytic["gain"]) == pytest.approx(1.0, rel=2e-3)
+    # what `astype` alone would have given, which is the error being avoided
+    naive = abs(complex(np.vdot(reference, real_only.astype(np.complex128))
+                        / np.vdot(reference, reference).real))
+    assert naive == pytest.approx(0.5, rel=2e-3)
+    assert pd.analytic(reference) is not reference
+    assert np.allclose(pd.analytic(reference), reference)
+
+
+def test_the_level_does_not_depend_on_how_much_blanking_the_window_holds():
+    """A mean of magnitudes is a level per sample of window; a projection
+    onto the specified burst is a level."""
+    reference = _specified_burst()
+    tight = pd.burst_amplitude(reference, RATE, doubler_applied=False)
+    padded = pd.burst_amplitude(
+        np.concatenate([reference, np.zeros(3 * LENGTH, dtype=complex)]),
+        RATE, doubler_applied=False)
+    assert abs(padded["gain"]) == pytest.approx(abs(tight["gain"]), rel=1e-12)
+    # the mean-of-magnitudes reading of the same two windows differs by the
+    # window ratio exactly, which is why the projection is used
+    ratio = (np.abs(reference).mean()
+             / np.abs(np.concatenate([reference,
+                                      np.zeros(3 * LENGTH)])).mean())
+    assert ratio == pytest.approx(4.0, rel=1e-12)
+
+
+def test_the_two_instruments_in_the_tree_disagree_and_the_pair_is_the_point():
+    """`burst_instrument.amplitude` reads `2 mean|envelope|` and this reads a
+    projection. On a perfect burst they differ by the mean-to-peak of the
+    specified raised-cosine gate, and off it by the window ratio - so they
+    are two independent measurements that can disagree, which is what a pair
+    is for."""
+    doubler = 10.0 ** (cc.BURST_DOUBLER_DB / 20.0)
+    measured = _specified_burst() * doubler
+    projection = pd.burst_amplitude(measured, RATE)["chroma_referred_ire"]
+    assert projection == pytest.approx(pd.BURST_AMPLITUDE_IRE, rel=1e-12)
+    # over the whole window the mean falls as the window grows
+    wide = bi.amplitude(measured)["chroma_referred"]
+    half = bi.amplitude(measured[:LENGTH // 2])["chroma_referred"]
+    assert half == pytest.approx(2.0 * wide, rel=1e-9)
+    # on the burst's own support the disagreement is the gate's mean-to-peak
+    support = np.flatnonzero(np.abs(_specified_burst()) > 0.0)
+    on_support = bi.amplitude(measured[support[0]:support[-1] + 1])
+    gate = np.abs(_specified_burst()[support[0]:support[-1] + 1])
+    assert on_support["chroma_referred"] / projection == pytest.approx(
+        gate.mean() / gate.max(), rel=1e-9)
+
+
+def test_the_residual_says_when_a_believable_ratio_is_still_wrong():
+    """One complex gain describes a burst that has only been scaled and
+    rotated. A channel that has changed its SHAPE returns a ratio inside
+    the tolerance and a residual that is no longer small, so the pair can
+    disagree in a way a bare ratio cannot show."""
+    reference = _specified_burst()
+    clean = pd.burst_amplitude(reference, RATE, doubler_applied=False)
+    assert clean["residual_fraction"] < 1e-20
+    # the same level, delivered with the burst's shape changed
+    shifted = np.roll(reference, 8)
+    moved = pd.burst_amplitude(shifted, RATE, doubler_applied=False)
+    assert moved["residual_fraction"] > 0.1
+
+
+def test_the_amplitude_dimension_is_added_beside_the_transfer_not_folded_in():
+    """Nothing above it moves: the transfer still measures the channel's
+    shape against the composite specification, doubler and all."""
+    got = pd.burst_dimension(_specified_burst() * 0.7 * np.exp(1j * 0.3), RATE)
+    live = got["coherence"] > 0.9
+    assert np.abs(got["transfer"][live]).mean() == pytest.approx(0.7, rel=1e-6)
+    assert np.angle(got["transfer"][live].mean()) == pytest.approx(0.3,
+                                                                   abs=1e-6)
+    assert set(got) >= {"transfer", "coherence", "standard_error",
+                        "reference", "absolute_phase", "amplitude"}
+    # a 0.7 channel whose burst still carries the doubler is a chroma level
+    # of 0.35 of the specification, which is the number the picture wants
+    assert got["amplitude"]["ratio"] == pytest.approx(0.7 / (
+        10.0 ** (cc.BURST_DOUBLER_DB / 20.0)), rel=1e-9)
+    assert got["amplitude"]["phase_deg"] == pytest.approx(np.degrees(0.3),
+                                                          abs=1e-6)
+
+
+def test_the_colour_under_carrier_sets_the_clock_the_phase_is_read_against():
+    """A degree is 0.776 ns at the subcarrier and 4.41 us at 40 f_H, so the
+    carrier the burst was measured at has to travel with the phase."""
+    under = pd.burst_amplitude(
+        pd.spec_burst(RATE, LENGTH, carrier_hz=pd.NTSC_COLOUR_UNDER_HZ),
+        RATE, doubler_applied=False, carrier_hz=pd.NTSC_COLOUR_UNDER_HZ)
+    assert under["carrier_hz"] == pytest.approx(pd.NTSC_COLOUR_UNDER_HZ)
+    assert under["per_degree_s"] == pytest.approx(
+        1.0 / (360.0 * pd.NTSC_COLOUR_UNDER_HZ), rel=1e-12)
+    assert abs(under["gain"]) == pytest.approx(1.0, rel=1e-9)
+    # 40 f_H exactly, so one line is 40 cycles and a degree is that
+    # much coarser a clock
+    assert under["per_degree_s"] / (1.0 / (360.0 * pd.subcarrier_hz())) == \
+        pytest.approx(pd.SUBCARRIER_RATIO / pd.COLOUR_UNDER_MULTIPLE,
+                      rel=1e-12)

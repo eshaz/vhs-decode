@@ -7,10 +7,16 @@ the documents and the code fail together rather than drift apart: if a claim
 stops reproducing, this test says so.
 
 It includes the proofs that establish the FAILURES - the nested matrix's
-statistics, the literal zero, the wrong scatter, the blindness to a shared
-departure. Those are expected to demonstrate their defect, and they fail if
-the defect stops reproducing, because the withdrawal recorded in
-ELLIPTICAL_COLLAPSE.md section 6c would then no longer match the code.
+statistics, the literal zero, the blindness to a shared departure. Those are
+expected to demonstrate their defect, and they fail if the defect stops
+reproducing, because the withdrawal recorded in ELLIPTICAL_COLLAPSE.md
+section 6c would then no longer match the code.
+
+The scatter was one of those and is no longer: it was corrected on
+2026-09-06 (sqrt(2)/L is the complex asymptote, a real ensemble scatters
+2/L), so its proof now asserts the LAW rather than the defect, and the
+nested-matrix proof's frozen sigmas are restated in the corrected
+convention.
 """
 
 import pytest

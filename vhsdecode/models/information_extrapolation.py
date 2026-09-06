@@ -690,6 +690,99 @@ def head_dc_components() -> List[Component]:
     ]
 
 
+def transport_components() -> List[Component]:
+    """THE TRANSPORT'S OWN COMPONENTS: the tape's speed against its
+    expected, and the head-to-tape distance over time.
+
+    Ethan: "Let's use the tape speed difference from its expected as
+    another component, this is what ties in the tapes mechanical model we
+    built earlier."
+
+    THE TIE-IN IS AN IDENTIFIABILITY ARGUMENT, not a convenience. Speed
+    enters the magnetics only through `lambda = v / f`, and every loss is
+    a function of a length over that wavelength - so on the FREQUENCY axis
+    a speed error is EXACTLY a common scaling of every magnetic length.
+    Measured over 0.5 to 6 MHz: coherence 1.000000, worst difference
+    6.7e-16 nepers, and still 0.999 against spacing alone. Nothing
+    spectral can witness it.
+
+    It is directly observable on the TIME axis, and on the AMPLITUDE axis
+    through the envelope's drum line - which the time base corrector
+    cannot null, because it is a modulation rather than a timing. That is
+    what the transport brings: a measurement on axes where the magnetics
+    are blind, which removes a direction from the frequency axis's null
+    space rather than adding one to it.
+    """
+    return [
+        _component(
+            "tape speed against its expected",
+            "the line period read BEFORE the time base correction (or what "
+            "the corrector had to remove), and the drum-rate line in the "
+            "envelope's own spectrum. THE TIME AXIS IS THE IDENTIFIER: on "
+            "the frequency axis this is exactly degenerate with a common "
+            "scaling of every magnetic length (coherence 1.000000) and "
+            "0.999 collinear with spacing alone, so it must never be "
+            "fitted spectrally. It measures playback speed against RECORD "
+            "speed, so a source whose sync generator ran fast reads the "
+            "same as a slow deck - see `tape_speed.attribute`, where only "
+            "the capstan, the pinch roller and the drum can produce it",
+            ("time", "frequency"), linear=True,
+            stage=RF_PLAYBACK, machine=PLAYBACK_MACHINE),
+        _component(
+            "head-to-tape distance over time",
+            "the spacing d(t), whose Wallace loss is 54.6 d/lambda dB - "
+            "the steepest lever in the chain, 5.5 dB for a tenth of a "
+            "wavelength. Its STATIC value is not separable from the other "
+            "magnetic lengths; its TIME VARIATION is, because a transient "
+            "is not collinear with a static loss, and that variation IS "
+            "the dropouts rather than a separate phenomenon "
+            "(`magnetic_circuit.dropouts_from_spacing`)",
+            ("amplitude", "time"), linear=True,
+            stage=RF_PLAYBACK, machine=PLAYBACK_MACHINE),
+        _component(
+            "tracking mismatch",
+            "the head's offset across its own track, which does TWO things "
+            "because VHS has NO GUARD BAND (SMPTE table 2 gives pitch equal "
+            "to width): the wanted signal falls with the overlap, and the "
+            "uncovered part of the head sits over the NEIGHBOUR. The "
+            "azimuth is the only thing between them, and it protects the "
+            "two bands very differently - the gap sweeps 12.33 um across a "
+            "58 um track at +-6 degrees, giving 34.5 dB of suppression at "
+            "the luma sync tip and only 13.8 dB at the colour-under. "
+            "TWENTY DECIBELS LESS FOR THE CHROMA, which is why VHS chroma "
+            "crosstalk is the visible problem it is, and it follows from "
+            "the specification with nothing fitted",
+            ("amplitude", "time"), linear=True,
+            stage=RF_PLAYBACK, machine=PLAYBACK_MACHINE),
+        _component(
+            "reel pack radius",
+            "the reel line in the envelope's spectrum, which is a POSITION "
+            "measurement rather than a rate: r = v/(2 pi f) inverts the "
+            "Archimedean spiral r = sqrt(r0^2 + L t / pi), and the length "
+            "and thickness are specified per tape type (JVC's L = 2.2t + 2 "
+            "metres, SMPTE table 1's 19 um and T-160's 15.6). The band is "
+            "the tape's signature: T-30 bottoms at 0.2253 Hz and T-160 at "
+            "0.1217, against a common 0.4423 Hz at the bare hub. Measured "
+            "on home at 0.293 Hz = an 18.1 mm pack, 30.5 m in",
+            ("amplitude", "time"), linear=True,
+            stage=RF_PLAYBACK, machine=PLAYBACK_MACHINE),
+        _component(
+            "recorded transition length",
+            "the tape's coercivity and remanence through "
+            "`magnetic_circuit.transition_length`: a = sqrt(Mr delta "
+            "(d + delta/2) / (pi Hc)), which is 0.155 um on this stock - "
+            "THREE TIMES the head-to-tape spacing - and costs 5.60 dB at "
+            "the luma carrier against the spacing loss's 1.81. It has the "
+            "identical exp(-2 pi a / lambda) form as spacing, so it is "
+            "degenerate with it on the frequency axis; what separates them "
+            "is the RECORD LEVEL, because a goes as sqrt(Mr) and the "
+            "head-to-tape spacing does not care what was recorded. It "
+            "belongs to the RECORDING machine",
+            ("amplitude", "frequency"), linear=True,
+            stage=RF_RECORDING, machine=RECORDING),
+    ]
+
+
 def rf_stage_drift_components() -> List[Component]:
     """The RF stage's parameters as they move ALONG a tape.
 
@@ -2514,7 +2607,8 @@ def _directions(residuals, axis, order, grids=None):
 SPHERE_SIGMA = 3.0
 
 
-def sphere_floor(count: int, length: int) -> Dict[str, float]:
+def sphere_floor(count: int, length: int,
+                 real: bool = False) -> Dict[str, float]:
     """How circular a purely random ensemble of this size looks.
 
     Ethan's terminating condition is "down to the circular shape of the
@@ -2533,18 +2627,46 @@ def sphere_floor(count: int, length: int) -> Dict[str, float]:
 
     Checked against simulation over N in {3..32} and L in {64..1024}, real
     and complex: the ratio of measured to predicted sits at 0.88 to 1.18
-    with no trend. The scatter about it measures as sqrt(2)/L, flat in N -
-    which is why **adding components sharpens the test**: the floor rises
-    with N while its scatter does not, so the margin a real asymmetry has
-    to clear becomes better determined the more components are brought in.
-    That is Ethan's "increase the constant, how many components, to know
-    exactly when you have reached the end".
+    with no trend.
+
+    THE SCATTER DEPENDS ON WHETHER THE ENSEMBLE IS REAL OR COMPLEX, and
+    shipping one value for both understated it by sqrt(2) on every real
+    ensemble - which OVERSTATES the margin, so the loop believes it is
+    further from the floor than it is and keeps going, fitting noise. The
+    direction of that error is the dangerous one.
+
+    The law is derivable. `G_ij` is the inner product of two random unit
+    directions. Real: approximately N(0, 1/L), so `|G_ij|^2` is
+    `(1/L) chi^2_1`, variance `2/L^2`. Complex: the real and imaginary
+    parts carry half the variance each, so `|G_ij|^2` is
+    `(1/L)(chi^2_2 / 2)`, variance `1/L^2`. The asymmetry is a function of
+    `sum_{i!=j}|G_ij|^2`, so its scatter is sqrt(2) LARGER when real.
+
+    Measured over 400 trials per cell, scatter x L:
+
+        N=8  L=512    real 2.006+-0.071   complex 1.434+-0.051
+        N=32 L=512    real 1.814+-0.064   complex 1.321+-0.047
+        N=32 L=1024   real 2.031+-0.072   complex 1.359+-0.048
+        N=64 L=1024   real 1.928+-0.068   complex 1.196+-0.042
+
+    Complex sits at sqrt(2) = 1.414 and real at 2, with the ratio 1.37 to
+    1.61 against a predicted sqrt(2) - so the theory holds and the shipped
+    constant was the complex asymptote.
+
+    Both are flat in N, which is why **adding components sharpens the
+    test**: the floor rises with N while its scatter does not, so the
+    margin a real asymmetry has to clear becomes better determined the more
+    components are brought in. That is Ethan's "increase the constant, how
+    many components, to know exactly when you have reached the end".
     """
     count = max(int(count), 1)
     length = max(int(length), 1)
     return {
         "asymmetry": count / (length + count - 1.0),
-        "scatter": float(np.sqrt(2.0)) / length,
+        # sqrt(2)/L complex, 2/L real - the ratio is sqrt(2), derived above
+        "scatter": (float(np.sqrt(2.0)) * (np.sqrt(2.0) if real else 1.0)
+                    / length),
+        "real": bool(real),
         "count": float(count),
         "length": float(length),
     }
@@ -2675,7 +2797,13 @@ def ellipsoid(residuals: Dict[str, Dict[Axis, np.ndarray]], axis: Axis,
     # "Down to the circular shape of the complex signal": the floor is
     # reached when what is left is as spherical as a random ensemble of
     # this size and length would be.
-    circle = sphere_floor(max(effective, 1), length)
+    # WHETHER THE ENSEMBLE IS REAL IS MEASURED, NOT TAKEN FROM THE FLAG.
+    # `real_parameters=True` stacks real and imaginary parts and certainly
+    # gives a real matrix, but so does passing real residuals with the flag
+    # off - and the scatter law follows the matrix, not the caller's
+    # intent.
+    circle = sphere_floor(max(effective, 1), length,
+                          real=not bool(np.any(np.iscomplex(directions))))
     margin = ((asymmetry - circle["asymmetry"]) / circle["scatter"]
               if circle["scatter"] > 0 else 0.0)
     # Ethan: "the total eigenvalue is the total amount of information we
@@ -2695,6 +2823,9 @@ def ellipsoid(residuals: Dict[str, Dict[Axis, np.ndarray]], axis: Axis,
         "rank": rank,
         "significant": significant,
         # the information budget, and the share of it that is signal
+        # which scatter law the fit chose, read off the matrix rather than
+        # taken from the caller - a real ensemble scatters sqrt(2) wider
+        "sphere_real": bool(circle.get("real", False)),
         "information": float(count),
         "resolved": resolved,
         "resolved_fraction": resolved / max(float(count), 1e-30),
@@ -3255,6 +3386,25 @@ def orthogonalize_symmetric(residuals: Dict[str, Dict[Axis, np.ndarray]],
     for axis in axes_present(residuals):
         for names, directions in _grouped_directions(residuals, axis,
                                                      list(residuals)):
+            # THE REAL PART IS CORRECT HERE AND IS NOT THE DISCARDED-PHASE
+            # DEFECT IT RESEMBLES. A sweep for magnitude-only arithmetic
+            # flagged this against `orthogonalize`, which takes `np.abs` of
+            # the same Gram twelve hundred lines below, and the two genuinely
+            # differ - but deliberately, because they solve different
+            # problems.
+            #
+            # This estimator solves for REAL shares applied to complex
+            # residuals, which the docstring below states. Minimising
+            # `||b - sum x_i d_i||^2` over REAL `x_i` gives, by
+            # differentiating with respect to each `x_j`,
+            #
+            #     sum_i Re<d_j, d_i> x_i = Re<d_j, b>
+            #
+            # so `Re(G)` IS the normal-equation matrix, exactly. Using
+            # `|G|` here would be the error: two directions ninety degrees
+            # apart in phase cannot explain one another by any real multiple,
+            # and `Re(G) = 0` says so correctly while `|G|` would claim they
+            # were collinear and remove a share that does not exist.
             gram = np.real(directions @ directions.conj().T)
             off = np.abs(gram - np.diag(np.diag(gram)))
             if not off.size or off.max() < COHERENCE_THRESHOLD:

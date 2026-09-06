@@ -59,29 +59,60 @@ THE MEASURED EVIDENCE THIS MODULE'S OWN RUNS PRODUCE, so that a reader after
 a restart does not have to re-derive it. On the VHS luma RF band, 1 to 7 MHz
 over 512 places, VHS NTSC SP mechanics:
 
-    all three signatures        1.8035 effective of 3, condition 28.84
-    singular values             1.4134, 1.0000, 0.0490
-    worst coherent pair         amplitude against frequency, 0.99760
+    all three signatures        2.2505 effective of 3, condition 2.413
+    singular values             1.3064, 1.0000, 0.5415
+    worst coherent pair         amplitude against frequency, 0.70541
     amplitude and phase alone   2.0000 of 2, condition 1.000, coherence 8e-17
-    amplitude and frequency     1.0024 of 2, condition 28.84
+    amplitude and frequency     1.3355 of 2, condition 2.406
+    phase and frequency         1.9961 of 2, condition 1.045
     a family of five SPACINGS   1.0000 of 5 - one direction, as the
                                 separability law requires of a rate family
     azimuth control             a common misalignment cancels to 0.0e+00
                                 nepers rms, while independent construction
                                 errors of 0.25 and 0.15 degrees leave 4.9e-02
     Wallace round trip          -0.5558 dB -> 14.767 nm -> -0.5558 dB, 1.1e-16
-    band dependence             1.8035 on 1-7 MHz, 1.8043 on 0.2-7,
-                                1.8128 on 0.1-10, 1.8005 on the carrier alone
+    band dependence             2.2505 on 1-7 MHz, 2.2506 on 0.2-7,
+                                2.2519 on 0.1-10, 2.2501 on the carrier alone
 
-SO THE HONEST ANSWER IS ONE NEW KIND AND TWO MEMBERS OF THE COLLINEAR FAMILY,
-and it took the measurement to find that out. The delay is a genuinely new
+THESE NUMBERS ARE THE RECHARACTERISED ONES AND THE CONCLUSION THEY SUPPORT IS
+THE OPPOSITE OF THE ONE THEY FIRST SUPPORTED. `frequency_signature` built
+`exp(there - here)` from two log MAGNITUDES and cast the real result to
+complex, so the entry arrived with no phase. It read 1.8035 of 3 at condition
+28.84, the amplitude-frequency pair sat at 0.99760, and this module's central
+finding was that the frequency scaling is another RATE and not another kind.
+
+A FREQUENCY SCALING IS THE ONE CASE WHERE DROPPING THE PHASE IS NOT
+RECOVERABLE. For most entries a minimum-phase response's phase is implied by
+its magnitude, so a magnitude-only signature loses nothing that cannot be
+reconstructed. Here the two sides are the SAME response at two different
+frequencies, so what the entry carries is `phi(s f) - phi(f)`, and that is
+not implied by the magnitude difference - it is a separate half of the same
+operation. Measured at a fractional scaling of 1e-3, the magnitude difference
+peaks at 0.00092 nepers and the phase difference at 0.00362 radians: THE
+SIGNATURE WAS BLIND TO ABOUT FOUR FIFTHS OF ITS OWN EFFECT.
+
+Carrying it, the amplitude-frequency pair falls from 0.99760 to 0.70541 and
+the three entries read 2.2505 of 3 at condition 2.413. The frequency scaling
+IS another kind after all, and the kind is a phase.
+
+WHAT SURVIVES OF THE OLD READING. The separability argument below is still
+correct about the MAGNITUDES - scaling the axis scales the same dimensionless
+group a length does, so the magnitude halves really are one direction - and
+the band dependence is still almost flat, 2.2501 to 2.2519 across a hundredfold
+change of fractional bandwidth, which is the same insensitivity the magnetics
+found. What was wrong was reading a magnitude-only collinearity as a statement
+about the mechanism.
+
+SO THE HONEST ANSWER IS TWO NEW KINDS AND THE MAGNITUDES SHARING ONE, and it
+took the measurement twice to find that out. The delay is a genuinely new
 kind: it is orthogonal to both magnitude quantities to 8e-17 once real and
 imaginary parts are stacked, because a phase and a magnitude are two
 mechanisms - which is why `real_parameters=True` is not optional here, and
 why amplitude and phase together read a perfect 2.0000 of 2 at condition
-1.000. The frequency scaling is NOT a new kind. It sits at 0.99760 with the
-separation, and the two together read 1.0024 of 2: one direction wearing two
-names.
+1.000. The frequency scaling is a new kind TOO, and only its magnitude half is
+not. It sits at 0.70541 with the separation and the two together read 1.3355
+of 2 - not one direction wearing two names, but two directions sharing most
+of one. Against the phase it reads 1.9961 of 2, essentially orthogonal.
 
 The separability law predicts exactly this, and the prediction is worth
 stating because it was not obvious in advance. Every mechanism in the shared
@@ -96,12 +127,19 @@ and widening the band from 7:1 to 100:1 moves the pair only from 0.99760 to
 0.99110. Fractional bandwidth is the only variable that moves it at all,
 which is the same finding the magnetics arrived at.
 
-ADDING THE FREQUENCY QUANTITY TO THE KEY LOWERS THE COUNT: 2.0000 of 2 at
-condition 1.000 becomes 1.8035 of 3 at condition 28.84. That is the rule the
-sub pre-emphasis taught arriving again - a modification earns a place in the
-key by the direction it adds, not by being a modification - and it is an
-independent reason, beyond the size argument below, to keep this quantity out
-of the key and report it as a bound.
+ADDING THE FREQUENCY QUANTITY TO THE KEY NOW RAISES THE COUNT: 2.0000 of 2 at
+condition 1.000 becomes 2.2505 of 3 at condition 2.413. It used to LOWER it,
+to 1.8035 at condition 28.84, and that was the independent reason given here
+for keeping it out.
+
+THAT REASON IS GONE AND THE QUANTITY IS STILL OUT, on a narrower argument
+that has to be stated rather than inherited. It buys +0.2505 of a direction
+for 2.41 times the conditioning. The admission gate this arc applies
+elsewhere - `interference.admission` - asks for more than half a direction of
+gain at no more than 1.25 times the cost, and this clears neither. So it is
+held, as it was, but because it does not pay rather than because it adds
+nothing; and the size argument below is now the primary reason rather than
+the secondary one.
 
 THE FREQUENCY QUANTITY IS REPORTED AS A BOUND, NOT AS A CORRECTION. Three
 things say so and they agree. The first is the prior measurement: a frequency
@@ -417,6 +455,20 @@ def shared_log_response(frequency_hz, writing_speed_m_s: float,
                                    track_width_m, **values)
 
 
+def shared_phase(frequency_hz, writing_speed_m_s: float,
+                 track_width_m: float, **parameters) -> np.ndarray:
+    """The phase of the response the two heads share, in radians.
+
+    The partner to `shared_log_response`, and needed for the same reason the
+    frequency-scaling signature exists at all: a rescaling of the axis moves
+    whatever shape is there, and the phase is part of the shape.
+    """
+    values = dict(head_model.TYPICAL)
+    values.update(parameters)
+    return head_model.phase_rad(_grid(frequency_hz), writing_speed_m_s,
+                                track_width_m, **values)
+
+
 def shift_direction(frequency_hz, writing_speed_m_s: float,
                     track_width_m: float, **parameters) -> np.ndarray:
     """`dLbar/du` with `u = ln f`: the direction a frequency shift moves in.
@@ -486,7 +538,26 @@ def frequency_signature(frequency_hz, fractional_scaling: float,
                                 **parameters)
     exponent = there - here
     exponent = np.where(np.isfinite(exponent), exponent, 0.0)
-    return np.exp(exponent).astype(np.complex128)
+
+    # AND THE PHASE, which this returned without. It built `exp(there - here)`
+    # from two log MAGNITUDES and cast the real result to complex - a real
+    # number wearing a complex dtype.
+    #
+    # A FREQUENCY SCALING IS EXACTLY THE CASE WHERE THAT IS NOT HARMLESS. For
+    # most operations a minimum-phase response's phase is implied by its
+    # magnitude, so carrying only the magnitude loses nothing that cannot be
+    # recovered. Here the two sides are the SAME response at two different
+    # frequencies, so the phase difference is `phi(s f) - phi(f)`, which is
+    # not zero for any response with a shape - it is the very quantity a
+    # scaling moves. Dropping it made the signature blind to the half of the
+    # scaling that shows as a delay.
+    phase_here = shared_phase(f, writing_speed_m_s, track_width_m,
+                              **parameters)
+    phase_there = shared_phase(f * scale, writing_speed_m_s, track_width_m,
+                               **parameters)
+    turn = phase_there - phase_here
+    turn = np.where(np.isfinite(turn), turn, 0.0)
+    return np.exp(exponent + 1j * turn)
 
 
 def geometric_bound(spacing_difference_m: float,
@@ -1227,3 +1298,238 @@ def key_signatures(frequency_hz, **kwargs) -> Dict[str, np.ndarray]:
     """
     every = signatures(frequency_hz, **kwargs)
     return {name: every[name] for name in KEY_ENTRIES if name in every}
+
+
+# --------------------------------------------------------------------------
+# The two on-tape bands as two measurements of the same head pair
+# --------------------------------------------------------------------------
+
+COLOUR_UNDER_BAND_HZ = (0.4e6, 0.9e6)
+LUMA_BAND_HZ = (3.4e6, 4.4e6)
+"""The two bands the same head wrote in the same pass.
+
+The colour-under sits where the luma FM does not, and both were sourced
+from one signal by one head - so they are two measurements of that head at
+wavelengths eleven times apart, taken under identical everything else.
+"""
+
+
+def band_ratio_discriminator(luma_hz: float = 3.9e6,
+                             colour_under_hz: float = 0.65e6
+                             ) -> Dict[str, float]:
+    """GAIN OR CLEARANCE - decided by one ratio, with no fitting.
+
+    Ethan: "We can use the difference between the color under and luma
+    components like we did before to measure the properties of the head.
+    The luma and chroma components are band measurements of each head."
+
+    The head difference in log magnitude is
+
+        dlog|H|(f) = g - 2 pi (dd) f / v
+
+    a CONSTANT if the heads differ in gain and LINEAR IN f if they differ
+    in clearance. So the ratio of the departure measured in the two bands
+    is the whole test:
+
+        a pure clearance difference  ->  ratio = f_luma / f_cu = 6.000
+        a pure gain difference       ->  ratio = 1.000
+
+    Nothing is fitted and nothing is assumed; the two mechanisms simply
+    predict different numbers. This is the reasoning that established the
+    head difference IS a flat gain rather than a clearance - the departure
+    was still 0.15 to 0.22 nepers at 629 kHz where a clearance would have
+    decayed to about 0.01 - and it is written here as an estimator rather
+    than left as an argument.
+    """
+    ratio = float(luma_hz) / max(float(colour_under_hz), 1e-30)
+    return {
+        "clearance_predicts": ratio,
+        "gain_predicts": 1.0,
+        "luma_hz": float(luma_hz),
+        "colour_under_hz": float(colour_under_hz),
+        "how": "measure the head difference in each band and divide; the "
+               "answer lands on one prediction or between them",
+    }
+
+
+def two_band_difference(luma_frequency_hz, luma_log_difference,
+                        colour_under_frequency_hz, colour_under_log_difference,
+                        writing_speed_m_s: float = 5.8709
+                        ) -> Dict[str, object]:
+    """Solve the head difference for a GAIN and a CLEARANCE together.
+
+    Two bands, two unknowns - the construction Ethan describes, applied to
+    the head pair rather than to the absolute response. The model is
+    linear in both, so this is one least-squares solve and the error bars
+    come out of it directly.
+
+    WHY THE PAIR IS WORTH IT, measured over the two bands against either
+    alone:
+
+        luma band alone     cond 27.0   coherence 0.997
+                            sigma(clearance) 186 nm   sigma(gain) 0.78 dB
+        colour-under alone  cond  9.1   coherence 0.976
+                            sigma(clearance) 373 nm   sigma(gain) 0.27 dB
+        BOTH BANDS          cond  3.1   coherence 0.811
+                            sigma(clearance)  23 nm   sigma(gain) 0.070 dB
+
+    ELEVEN TIMES the precision on the gain and eight on the clearance,
+    because over one band a constant and a term linear in frequency are
+    nearly the same shape and over eleven wavelengths they are not.
+
+    EVERYTHING ELSE STILL CANCELS. This is a difference between the two
+    heads, so the tape, the record-side path, the decoder's filters and
+    the de-emphasis are common to both and gone - which is what makes the
+    residual belong to the heads alone. The two bands do not weaken that;
+    they add a second lever to the same cancellation.
+    """
+    luma_f = np.asarray(luma_frequency_hz, dtype=np.float64).ravel()
+    luma_y = np.asarray(luma_log_difference, dtype=np.float64).ravel()
+    cu_f = np.asarray(colour_under_frequency_hz, dtype=np.float64).ravel()
+    cu_y = np.asarray(colour_under_log_difference, dtype=np.float64).ravel()
+    if len(luma_f) != len(luma_y) or len(cu_f) != len(cu_y):
+        raise ValueError("each band needs one departure per frequency")
+    grid = np.concatenate([cu_f, luma_f])
+    values = np.concatenate([cu_y, luma_y])
+    good = np.isfinite(grid) & np.isfinite(values)
+    grid, values = grid[good], values[good]
+    if len(grid) < 4:
+        return {"gain_nepers": float("nan"), "clearance_m": float("nan"),
+                "usable": False}
+    design = np.column_stack([np.ones_like(grid),
+                              -2.0 * np.pi * grid / float(writing_speed_m_s)])
+    solution, *_ = np.linalg.lstsq(design, values, rcond=None)
+    residual = values - design @ solution
+    dof = max(len(grid) - 2, 1)
+    variance = float(residual @ residual) / dof
+    covariance = variance * np.linalg.inv(design.T @ design)
+    gain, clearance = float(solution[0]), float(solution[1])
+    # A SIGNIFICANCE TEST NEEDS A MEANINGFUL ERROR BAR. On noiseless data
+    # the residual is zero, so sigma is zero, and "three sigma" fires on
+    # floating-point dust - a planted pure gain reported a significant
+    # clearance of 1e-17 metres. The floor is the departure's own scale
+    # times the double's epsilon, below which nothing is a measurement.
+    scale = float(np.max(np.abs(values))) or 1.0
+    floor = scale * np.finfo(np.float64).eps * 16.0
+    # which mechanism dominates, by the share of the departure each explains
+    gain_only = np.full_like(grid, gain)
+    clearance_only = -2.0 * np.pi * grid / float(writing_speed_m_s) * clearance
+    total = float(np.sum(values ** 2)) or 1.0
+    return {
+        "gain_nepers": gain,
+        "gain_db": gain * 20.0 / np.log(10.0),
+        "gain_sigma_nepers": float(np.sqrt(covariance[0, 0])),
+        "clearance_m": clearance,
+        "clearance_sigma_m": float(np.sqrt(covariance[1, 1])),
+        "residual_rms": float(np.sqrt(np.mean(residual ** 2))),
+        "gain_share": float(np.sum(gain_only ** 2) / total),
+        "clearance_share": float(np.sum(clearance_only ** 2) / total),
+        "gain_significant": bool(
+            abs(gain) > max(3.0 * float(np.sqrt(covariance[0, 0])), floor)),
+        "clearance_significant": bool(
+            abs(clearance)
+            > max(3.0 * float(np.sqrt(covariance[1, 1])), floor)),
+        "significance_floor": floor,
+        "usable": True,
+        "cancels": "the tape, the record-side path, the decoder's filters "
+                   "and the de-emphasis - all common to both heads",
+    }
+
+
+# --------------------------------------------------------------------------
+# Is each head's response FIXED? The test, and what it can and cannot see
+# --------------------------------------------------------------------------
+
+def fixed_response_verdict(head_a_halves, head_b_halves,
+                           span_s: Optional[float] = None
+                           ) -> Dict[str, object]:
+    """Whether each head's response is fixed, and over what span.
+
+    Ethan: "The model of the VCR is fixed throughout recording and playback
+    depending on which circuit path is enabled on the VCR so a fixed
+    response for each head confirms this though testing."
+
+    THE TEST, made explicit. If the model is fixed and the only switch is
+    which head reads, then the BETWEEN-head difference must exceed the
+    WITHIN-head variation - otherwise "each head has its own fixed
+    response" is a distinction the data does not support. Each argument is
+    a pair of profiles from disjoint halves of that head's own fields, so
+    their difference IS the within-head variation with no model in it.
+
+    THE PULSE MUST COME OUT FIRST, and this is why the function takes
+    profiles rather than a correlation. Two sync profiles correlate at
+    +1.0000 whatever the channel does, because both are dominated by the
+    same -40 IRE step; the correlation measures the pulse, not the
+    response. So the comparison is made on the LEVEL and the SHAPE
+    separately, after the common offset is removed.
+
+    MEASURED on 16 fields of two tapes, sync interval, in IRE:
+
+                    within-head             between heads
+        home   level 0.023  shape 0.069   level -0.147 (6.3x)  shape 0.315 (4.6x)
+        bars   level 0.006  shape 0.105   level +0.048 (7.8x)  shape 0.246 (2.4x)
+
+    So the per-head LEVEL is resolved on both tapes and the SHAPE on one.
+    And the level's SIGN differs between them, which is the head model's
+    own statement arriving from a third direction: the per-head constant
+    belongs to the (recording, playback) PAIR, not to a machine.
+
+    WHAT THIS TEST CANNOT SEE, and it is the important limit. Sixteen
+    fields is 0.27 seconds. Over that span the response is fixed; it says
+    nothing about "throughout", and the tesseract's field-series fold -
+    256 and 1024 fields, 4.3 and 17 seconds - measures the response
+    DRIFTING across the transport's whole band, flat at 40 to 48 times the
+    noise from a quarter second upward.
+
+    THE TWO ARE NOT IN CONFLICT, and the reconciliation is the useful
+    result: THE TIME SCALE SEPARATES THE CIRCUIT FROM THE MECHANICS. The
+    circuit does not change - Ethan's claim, and nothing in the
+    electronics has a second-scale time constant - so the fixed part is
+    the circuit's. What varies does so at the drum and reel rates, which
+    are mechanical, and belongs to the head-to-tape interface rather than
+    to the model. A response that were fixed at ALL scales would actually
+    refute the transport model, not confirm it.
+    """
+    def split(first, second):
+        first = np.asarray(first, dtype=np.float64).ravel()
+        second = np.asarray(second, dtype=np.float64).ravel()
+        if len(first) != len(second):
+            raise ValueError("both halves must be the same profile length")
+        level = float(np.mean(first - second))
+        shape = (first - second) - level
+        return level, float(np.sqrt(np.mean(shape ** 2)))
+
+    # each half averages half the fields, so a whole-head figure is
+    # root-two better than the difference between halves
+    root_two = float(np.sqrt(2.0))
+    within = {}
+    wholes = {}
+    for name, halves in (("A", head_a_halves), ("B", head_b_halves)):
+        first, second = halves
+        level, shape = split(first, second)
+        within[name] = {"level": abs(level) / root_two,
+                        "shape": shape / root_two}
+        wholes[name] = 0.5 * (np.asarray(first, dtype=np.float64).ravel()
+                              + np.asarray(second, dtype=np.float64).ravel())
+
+    level, shape = split(wholes["A"], wholes["B"])
+    typical_level = 0.5 * (within["A"]["level"] + within["B"]["level"])
+    typical_shape = 0.5 * (within["A"]["shape"] + within["B"]["shape"])
+    level_ratio = abs(level) / max(typical_level, 1e-30)
+    shape_ratio = shape / max(typical_shape, 1e-30)
+    return {
+        "within_head": within,
+        "between_level": level,
+        "between_shape_rms": shape,
+        "level_ratio": level_ratio,
+        "shape_ratio": shape_ratio,
+        "level_resolved": bool(level_ratio > 3.0),
+        "shape_resolved": bool(shape_ratio > 3.0),
+        "fixed_per_head": bool(level_ratio > 3.0 or shape_ratio > 3.0),
+        "span_s": span_s,
+        "span_covers_drift": bool(span_s is not None and span_s > 1.0),
+        "limit": "a short span tests reproducibility, not stability - the "
+                 "transport's drift lives from a quarter second upward, so "
+                 "a verdict from under a second speaks for the CIRCUIT "
+                 "only, which is exactly the part that should be fixed",
+    }

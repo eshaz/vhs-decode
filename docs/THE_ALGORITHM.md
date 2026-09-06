@@ -203,14 +203,35 @@ threshold is derived rather than chosen. From `trace(G) = N`,
 `trace(G²) = N + Σ_{i≠j}|G_ij|²` and `E|G_ij|² = 1/L`:
 
     floor   = N / (L + N − 1)
-    scatter = √2 / L
+    scatter = √2 / L     complex ensemble
+            = 2 / L      real ensemble
     margin  = (asymmetry − floor) / scatter
+
+**The scatter depends on the ensemble's kind**, and shipping one value for
+both understated it by √2 on every real ensemble. `G_ij` is the inner
+product of two random unit directions: real, that is ≈ N(0, 1/L), so
+`|G_ij|²` is `(1/L)χ²₁` with variance `2/L²`; complex, the real and
+imaginary parts carry half the variance each, so `|G_ij|²` is
+`(1/L)(χ²₂/2)` with variance `1/L²`. The asymmetry is a function of
+`Σ_{i≠j}|G_ij|²`, so its scatter is **√2 wider when the ensemble is real**.
+
+Measured over 400 trials per cell, scatter × L: real 1.81–2.03, complex
+1.20–1.43, ratio 1.37–1.61 against the predicted √2.
+
+Understating the scatter **overstates the margin**, so the loop believes
+itself further from the floor than it is and keeps going — it runs past its
+own floor, fitting noise. That is the dangerous direction, and it applied
+to every real ensemble, including `real_parameters=True`, which is the form
+this document prescribes for real physical parameters (§3, "Which inner
+product"). Corrected 2026-09-06; `ellipsoid` now reads the kind off the
+stacked matrix rather than from the caller's flag, because real residuals
+passed with the flag off are a real ensemble too.
 
 **At the floor when `margin ≤ 3`.** More components raise the floor while its
 scatter does not move, so the margin becomes better determined — which is why
 adding components tells you more exactly when you have finished.
 
-`sphere_floor(count, length)`
+`sphere_floor(count, length, real=False)`
 
 ---
 
@@ -271,6 +292,112 @@ dimension — the last being the transpose, each place a component and its
 vector running over fields. `axes_present(residuals)` enumerates them.
 
 ---
+
+## 8a. The fold on all dimensions: the tesseract, and the traversal back out
+
+Added 2026-09-05 from Ethan's directives, verbatim in the order given:
+
+> Oh I think the tesseract is asymmetric, and you never reach the full
+> residual, since a hypercube has a finite number of edges.
+
+> Build out this n dimensional tesseract that folds in onto itself, it is a
+> graph that is connected to all of its dimensional siblings and parents,
+> and all other relationships, the differentials are determined by the
+> color and the luma together for the video part, and the sync pulses, and
+> eq pulses, etc.
+
+> The folding happens on all dimensions, previously we were only connecting
+> it in sequence three ways, not the full dense graph.
+
+> but across stages we know the path through this graph a depth we can
+> trace ... Eventually it collapses down to one real signal which we can
+> subtract to remove the residual
+
+> Implementing a progressive multi-dimensional Hypercomplex Hilbert
+> transform over a graph topology for iterative residual extraction and
+> full related inverse signal deconvolution ... Each adjacent dimension of
+> measurements get another dimension added to its hilbert transform. I run
+> the signal through, it is hilbert transformed, related to the spec.
+> Finally at the end, we take the inverse. Follow the tree back up and we
+> come out with the subtracted out residual. ... nested tensor expansion
+> using multi-axis Fourier slices
+
+**Vertices.** Every two-state measurement axis (head A/B, falling/rising
+edge, first/second half of the fields, one tape/another, luma/chroma) is
+an axis of a hypercube; a vertex is one combination of states and carries
+the complex log of the measurement made there with its noise variance.
+`tesseract.Cube`.
+
+**The fold.** Folding along an axis pairs each vertex with its sibling
+across that axis and returns the parent (their mean, one axis fewer) and
+the differential (half their difference). Folding on every axis in every
+order is the Walsh-Hadamard transform of the cube - the Fourier transform
+of Z_2^n - and gives 2^n - 1 contrasts, one per non-empty subset of the
+axes, orthogonal and complete: the cube rebuilds exactly from them
+(`tesseract.fold`, `walsh`, `reconstruct`). The sequential machinery of
+section 6 took the order-one contrasts and one chain through the higher
+orders; the fold on all dimensions takes all of them at once, which is the
+dense graph: every pair of vertices is connected, and their difference is
+the sum of the contrasts on the axes they differ in (`dense_graph`).
+
+**The hypercomplex signal is the same object.** The n-dimensional
+hypercomplex analytic signal has 2^n components, the signal and its partial
+Hilbert transforms along every subset of axes; on a two-state axis the
+partial Hilbert transform is the contrast. So the traversal is: expand by
+one axis at a time (each doubles the component count), take the Bode
+relation along frequency to split each contrast into its minimum-phase and
+excess-phase parts, relate to the specification by subtracting the ideal's
+components, keep the contrasts that stand above their own noise, and fold
+back up the tree to one real departure per vertex whose `exp(-departure)`
+is the real kernel subtracted from the capture (`hypercomplex.expand`,
+`causality`, `relate_to_spec`, `collapse_back`, `deconvolve`;
+`tesseract.one_real_signal`).
+
+**The path has a depth.** The folds commute, but the chain does not: each
+axis is a property of one stage of the chain and a contrast on several axes
+is removed at the depth of the deepest stage it touches, shallowest stage
+first (`tesseract.trace`, `AXIS_STAGE`, positions from
+`interference.full_chain`).
+
+**The finite number of edges.** A contrast is identified when its power
+stands above its noise; below that it stays in the residual. Every
+contrast's noise is fixed by the cube's vertex count, so the residual after
+the fold is the sum of the contrasts the cube is too small to identify,
+lowered only by more vertices, never by more folding of the same ones. When
+the top-order contrast itself stands above noise the structure has more
+dimensions than the cube has axes (`unreached`, `asymmetry`).
+
+**Measured.** Head x polarity x half x tape on the sync exports: all 15
+contrasts identified, the four-way included (z 23 to 324); sides unequal by
+5.7 to 55 times; every axis's departure mostly excess phase once the
+contrasts are placed back on the 4 f_sc grid before the cepstrum - the
+polarity contrast a +48 to +128 ns delay, the tape contrast -126 to +78 ns,
+0.4 to 1.1 rad of all-pass after the delay, and a minimum-phase share at or
+below zero, the signature of a symmetric (zero-phase) shape - so the
+dimension the frequency key lacks is time. The chroma burst, read per line
+against the phase the decoder imposed, gives a per-head contrast of 0.6 per
+cent and 0.06 degrees reproduced on two decodes from different seek points,
+of the opposite sign to the luma's in the same band: a channel-specific
+per-head gain, not a shared spacing.
+
+**The time axis, folded by the bits of the field index.** A per-field
+measurement over 2^k consecutive fields is a cube whose axes are the field
+index's bits - bit 0 the head, bit 1 the drum revolution, each higher bit a
+time scale twice the last - and the fold on all of them is the sequency
+spectrum over field time (`tesseract.from_field_series`). On 256 fields of countdown
+(4.27 s, decoded at the recorded 40 MSps flags) every scale from the head
+(z 794) and the drum revolution (z 155) to two seconds (z 1020) carries
+structure, flat at 40 to 48 times the noise from a quarter second upward:
+the response drifts across the transport's whole band. The frequency key
+could not see this; this is the dimension it lacked. On 1024 fields of home (17.08 s) the reel band
+becomes a line: 33 times the median at 0.293 Hz inside the reels' own
+0.118-0.442 Hz. The drum cannot be read from a per-field series at all -
+it turns once per two fields, which is exactly that series' Nyquist, so it
+aliases onto the head alternation. (A first run on home at the wrong
+sample rate was withdrawn.) The residual-to-floor test (`residual_floor`) says
+unrecoverable with structure on every tape and head: 24 to 39 dB above the
+standard-error floor, not white, reproducing on the held-out half with an
+agreement of 0.77 to 1.00.
 
 ## What terminates the whole thing
 

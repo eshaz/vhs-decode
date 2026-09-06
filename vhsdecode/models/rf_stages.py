@@ -113,13 +113,37 @@ tap, which observes the processing arm with no tape in it at all.
 
 THE EFFECTIVE COUNT. Against the magnetics baseline of 1.58 effectively
 distinguishable of 6 (reproduced here by `magnetics_baseline` as 1.576 at
-condition 3.0e4), adding all six RF stage entries gives 1.803 of 12. Six more
-members buy 0.23 of a direction. THE TWO STAGES ARE THE SAME COLLINEAR FAMILY
-SEEN TWICE, with two exceptions that are worth their place: the record
-current's level dependence (coherence at most 0.42 with anything else, the
-axis `magnetic` already established) and the playback equalisation's corner
-inside the band (at most 0.65). Everything else is another value of the one
-dimensionless group `length / recorded wavelength`.
+condition 3.0e4), adding all six RF stage entries gives 2.391 of 12 at
+condition 6.5e4. Six more members buy 0.81 of a direction.
+
+THESE NUMBERS WERE RECHARACTERISED WHEN THE PHASE WAS CARRIED, and the old
+ones are kept here because the difference is the finding. They read 1.803 of
+12 at condition 6.8e13, and six members bought 0.23 of a direction. Three
+places in this file were discarding the phase: `_shape` and `effective_count`
+both cast with `dtype=np.float64`, which numpy applies to a complex array by
+dropping the imaginary part with only a ComplexWarning, and `_stage_rows`
+took `log(abs(...))` where the complex logarithm was meant. Every builder in
+the module returns a genuinely complex response - 0.96 to 3.0 radians of
+phase - and none of it reached the count.
+
+THE CONDITIONING IS THE LARGER PART OF THAT. 6.8e13 is numerically singular:
+the ensemble had no usable inverse at all. 6.5e4 is merely ill-conditioned.
+Carrying the phase did not add a mechanism, it stopped the arithmetic from
+collapsing one.
+
+THE CONCLUSION IS UNCHANGED AND THAT IS THE POINT. THE TWO STAGES ARE STILL
+THE SAME COLLINEAR FAMILY SEEN TWICE - 0.81 of a direction from six members
+is still a collapse - and every null-space result is EXACTLY unmoved: the
+record transition against the playback spacing is still 1.000000000 coherent,
+the emphasis pair still 1.000000000, and every split residual still exactly
+zero. The phase did not manufacture separability the physics denies, which is
+the strongest available check that the fix is a fix and not a leak.
+
+Two exceptions are still worth their place: the record current's level
+dependence (coherence at most 0.42 with anything else, the axis `magnetic`
+already established) and the playback equalisation's corner inside the band
+(at most 0.65). Everything else is another value of the one dimensionless
+group `length / recorded wavelength`.
 
 THE CONTROL IS `cascade_control`, and it can fail. One mechanism entered once
 on each side is physically one shape, so the pair must span exactly ONE
@@ -485,8 +509,8 @@ def _floored(response: np.ndarray, floor: float) -> np.ndarray:
 
 
 def record_head_write(rf_hz, transition_length_m: float = 0.10e-6,
-                      writing_speed_m_s: float = DEFAULT_WRITING_SPEED_M_S
-                      ) -> np.ndarray:
+                      writing_speed_m_s: float = DEFAULT_WRITING_SPEED_M_S,
+                      minimum_phase: bool = True) -> np.ndarray:
     """The record head's own response: the transition it can write.
 
     Writing is not reading. A reproduce head reads through a gap and loses
@@ -507,8 +531,22 @@ def record_head_write(rf_hz, transition_length_m: float = 0.10e-6,
     same statement reached from the record side.
     """
     wavelength = float(writing_speed_m_s) / _positive(rf_hz)
-    return np.exp(-2.0 * np.pi * float(transition_length_m) / wavelength
-                  ).astype(np.complex128)
+    logged = -2.0 * np.pi * float(transition_length_m) / wavelength
+    # THE PHASE ITS SIBLING ALREADY CARRIED AND THIS DID NOT. A transition
+    # loss is a minimum-phase magnitude like every other loss in this module,
+    # and `playback_head_losses` twelve stages down has taken
+    # `minimum_phase_of` all along. This returned `exp(logged)` cast to
+    # complex - a real number wearing a complex dtype, which is the shape a
+    # discarded phase leaves behind.
+    #
+    # AND IT DOES NOT DISTURB THE NULL SPACE ABOVE, which is the thing to
+    # check rather than assume: the record transition and the playback
+    # spacing have the SAME functional form, so they acquire the same
+    # minimum phase and remain exactly collinear. Measured,
+    # `wavelength_loss_coherence` is 1.000000000 before and after.
+    phase = (minimum_phase_of(logged) if minimum_phase
+             else np.zeros_like(logged))
+    return np.exp(logged + 1j * phase)
 
 
 def record_current_level_dependence(
@@ -833,10 +871,38 @@ def stage_signatures(baseband_hz, rf_hz, **kwargs) -> Dict[str, np.ndarray]:
 
 
 def _shape(values) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float64).ravel()
-    values = values - values.mean()
+    """A signature as a unit shape, WITH ITS PHASE.
+
+    This cast `dtype=np.float64` on whatever it was given. On a complex
+    signature numpy drops the imaginary part with only a ComplexWarning, so
+    every coherence computed through here was a magnitude coherence
+    regardless of what the caller passed.
+
+    A complex shape is stacked as real followed by imaginary rather than kept
+    complex, and that choice is load-bearing: the Hermitian inner product is
+    BLIND TO A GLOBAL PHASE, so two signatures differing only by a constant
+    rotation would measure as identical under it. Stacking is not blind to
+    it, which is what makes a phase difference count as a difference.
+    """
+    values = np.asarray(values).ravel()
+    if np.iscomplexobj(values):
+        values = values - values.mean()
+        values = np.concatenate([values.real, values.imag])
+    else:
+        values = np.asarray(values, dtype=np.float64)
+        values = values - values.mean()
     norm = float(np.linalg.norm(values))
     return values / norm if norm > 1e-30 else values
+
+
+def _complex_log(values) -> np.ndarray:
+    """`log|H| + j arg H`, with the phase unwrapped so a difference of two of
+    them is a difference and not a wrap."""
+    values = np.asarray(values).ravel()
+    magnitude = np.log(np.maximum(np.abs(values), 1e-30))
+    if not np.iscomplexobj(values):
+        return magnitude
+    return magnitude + 1j * np.unwrap(np.angle(values))
 
 
 def _coherence(first, second) -> float:
@@ -1306,8 +1372,29 @@ def effective_count(rows: Sequence[np.ndarray], demean: bool = False
     published 1.58 of 6 was measured with - the same rows demeaned read 2.07,
     and the two are not the same measure. `interference.distinguishable`
     removes the mean; the tape figure quoted beside it does not.
+
+    COMPLEX ROWS ARE STACKED REAL-THEN-IMAGINARY, and this is the third place
+    in this file where `dtype=np.float64` was silently discarding a phase -
+    numpy drops the imaginary part with only a ComplexWarning, so every row
+    arrived here magnitude-only however complex it was built. The other two
+    were `_shape` and the `log(abs(...))` inside `_stage_rows`.
+
+    Stacking rather than keeping the rows complex is the same choice `_shape`
+    makes and for the same reason: a Hermitian inner product cannot see a
+    global phase difference, and the whole point of carrying the phase is
+    that a phase difference should count.
     """
-    stack = np.array([np.asarray(r, dtype=np.float64).ravel() for r in rows])
+    prepared = []
+    for row in rows:
+        values = np.asarray(row).ravel()
+        if np.iscomplexobj(values):
+            prepared.append(np.concatenate([values.real, values.imag]))
+        else:
+            prepared.append(np.asarray(values, dtype=np.float64))
+    width = max(v.size for v in prepared)
+    stack = np.array([v if v.size == width
+                      else np.concatenate([v, np.zeros(width - v.size)])
+                      for v in prepared])
     if demean:
         stack = stack - stack.mean(axis=1, keepdims=True)
     norms = np.linalg.norm(stack, axis=1, keepdims=True)
@@ -1389,8 +1476,14 @@ def _stage_rows(rf_hz, mechanics) -> Tuple[List[str], List[np.ndarray]]:
     step = 1.0 + BASELINE_PERTURBATION
 
     def moved(builder, value):
-        below = np.log(np.abs(builder(value)))
-        above = np.log(np.abs(builder(value * step)))
+        # THE COMPLEX LOGARITHM, NOT THE LOG OF THE MAGNITUDE. `log|H|` keeps
+        # only how a parameter moves the response's SIZE; `log H` keeps how it
+        # moves the size and the angle, and for a loss whose phase follows its
+        # magnitude the second is a strictly larger statement. Taking `abs`
+        # here made every row of the ensemble magnitude-only however complex
+        # the signature underneath it was.
+        below = _complex_log(builder(value))
+        above = _complex_log(builder(value * step))
         return np.nan_to_num(above - below)
 
     names = ["record amplifier", "record head write response",
@@ -1421,12 +1514,18 @@ def distinguishable(rf_hz=None, mechanics: Optional[Dict[str, float]] = None
     like for like. Measured on the VHS RF band, 0.5 to 8.0 MHz:
 
         magnetics alone                 1.576 of  6, condition 3.0e4
-        with the record stage           1.676 of  9
-        with the playback stage         1.743 of  9
-        with both                       1.803 of 12, condition 6.8e13
+        with the record stage           2.081 of  9
+        with the playback stage         2.085 of  9
+        with both                       2.391 of 12, condition 6.5e4
+        the six stages alone            2.683 of  6
 
-    SIX MORE MEMBERS BUY 0.23 OF A DIRECTION. The plain reading is the right
-    one: THE TWO STAGES ARE THE SAME COLLINEAR FAMILY SEEN TWICE. Every
+    Measured with the phase carried. The same table read 1.676 / 1.743 /
+    1.803 of 12 at condition 6.8e13 while three places in this file were
+    discarding it - see the module docstring for which three and why the
+    conditioning moved by nine orders of magnitude.
+
+    SIX MORE MEMBERS BUY 0.81 OF A DIRECTION. The plain reading is still the
+    right one: THE TWO STAGES ARE THE SAME COLLINEAR FAMILY SEEN TWICE. Every
     entry except two is another monotone function of one length over the
     recorded wavelength, which is the law `docs/COMPONENT_MAPPINGS.md`
     section 2 states - a family is collinear when its members differ only in
