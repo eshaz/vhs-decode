@@ -317,6 +317,12 @@ def settle_the_question() -> Dict[str, str]:
         "candidate": ("the LUMA side's sync-to-subcarrier relationship "
                       "measured before the chroma is split off, which the "
                       "record heterodyne never touches"),
+        "closed": ("the colour-under replica the demodulated luma carries, "
+                   "which `vhsdecode/models/colour_lock.py` now measures at "
+                   "a resultant of 0.98-0.99 on SP: a NEW channel, but not "
+                   "this quantity. `colour_under_field_advance` shows why - "
+                   "on 525/60 it advances 10500 cycles a field, fractional "
+                   "zero, so it carries no per-field phase at all"),
         "external": ("a reference outside the tape - the standard's line-10 "
                      "burst zero-crossing rule, or a known colour in the "
                      "picture, neither of which is available from the sync "
@@ -324,6 +330,114 @@ def settle_the_question() -> Dict[str, str]:
         "caution": ("a period-4 two-state pattern is cyclically identical to "
                     "its own rotation, so any such test establishes that a "
                     "SEQUENCE is intact and never which field is first"),
+    }
+
+
+def colour_under_field_advance(system: str = "NTSC") -> Dict[str, object]:
+    """WHY THE LUMA'S COLOUR-UNDER REPLICA CANNOT CARRY THE COLOUR FRAME.
+
+    A new channel arrived with `vhsdecode/models/colour_lock.py`: the
+    colour-under replica the demodulated luma carries, which the decoder's
+    up-conversion never touches and which locks at a resultant of 0.98 to 0.99
+    on the SP decodes. It is the first genuinely independent reading of the
+    tape's colour-under phase this arc has had, so the framing question has to
+    be put to it - and the answer is no, for a reason that is one division.
+
+    The colour-under is a MULTIPLE OF THE LINE RATE by specification. On 525/60
+    it is exactly forty times it, so over a field of 262.5 lines it advances
+
+        262.5 x 40 = 10500 cycles, fractional part ZERO
+
+    and a carrier that advances a whole number of cycles a field has no
+    per-field phase to carry. That is the same reason the module docstring
+    gives for the recorded burst, arriving through a different door: the format
+    chose 40 f_H so the field-to-field phase would cancel, and it cancels in
+    every channel the colour-under reaches, including this one.
+
+    On 625/50 the printed 626.953 kHz carrier gives 40.124992 times the line
+    rate and a fractional advance of 0.060 per field, which is NOT a claim that
+    PAL's colour-under carries an eight-field sequence. The printed figure is
+    rounded to the hertz, and the fraction is a property of that rounding
+    rather than of the format; the value is returned so the difference between
+    a derived and a printed constant stays visible, exactly as
+    `colour_under.carrier_provenance` insists.
+    """
+    from vhsdecode.models import colour_under
+
+    key = _system(system)
+    line_rate = colour_under.line_rate_hz(key)
+    carrier = colour_under.carrier_hz(key)
+    lines = LINES_PER_FIELD[key]
+    ratio = carrier / line_rate
+    per_field = ratio * float(lines)
+    fractional = per_field % 1.0
+    return {
+        "system": key,
+        "carrier_in_line_rates": float(ratio),
+        "cycles_per_field": float(per_field),
+        "fractional_advance": float(fractional),
+        "can_carry_a_field_sequence": bool(fractional > 1e-9),
+        "printed_carrier": colour_under.carrier_provenance(key)["printed"],
+        "why": ("a carrier that advances a whole number of cycles per field "
+                "holds no per-field phase; on 525/60 the colour-under advances "
+                "exactly 10500"),
+    }
+
+
+def dimensions() -> Dict[str, object]:
+    """WHICH AXES THE COLOUR FRAME HAS, and the one it does not.
+
+    Ethan, 2026-09-06: *"All of them need to be used and all of them need to
+    model all dimensions."* Two of the three are here and derived; the third
+    is absent for a reason, and stating it is better than manufacturing a
+    number to fill the column.
+
+      FREQUENCY   the sequence LENGTH is a frequency statement and nothing
+                  else: it is the smallest `n` for which `n` fields of
+                  `525/2` lines at `455/2` subcarrier cycles a line is a
+                  whole number of cycles. Four for 525/60, eight for 625/50,
+                  and the ratio is what decides it.
+      TIME        the advance, 270 degrees a field on 525/60, which is a
+                  phase and therefore a time - `expected_phase` gives it in
+                  degrees and the subcarrier converts it to seconds.
+      AMPLITUDE   ABSENT, and it cannot be otherwise. The quantity is a
+                  state index out of `n`; an index has no magnitude, and a
+                  magnitude attached to one would be a property of the
+                  estimator rather than of the framing.
+
+    WHAT WOULD CARRY AN AMPLITUDE is the CONFIDENCE of a measured framing -
+    the resultant of the phase the decision was taken on - and `confidence`
+    is written and ready for it. It has no input on this medium, for the
+    reason this module's docstring proves at length: the colour-under
+    advances a whole number of cycles a field, so the sequence is not on the
+    tape to be measured. The axis is missing because the measurement is,
+    not because the axis was overlooked.
+    """
+    ntsc = sequence("NTSC")
+    return {
+        "frequency": {
+            "present": True,
+            "quantity": "the sequence length, from the subcarrier's ratio to "
+                        "the line rate",
+            "value": int(ntsc["states"]),
+        },
+        "time": {
+            "present": True,
+            "quantity": "the advance per field, as a phase and so as a time",
+            "degrees_per_field": float(ntsc["degrees_per_field"]),
+        },
+        "amplitude": {
+            "present": False,
+            "why": "the framing is a state index out of n and an index has "
+                   "no magnitude; the quantity that would carry one is the "
+                   "confidence of a MEASURED framing, and the colour-under "
+                   "advances a whole number of cycles a field so there is "
+                   "nothing on the tape to measure it from",
+            "would_be": "colour_framing.confidence, which has no input here",
+        },
+        "why": ("an axis that is absent is reported as absent with the "
+                "reason, because filling the column with a number that is "
+                "not a measurement is worse than leaving it empty"),
     }
 
 

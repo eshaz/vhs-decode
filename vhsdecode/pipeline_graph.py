@@ -23,7 +23,11 @@ rather than documentation:
   * the AXIS each acts on - amplitude, frequency, time;
   * the three kinds of edge drawn distinctly, because conflating them is
     how a well-meaning reordering breaks a correction;
-  * where the chain COLLAPSES, and where it stops collapsing.
+  * where the chain COLLAPSES, and where it stops collapsing;
+  * the two TRANSFORMS' cubes - a node declaring `absorbs` is drawn as one
+    box holding every node whose measurement fills a vertex of its cube,
+    so the model stages appear as two boxes and not as a chain, there
+    being no order among vertices.
 
 THE COLLAPSE is the arc's central claim and the reason the graph is worth
 drawing at all. Every filter before the demodulator is LTI on the RF, so
@@ -130,6 +134,21 @@ def validate(declared: Dict[str, Any], path: str = "<declaration>"
         for other in node.get("must_precede", []) + node.get("must_follow", []):
             if other not in by_name:
                 raise ValueError("%s orders against unknown node %r"
+                                 % (where, other))
+        # A supersession is a REFUSAL at startup, so a mistyped name would
+        # not merely draw wrongly - it would let two stages apply the same
+        # correction twice with nothing said.
+        for other in node.get("supersedes", []):
+            if other not in by_name:
+                raise ValueError("%s supersedes unknown node %r"
+                                 % (where, other))
+        # An absorbed node is a VERTEX of the transform's cube and is drawn
+        # inside its box, so a mistyped name here would draw a vertex the
+        # cube does not have and let the transform stand for a measurement
+        # that is never taken.
+        for other in node.get("absorbs", []):
+            if other not in by_name:
+                raise ValueError("%s absorbs unknown node %r"
                                  % (where, other))
     _check_ordering(declared)
     return declared
@@ -242,6 +261,167 @@ GATE_OFF = {"!= 0": 0, "> 0": 0, "> -1": -1, "is not None": None,
             "is True": False, "is False": True}
 GATE_ON = {"!= 0": 1.0, "> 0": 1.0, "> -1": 0, "is True": True,
            "is False": False}
+
+
+def declared_default(gate: Any) -> Dict[str, Any]:
+    """Whether this gate's declared default may be SEEDED, and as what.
+
+    Returns `{"seed": bool, "value": Any, "why": str}`. Kept apart from
+    `apply_defaults` so the rule can be asserted directly by a test - the
+    declaration is DATA, and data that ends up multiplying a float32 array
+    needs its type checked at the boundary rather than at the multiply.
+
+    Three ways a declared default is not a value to be written anywhere:
+
+      * IT IS NOT OURS TO SUPPLY. Only a gate marked `declared_default`
+        belongs to the declaration; every other option has a command line
+        flag or a code-side fallback behind it, and its `default` here is
+        DOCUMENTATION of what that comes to. Seeding those would not merely
+        be redundant, it would override the fallback - `sharpness` documents
+        1 while the code falls back to the format's own value - so a
+        declaration written to describe the pipeline would silently change
+        it.
+
+      * IT DESCRIBES A PROVENANCE RATHER THAN A VALUE. `high_boost` declares
+        `default = "format"`, meaning "the format definition supplies this".
+        Written through, that six-character string reached
+        `high_part * self._high_boost` and the demodulator raised on
+        multiplying a float32 array by a string. A string default that is not
+        the null placeholder is a description, and descriptions are skipped.
+
+      * ITS PREDICATE CANNOT EVALUATE IT. A gate declared `derived`, or one
+        whose extra conditions are not ours to satisfy, has no value this
+        module can honestly resolve. The base predicate - everything before
+        the first `and` - is what is tested, exactly as `apply_selection`
+        reads a compound gate, because the extra conditions only ADD
+        requirements.
+
+    The one string that IS a value is the null placeholder: TOML cannot
+    express null, so an absent default is written as `"none"` and normalised
+    back here, which is the same trap `resolve_gate` already steps over.
+    """
+    if not isinstance(gate, dict) or "default" not in gate:
+        return {"seed": False, "value": None, "why": "no declared default"}
+    if not gate.get("option"):
+        return {"seed": False, "value": None, "why": "no option to write"}
+    if not gate.get("declared_default"):
+        return {"seed": False, "value": None,
+                "why": "the default is supplied elsewhere - a command line "
+                       "flag or a code-side fallback - and this declaration "
+                       "documents it rather than owning it"}
+    value = gate["default"]
+    if isinstance(value, str):
+        if value.strip().lower() == "none":
+            value = None
+        else:
+            return {"seed": False, "value": None,
+                    "why": "a string default names where the value comes "
+                           "from; it is not the value"}
+    predicate = str(gate.get("predicate", "!= 0")).split(" and ")[0].strip()
+    test = PREDICATES.get(predicate)
+    if test is None:
+        return {"seed": False, "value": None,
+                "why": "the predicate %r is derived and cannot be resolved "
+                       "from a value" % predicate}
+    try:
+        test(value)
+    except TypeError:
+        return {"seed": False, "value": None,
+                "why": "the predicate %r cannot evaluate %r"
+                       % (predicate, value)}
+    return {"seed": True, "value": value, "why": "declared"}
+
+
+def apply_defaults(options: Dict[str, Any],
+                   declared: Dict[str, Any]) -> List[str]:
+    """Seed the option values a node's own declaration OWNS, in place.
+
+    Ethan: *"Let's retire all the one-off options and have everything we have
+    done so far live in the graph and have a consistently modeling
+    structure."* A stage whose only control is `--stages` has no command line
+    flag to carry its default, so the DECLARATION carries it - `gate.default`
+    beside `declared_default = true` is the value the stage runs at when
+    nothing on the command line says otherwise, and this writes it where every
+    existing `if` in the decoder already reads.
+
+    Two independent guards, because this writes into the option values the
+    whole decoder is gated on. `setdefault` semantics: a key already present
+    is never touched, and `main.py` writes every flag-backed key
+    unconditionally. And `declared_default`: only a gate that says the
+    declaration owns its default is seeded at all, so a node documenting what
+    some other fallback comes to cannot override it. A decode with no
+    `--stages` argument is therefore bit-identical to one taken before the
+    node was declared.
+
+    Returns the human-readable list of what it seeded, for the log.
+    """
+    seeded: List[str] = []
+    for node in declared.get("node", []):
+        gate = node.get("gate")
+        if not isinstance(gate, dict) or gate.get("option") in options:
+            continue
+        verdict = declared_default(gate)
+        if not verdict["seed"]:
+            continue
+        options[gate["option"]] = verdict["value"]
+        seeded.append("%s default %r (from the declaration)"
+                      % (node["name"], verdict["value"]))
+    return seeded
+
+
+def supersessions(options: Dict[str, Any],
+                  declared: Dict[str, Any]) -> List[str]:
+    """Pairs where one enabled node supersedes another that is also enabled.
+
+    A node declaring `supersedes` does not run BESIDE what it names; it stands
+    in its place. `colour_free_luma` and `luma_beat` are the case this exists
+    for - both subtract the same colour-under coupling from the same picture,
+    so running the two takes it out twice and the second fit is made against a
+    picture the first has already emptied, which fails quietly rather than
+    loudly. Reported as a list of sentences so the caller decides whether that
+    is a warning or a refusal.
+    """
+    def _may_run(node: Dict[str, Any]) -> bool:
+        """Whether this node's own flag lets it run at all.
+
+        A COMPOUND gate - `luma_beat` is gated on its flag AND on a burst
+        being present - cannot be resolved to "on" from the options alone,
+        and `resolve_gate` correctly refuses to pretend otherwise. It can
+        always be resolved to OFF, though, by the same reasoning
+        `apply_selection` uses: the extra conditions only add requirements,
+        so a false base predicate makes the conjunction false. That is what
+        this asks, so a pair is refused where both flags are set and not
+        merely where one node's gate is unresolvable.
+        """
+        gate = resolve_gate(node, options)
+        if gate["state"] != "conditional":
+            return gate["state"] == "on"
+        declaration = node.get("gate")
+        if not isinstance(declaration, dict):
+            return True
+        base = declaration.get("predicate", "!= 0").split(" and ")[0].strip()
+        test = PREDICATES.get(base)
+        if test is None:
+            return True
+        try:
+            return bool(test(gate["value"]))
+        except TypeError:
+            return True
+
+    conflicts: List[str] = []
+    for node in declared.get("node", []):
+        superseded = node.get("supersedes") or []
+        if not superseded or resolve_gate(node, options)["state"] != "on":
+            continue
+        for name in superseded:
+            other = declared["by_name"].get(name)
+            if other is None or not _may_run(other):
+                continue
+            conflicts.append(
+                "%s supersedes %s and both are enabled - they would apply the "
+                "same correction twice. Turn one off: --stages -%s or "
+                "--stages -%s." % (node["name"], name, node["name"], name))
+    return conflicts
 
 
 def apply_selection(options: Dict[str, Any], selection: Dict[str, Any],
@@ -392,6 +572,7 @@ def render_mermaid(declared: Dict[str, Any], options: Any = None,
     see a change of shape in a pull request."""
     nodes = declared["node"]
     groups = declared["collapse_by_name"]
+    by_name = declared.get("by_name") or {n["name"]: n for n in nodes}
     gates = {n["name"]: resolve_gate(n, options) for n in nodes}
 
     out: List[str] = []
@@ -421,6 +602,29 @@ def render_mermaid(declared: Dict[str, Any], options: Any = None,
                 out.append('      %s["%s"]' % (_identifier(node["name"]),
                                                _label(node, gates[node["name"]])))
                 placed.add(node["name"])
+            out.append("    end")
+        # the transforms' cubes next: a node declaring `absorbs` is one box
+        # holding every node whose measurement fills a vertex of its cube,
+        # the transform itself among them, because a vertex has no order
+        # and a chain would draw one
+        for node in in_scope:
+            if node["name"] in placed:
+                continue
+            vertices = [by_name[a] for a in node.get("absorbs", [])
+                        if by_name[a].get("scope") == scope
+                        and by_name[a]["name"] not in placed]
+            if not vertices:
+                continue
+            out.append('    subgraph %s_%s["%s"]' % (
+                scope, node["name"],
+                _escape("%s — one transform, %d vertices"
+                        % (node["name"], len(vertices)))))
+            out.append("      direction TB")
+            for member in [node] + vertices:
+                out.append('      %s["%s"]' % (
+                    _identifier(member["name"]),
+                    _label(member, gates[member["name"]])))
+                placed.add(member["name"])
             out.append("    end")
         for node in in_scope:
             if node["name"] not in placed:

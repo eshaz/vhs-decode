@@ -196,6 +196,7 @@ def spacing(lines, black_16b: float, white_16b: float,
     values = np.asarray(lines, dtype=np.float64)
     per_ire = (float(white_16b) - float(black_16b)) / 100.0
     tip = values[:, list(pulse_columns)]
+    estimate = None
     if mask_clipped_samples:
         # kept only so the comparison can be made; it is the worst of the
         # three treatments and `censored_mean`'s docstring says by how much
@@ -222,6 +223,21 @@ def spacing(lines, black_16b: float, white_16b: float,
     measured = porch - tip_level
     good = np.isfinite(measured)
     return {
+        # THE CENSORED FIT'S OWN DIAGNOSTICS, carried out rather than kept
+        # inside, because a caller has to be able to tell a correction from
+        # an extrapolation. A censored normal identifies its mean from the
+        # SURVIVING samples; where almost nothing survives it will still
+        # return a number, and on one of this arc's three decodes it
+        # returned a sync tip of -107 IRE from a window 79 per cent of which
+        # sat on the container floor. The fit is a measurement while its
+        # mean stands within its own fitted sigma of the floor and an
+        # extrapolation beyond that, and only the caller knows what to do
+        # about it.
+        "censored": (estimate if (censor_floor is not None
+                                  and not mask_clipped_samples
+                                  and (tip <= (censor_floor or 0.0)).any())
+                     else None),
+        "censor_floor": (None if mask_clipped_samples else censor_floor),
         "per_line": measured,
         "blanking_ire": float(np.nanmean(porch[good])),
         "tip_ire": float(np.nanmean(tip_level[good])),
@@ -311,6 +327,114 @@ def field_slope(lines, black_16b: float, white_16b: float,
     return out
 
 
+def depth_spectrum(pulses, sample_rate_hz: float,
+                   depth_ire: float = SPECIFIED_DEPTH_IRE
+                   ) -> Dict[str, object]:
+    """THE FREQUENCY AXIS OF THE SAME DEFICIT, so this is not a one-axis stage.
+
+    THE GAP THIS CLOSES, SAID PLAINLY. Everything above reads the spacing on
+    the pulse's flat interior, which is a reading AT DC, and `field_slope`
+    reads how it drifts down the field, which is the TIME axis. That is two
+    axes, and Ethan's standing requirement is three. What was missing is
+    whether the deficit is FLAT: a channel 2 per cent low at DC and 20 per
+    cent low at 2 MHz is a different defect from one that is 2 per cent low
+    everywhere, and the spacing alone cannot tell them apart.
+
+    THE SYNTHETIC SIDE IS SPECIFIED, NOT FITTED. The measured pulse is read
+    against `pair_dimension.spec_sync` - the standard's own 4.7 microsecond
+    pulse with 140 nanosecond edges at the specified 40 IRE depth - so this
+    is `pair_dimension.sync_dimension` with the depth made explicit, and the
+    transfer it returns is COMPLEX: its magnitude is the gain at each
+    frequency and its angle is the channel's phase there. Nothing is reduced
+    to a magnitude at this boundary.
+
+    THE SEGMENTS ARE THE LINES. One pooled pulse is one segment, and a
+    single-segment coherence is 1 by construction - it certifies the
+    arithmetic rather than the physics, which is exactly what
+    `pair_transfer`'s debiasing exists to prevent. So `pulses` is the
+    per-line ensemble, one row a line, and the specified pulse is repeated
+    against it; the coherence is then a real statement about how much of the
+    measured pulse the specified one accounts for.
+
+    Returns the transfer, the coherence, and the two scalars worth quoting:
+    `dc_gain`, the transfer extrapolated to zero frequency, which is the
+    spacing gain arrived at from the other side; and `tilt_db_per_mhz`, the
+    weighted slope of the gain across the band, which is zero when the
+    deficit is flat.
+
+    MEASURED BY THE RUNTIME STAGE, 2026-09-06, on the 75 per cent bar SP
+    decode - 245 sync pulses a field, band limited at the VHS luma's 3 MHz,
+    the pulses being the segments and the specified pulse repeated against
+    them:
+
+        DC gain           0.9687
+        spacing gain      0.9768   (read directly on the pulse interior)
+        tilt             +0.41 dB/MHz across the band
+
+    The two gains agree to 0.8 per cent, and that agreement is the check:
+    they share no arithmetic, one being a mean over samples and the other
+    the zero-frequency limit of a Wiener transfer. The tilt says the deficit
+    is not quite flat, which is the thing the spacing alone cannot see and
+    the whole reason this axis exists.
+
+    WHAT IS NOT DONE HERE, AND WHY. The tilt is REPORTED, never applied. A
+    level-dependent or frequency-dependent luma scale belongs to the
+    equaliser lane by Ethan's own ruling; this module owns the one number
+    the standard fixes, which is the flat scale, and the tilt is evidence
+    handed on rather than a correction taken.
+    """
+    from vhsdecode.models import pair_dimension
+
+    rows = np.atleast_2d(np.asarray(pulses, dtype=np.float64))
+    count, length = rows.shape
+    if count < 2 or length < 8:
+        raise ValueError("the frequency axis needs at least two pulses of "
+                         "more than a handful of samples each")
+    ideal = pair_dimension.spec_sync(float(sample_rate_hz), length,
+                                     depth_ire=-abs(float(depth_ire)))
+    result = pair_dimension.pair_transfer(
+        np.tile(ideal, count), rows.reshape(-1), count)
+    frequencies = np.fft.rfftfreq(length, d=1.0 / float(sample_rate_hz))
+    transfer = np.asarray(result["transfer"])
+    coherence = np.asarray(result["coherence"])
+    gain = np.abs(transfer)
+    # Weighted by the coherence and by the specified pulse's own power, so
+    # the bins where the standard puts no energy do not vote.
+    weight = coherence * np.asarray(result["input_power"])
+    weight = np.where(np.isfinite(weight), weight, 0.0)
+    weight[0] = 0.0
+    inside = frequencies > 0
+    total = float(weight[inside].sum())
+    if total > 0:
+        decibels = 20.0 * np.log10(np.maximum(gain, 1e-12))
+        centre = float(np.sum(weight * frequencies) / total)
+        spread = float(np.sum(weight * (frequencies - centre) ** 2))
+        mean_db = float(np.sum(weight * decibels) / total)
+        tilt = (float(np.sum(weight * (frequencies - centre)
+                             * (decibels - mean_db))) / spread
+                if spread > 0 else 0.0)
+        dc_gain = float(10.0 ** ((mean_db - tilt * centre) / 20.0))
+    else:
+        centre, tilt, dc_gain = float("nan"), float("nan"), float("nan")
+    return {
+        # COMPLEX, because the phase is half of what a transfer is
+        "transfer": transfer,
+        "frequency_hz": frequencies,
+        "coherence": coherence,
+        "gain": gain,
+        "specified": ideal,
+        "dc_gain": dc_gain,
+        "tilt_db_per_hz": tilt,
+        "tilt_db_per_mhz": tilt * 1e6 if np.isfinite(tilt) else tilt,
+        "weighted_centre_hz": centre,
+        "pulses": int(count),
+        "why": ("the spacing is a reading at DC; this is the same deficit "
+                "across frequency, against the standard's own pulse, so the "
+                "stage carries amplitude, frequency and time rather than "
+                "amplitude and time"),
+    }
+
+
 def correction(spacing_result: Dict[str, object]) -> Dict[str, object]:
     """The scale every other composite level must be divided by.
 
@@ -339,12 +463,26 @@ def correction(spacing_result: Dict[str, object]) -> Dict[str, object]:
 def from_decode(tbc_path: str, json_path: str, first_picture_line: int = 22,
                 mask_clipped_samples: bool = False) -> Dict[str, object]:
     """Detect the clip and measure the spacing on a decoded field set."""
+    from vhsdecode.models import precursor
+
     with open(json_path) as handle:
         parameters = json.load(handle)["videoParameters"]
     width = int(parameters["fieldWidth"])
     height = int(parameters["fieldHeight"])
-    black = float(parameters["black16bIre"])
-    white = float(parameters["white16bIre"])
+    # THE ZERO IS BLANKING AND THE SCALE IS THE DECODE'S OWN. This read
+    # `black16bIre` as the zero and `(white - black) / 100` as the units per
+    # IRE, and both were wrong: black sits at the specified 7.5 IRE setup
+    # rather than at zero, and the two levels the decoder writes are spread
+    # apart by `--level_adjust`, whose default is 0.1. Together they made
+    # the units per IRE 400.8 where the decode used 358.4, and every gain
+    # reported by this module was short by 11.8 per cent - the difference
+    # between the 0.913 / 0.840 / 0.873 first recorded in the docstring
+    # above and the 1.021 / 0.939 / 0.976 the same three decodes give when
+    # read on the scale they were written with. `precursor.output_scale`
+    # inverts the adjustment exactly; see there for the control.
+    scale = precursor.output_scale(parameters)
+    black = float(parameters["blanking16bIre"])
+    white = black + 100.0 * float(scale["units_per_ire"])
     raw = np.fromfile(tbc_path, dtype=np.uint16)
     count = raw.size // (width * height)
     fields = raw[:count * width * height].reshape(count, height, width)
@@ -361,6 +499,7 @@ def from_decode(tbc_path: str, json_path: str, first_picture_line: int = 22,
     return {
         "clip": clip, "spacing": measured,
         "correction": correction(measured),
+        "output_scale": scale,
         "fields": int(count),
         "pulse_interior_columns": (interior.start, interior.stop),
         "porch_columns": (porch.start, porch.stop),

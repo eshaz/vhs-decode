@@ -208,7 +208,10 @@ axis = ["frequency"]
 gate = { option = "channel_eq", predicate = "!= 0", default = 1, alternate = "luma_eq" }
 site = "vhsdecode/process.py"
 anchor = "rf_eq = self.Filters.get(\"ChannelEQ\", luma_eq)"
-reads = ["indata_fft"]
+# `rf_transform` is the latched table the single radio-frequency transform
+# publishes, read here because this is the one place the linear chain is
+# corrected; it arrives by feed-forward, so it is a read and not an order.
+reads = ["indata_fft", "rf_transform"]
 writes = ["indata_fft"]
 collapse = "rf_lti"
 must_follow = ["envelope"]
@@ -576,24 +579,29 @@ scope = "field"
 stage = "picture"
 axis = ["time"]
 gate = { option = "inverse_eq", predicate = "> -1", default = -1 }
-entry = "vhsdecode.addons.ringing_cancellation:process_field"
+entry = "vhsdecode.models.ringing_tesseract:process_field"
 site = "vhsdecode/field.py"
-anchor = "ringing_cancellation.process_field("
+anchor = "ringing_tesseract.process_field("
 reads = ["dsout"]
 writes = ["dsout"]
-accumulates = [ { key = "_ringing_state", race = "accepted", note = "ringing_cancellation.py:143-147" } ]
 components = [
-  { name = "smear", note = "the causal IIR shelf inverse, one stage per real pole" },
-  { name = "ring", note = "the gated feedforward subtraction of the certified resonances" },
-  { name = "ghost", note = "the echo taps" },
-  { name = "tail", note = "the dense FIR remainder the pencil cannot certify" },
-  { name = "landing_bank", note = "the synthesized per-landing kernels (sidecar: landing_bank)" },
-  { name = "relaxation", note = "the back porch's recovery tail as ONE time constant - about -2.9 IRE at tau 1.05-1.08 us, polarity-common, cornering near 130 kHz; survives the ringing correction (1-7% removed) so it is a residual, not a duplicate; default off" },
+  { name = "chroma_gate", note = "refuse the contrasts whose energy concentrates in the specified colour-burst lags - the chroma path leaking into the luma back porch, proved with a y-only capture of the same tape and deck. Off, the burst enters the kernel and is convolved with the picture." },
+  { name = "depth", note = "choose how many line axes the cube carries by holding out half the field's lines. Off, the depth is pinned at one - the polarity and the chroma nuisance axis - which is what every decode measured so far chooses anyway." },
 ]
-why = """The sync-derived artifact model, subtracted. Calibrated on lines
-the geometry declares measurable and - a known defect - applied to the whole
-field buffer including the last line, whose tip carries the next field's
-equalizing pulse."""
+why = """The sync-derived artifact, folded on the tesseract graph and
+SUBTRACTED - never filtered, because the chain is linear in the radio
+frequency domain and the demodulation is not, so the kernel is chosen by the
+sign of each transient and no one filter can do that. The stage is: measure
+every measurable line's sync fall and rise against the specification's own
+erf edge on one lag grid; fold the result on polarity and the line index's
+binary scales at once; refuse what the colour burst owns; collapse the
+identified contrasts to one real signal per landing; subtract it at every
+gated transient's own 50 per cent crossing at half the held-out optimal
+gain. ONE FIELD AT A TIME - nothing is averaged across fields, and
+`average_fields` is accepted and ignored. Calibrated on the lines the
+geometry declares measurable and applied only to those, so the field's final
+row - whose tip carries the next field's equalizing pulse - is left as it
+arrived."""
 
 [[node]]
 name = "hz_to_output"
@@ -610,6 +618,1317 @@ sync tip guarded off its own transitions, and the back porch from the burst
 end to one settling guard short of active video."""
 
 [[node]]
+name = "sync_shape"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "sync_shape", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_sync_shape"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_sync_shape("
+reads = ["dspicture"]
+writes = ["sync_pulse_shape"]
+must_follow = ["hz_to_output"]
+accumulates = [ { key = "_sync_shape_head", race = "none", note = "model_stages.py, the pooled pulse of each field parity; written on the field thread only" } ]
+components = [
+  { name = "band split", note = "what is inside the format's luma band is the shape and what is outside it is noise, BY CONSTRUCTION - a format constant, not a fitted knee" },
+  { name = "edge pair", note = "the two transients read separately, so a delay (both moving together) is told from a width change (the two moving apart)" },
+]
+why = """THE PULSE AS ONE COMPONENT ON ALL THREE AXES, and it applies nothing:
+it is the measurement `precursor` and `sync_depth` stand on, declared as a node
+of its own so it can be turned on for its log without turning on a correction.
+
+Ethan, having had to say it twice: "the shape is a component with all parts,
+amplitude, frequency and time". Fitted once in the band-limited Laplace
+eigenbasis, whose modes ARE the frequency axis, whose coefficients are the
+amplitude axis, and whose out-of-band remainder is the noise - which is handed
+on rather than discarded, because it is what sets `precursor`'s support
+window. The time axis is MEASURED and not derived: the delay against the other
+head's pooled pulse, taken from the PHASE of the complex response between them
+and split into a common delay and a width change. A group delay read off the
+magnitude by Bode's relation carries nothing the amplitude does not, and a
+module claiming three axes on that basis has two.
+
+MEASURED on three decodes, 245 pulses a field over a 96-sample segment: 60
+modes below 3 MHz of which 8.86 to 8.90 are effectively occupied, a shape of
+17.4 to 17.7 IRE rms with its energy centroid at 593 to 595 kHz, and an
+out-of-band remainder of 0.0008 to 0.053 IRE. Head against head the three
+tapes give three different answers - common delay -3.35, +2.37 and -3.25 ns
+with width changes of +1.49, +2.82 and -9.82 - and on all three the whole
+pulse's single number is neither of its parts and does not survive its own
+dispersion, which is precisely what the pair exists to show."""
+
+[[node]]
+name = "precursor"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "precursor", predicate = "!= 0", default = 1, declared_default = true }
+entry = "vhsdecode.model_stages:correct_precursor"
+site = "vhsdecode/field.py"
+anchor = "model_stages.correct_precursor("
+reads = ["dspicture", "sync_pulse_shape"]
+writes = ["dspicture"]
+mutates_in_place = true
+must_follow = ["hz_to_output", "sync_shape"]
+must_precede = ["sync_depth"]
+measures = [ { node = "sync_shape", as = "drive" } ]
+accumulates = [ { key = "_precursor_kernel", race = "none", note = "model_stages.py, the decoder's own kernel on the output grid, built once a decode" } ]
+components = [
+  { name = "kernel", note = "recovered from the decoder's own constructor and verified symmetric about lag zero, not rebuilt from the parameters" },
+  { name = "drive", note = "this field's own pooled sync edge, restricted to the transition and after - the porch is not fed back in as its own drive" },
+]
+why = """THE DECODER'S OWN RIPPLE, AHEAD OF ITS OWN EDGE. The video low-pass
+is applied by multiplying a real, non-negative response, and a real response
+is a zero-phase filter whose impulse response is symmetric about lag zero - so
+half of it acts BEFORE the input arrives. Every sync edge the decoder outputs
+therefore carries a ripple ahead of itself that was never on the tape, and for
+the sync edge that ripple lands in the front porch, which is the level
+reference this whole arc rests on. Against an ideal step the anticausal half
+predicts 2.6 IRE at 0.2 us ahead of a 40 IRE edge and still 0.08 IRE at 1.5,
+and the specified front porch is 1.5 us long: the WHOLE PORCH sits inside the
+precursor's support, so there is no precursor-free part of it to retreat to.
+
+THE DRIVE IS THE MEASURED EDGE AND NOT A STEP, because the ring at the band
+edge comes from the drive's energy at 2.5 to 3.5 MHz, where an ideal step has
+full energy and a recorded sync edge has very little.
+
+APPLIED IN FULL rather than at the gain law's half: the kernel is the
+decoder's own filter, known exactly rather than estimated, and the only fitted
+quantity is this field's own pooled edge over two hundred and forty-five
+lines.
+
+MEASURED on three decodes. The recovered kernel passes its own split test on
+every one - peak at lag zero, the halves agreeing to 6.0e-17 of it, each
+weighing 0.2716 - and what comes out of the porch is 0.580, 0.682 and 0.468
+IRE at its peak with 0.156, 0.194 and 0.143 IRE rms over the window. THE GAUGE
+IS THE PORCH AGAINST THE SAME LINE'S SETTLED BACK PORCH, which this stage
+never reads: over the two samples nearest the edge that departure improves
+from -2.079 to -1.974 IRE, -4.155 to -3.829 and -6.611 to -6.367, and on the
+single nearest sample of the bar tape from -3.062 to -2.474 - a fifth of it.
+What remains is the relaxation the porch carries in from the preceding active
+line, which `sync_geometry.front_porch_residual` owns and this stage does
+not."""
+
+[[node]]
+name = "sync_depth"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "sync_depth", predicate = "!= 0", default = 1, declared_default = true }
+entry = "vhsdecode.model_stages:correct_sync_depth"
+site = "vhsdecode/field.py"
+anchor = "model_stages.correct_sync_depth("
+reads = ["dspicture", "sync_pulse_shape"]
+writes = ["dspicture"]
+mutates_in_place = true
+must_follow = ["hz_to_output", "sync_shape", "precursor"]
+measures = [ { node = "sync_shape", as = "pulse" } ]
+components = [
+  { name = "spacing", note = "the level, read on the pulse's flat interior with the container's clip handled by censored maximum likelihood rather than by masking" },
+  { name = "drift", note = "the same spacing's slope down the field, which must be zero because both levels are specified constants" },
+  { name = "spectrum", note = "the same deficit against the standard's own pulse as a complex transfer - REPORTED, never applied, the tilt belonging to the equaliser lane" },
+]
+why = """THE ONLY ABSOLUTE SCALE THE SIGNAL CAN SUPPLY. Every other level in
+the composite waveform is specified as a fraction of something; blanking to
+the synchronizing level is specified outright at 40 IRE (ITU-R BT.1700), so
+the measured spacing over 40 is the luma channel's own gain and it feeds every
+level that follows.
+
+Measured by the runtime stage on the 75 per cent bar SP decode, read on the
+scale the decode was written with: 39.07 IRE over 245 lines a field with 0.26
+IRE of scatter, so a gain of 0.9768 - 0.20 dB low - drifting +0.09 IRE across
+the field. The picture agrees and was never used to fit it: the eight bar
+plateaus regress on SMPTE 170M table A.3's specified luminance levels through
+the origin at 0.9726 against the sync's 0.9768, a difference of 0.4 per cent.
+
+APPLIED AS A GAIN ABOUT THE MEASURED BLANKING AND NOTHING ELSE. A shift of the
+zero is a different defect and belongs to `standard_levels`; a spacing is
+immune to where the zero sits and so is this correction.
+
+IT REFUSES TO RUN BESIDE `--ire0_adjust hsync`, which derives the output scale
+from the same two levels inside `hz_to_output` - the spacing is then 40 IRE by
+construction and this stage would be fitting a correction to its own output."""
+
+[[node]]
+name = "vertical_interval"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "vertical_interval", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_vertical_interval"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_vertical_interval("
+reads = ["dspicture"]
+writes = ["vits_channel"]
+must_follow = ["hz_to_output"]
+components = [
+  { name = "detection", note = "the reserved lines against the three specified test lines, at a floor derived from the number of independent samples a band-limited line holds" },
+  { name = "channel", note = "the specified line against the line as it came back, as a Wiener transfer with the coherence that says where it is believable" },
+]
+why = """THE MOST VALUABLE INPUT THE METHOD CAN BE GIVEN, WHEN IT IS THERE.
+Every other component's synthetic side is a fitted curve, and a curve fitted
+to data describes that data by construction; an insertion test signal's bar
+amplitude, pulse durations, multiburst frequencies and subcarrier phases are
+printed in a standard to a tenth of an IRE. Its energy is spread across the
+whole video band where a sync pulse's is concentrated at one edge.
+
+AND IT DECLINES ON TWO OF THREE TAPES, which is half the point of wiring it.
+The 75 per cent bar tape's reserved rows hold 0.7 to 1.5 IRE peak to peak of
+nothing and home's hold 0.7 to 1.1, so the best of the three specified lines
+correlates at +0.157 and +0.092 against a null floor of 0.225 and the stage
+says so rather than fitting a channel to a blank line. Countdown DOES carry
+one: rows 16 to 18 stand at 72 to 104 IRE peak to peak above a quiet row 19,
+row 18 matches the specified colour bars at +0.674, it repeats between fields
+of the same parity at 0.999 where that tape's picture rows repeat at 0.64 to
+0.91, and the channel it yields carries 13.6 effective dimensions.
+
+THREE DISCRIMINATORS, BECAUSE ONE IS NOT ENOUGH. Correlation alone matched the
+actual colour bars on the bar tape's row 20 at +0.487 - a correct match to the
+wrong object, that source beginning its picture one line inside the reserved
+interval - and repetition alone cannot separate a static test pattern from an
+inserted line. Position is the third: a test signal is an ISLAND in a blank
+interval, spilled picture is a run that keeps going."""
+
+[[node]]
+name = "tape_speed"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "tape_speed_stage", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_tape_speed"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_tape_speed("
+reads = ["linelocs"]
+writes = ["tape_speed_epsilon"]
+must_follow = ["hz_to_output"]
+# THE OPTION IS `tape_speed_stage`, NOT `tape_speed`. `--tape_speed` already
+# exists and carries the SP / LP / EP string, which is truthy, so a gate named
+# after the module would have run this stage on every decode - it did, and the
+# log caught it. The NODE keeps the module's name, which is what `--stages`
+# and the graph use; only the option value it writes is distinct.
+components = [
+  { name = "line period", note = "the sync-only line positions before the resample, which is the only place a speed error survives - the corrector nulls it by construction" },
+  { name = "wavelength", note = "what that error does to every magnetic loss, through lambda = v / f, reported rather than used to identify it" },
+]
+why = """A COMPONENT, NOT A CALIBRATION. Speed enters the magnetics only
+through the wavelength, so an error of eps does not shift the response, it
+RESCALES the frequency axis every loss lives on - which makes it a first-class
+departure with its own axis.
+
+AND THE FREQUENCY AXIS CANNOT WITNESS IT. Over 0.5 to 6 MHz a speed error is
+degenerate with a common scaling of every magnetic length at coherence
+1.000000 and a worst difference of 6.7e-16 nepers - an identity, not an
+approximation, because every loss depends on a length over the speed. The TIME
+axis measures it directly and with no model at all, which is what "ties in the
+mechanical model": the transport supplies a measurement on an axis where the
+magnetics are blind.
+
+MEASURED on three decodes, 245 line periods a field off the sync-only line
+positions: +0.00015, -0.00006 and +0.00276, the last being the countdown tape
+at 0.28 per cent fast with a per-line spread almost as large as its mean. Even
+that error moves the magnetic log response by 0.028 dB over five and a half
+megahertz, which is the arithmetic reason the time axis has to carry this."""
+
+# =====================================================================
+# THE RADIO-FREQUENCY, CAPTURE AND TRANSPORT GROUP - eight measurements
+# taken on the RAW capture rather than on the picture.
+#
+# Ethan: "Every stage that we have designed must be called and used.
+# Exhaustively go through the stages and make sure they are being used.
+# All of them need to be used and all of them need to model all
+# dimensions."
+#
+# They run in the FIELD scope but their subject is the RF, and the two
+# facts are not in tension: `field.rawdata` is the capture's own samples
+# for this field's read span, so the RF is available on a serial thread
+# that also carries the line locations. The line locations are what make
+# the sync-only law enforceable here - the RF band is where the picture's
+# own sidebands live, so a spectrum over a whole field would be reading
+# the picture, and every node below that reads inside the band confines
+# itself to the sync tips and the burst.
+#
+# NOT ONE OF THEM WRITES A SAMPLE. Every module in this group identifies
+# something rather than correcting it, which is what the group is for, so
+# a decode is byte-identical whether they are on or off.
+# =====================================================================
+
+[[node]]
+name = "capture_profile"
+scope = "field"
+stage = "rf_playback"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "capture_profile", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_capture_profile"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_capture_profile("
+reads = ["raw_data", "env"]
+writes = ["capture_limit"]
+must_follow = ["envelope"]
+accumulates = [ { key = "_rf_measurements", race = "none", note = "model_stages.py, the per-field lattice and occupancy of all eight stages in this group; written on the field thread only" } ]
+components = [
+  { name = "lattice", note = "the word length from the spacing of the codes present, not from the container - an 8-bit capture in a 16-bit container is still 8-bit and the container says 16" },
+  { name = "quantisation floor", note = "one twelfth of a step squared, flat to Nyquist, which no residual in this arc may claim to sit below" },
+  { name = "binding limit", note = "Shannon over the Carson band for the tape and for the converter, which says which of the two is the limit" },
+]
+why = """THE FOURTH LINK, AND THE ONE THAT TERMINATES THE REST. Ethan named
+the chain as four and the component model carried three: *"Capture chain: VCR
+-> capture card; capture card profile -> complete limits of the sample rate
+i.e. 8bits, and 40mhz"*. Three constants stood in `information_extrapolation`
+for this - eight bits, forty megahertz and a 13.3 MHz roll-off - and on the
+captures this arc actually uses the rate is fifty, so the criterion they
+produced was wrong on every tape. Reading the profile from the capture is both
+the standing no-constants rule and the only way the number is right on the
+next one.
+
+MEASURED by this stage on three decodes taken here, and the three together are
+what make the reading trustworthy rather than merely plausible:
+
+  zaroff 75 per cent bars SP through `--no_resample`, at its own 50 MSps
+      8 bits on a step of 256, 45.8 per cent of full scale at 24.5 codes rms,
+      floor 0.289 codes, 49.92 dB, a 400 Mbit/s budget, and an occupancy
+      drifting 1.17 per cent across four fields
+  the home tape, natively 40 MSps and therefore never resampled
+      8 bits on a step of 256, 81.6 per cent of full scale at 40.5 codes rms,
+      a 320 Mbit/s budget, occupancy drifting 10.16 per cent
+  the same bars capture with `-f 50` and no `--no_resample`
+      16 bits on a step of 1, with 26825 distinct codes of the container's
+      65536
+
+THE THIRD READING IS WHY THIS STAGE CARRIES A REFUSAL. With `-f` given and no
+`--no_resample` the loader resamples the capture to the decoder's working rate
+before a single sample reaches a field, and a resampled stream lands on the
+CONTAINER's lattice rather than on the converter's. The lattice cannot tell
+that from a genuinely wider converter, so the stage says which of the two it
+is looking at by the one thing that does distinguish them - a converter cannot
+produce more codes than its own word length allows and a resampler produces as
+many as the container has - and it names `--no_resample` as the way to read
+the card's own.
+
+THE BINDING LIMIT IS THE GAUGE IT IS NOT FITTED WITH. The lattice says nothing
+about the tape; the envelope does. Over the 14.200 MHz Carson band the bars
+capture carries 19.4 dB of carrier-to-noise against the converter's 43.8, so
+the capacities are 91.89 and 206.72 Mbit/s and the TAPE binds by a factor of
+2.25; the home tape gives 15.6 against 48.0, 74.22 against 226.24 Mbit/s, and
+3.05. Ethan's *"since radio is where we got our vhs signal, that is the
+limit"* holds on both, measured.
+
+THE THIRD AXIS IS A DRIFT AND NOT A CONSTANT. A single reading of a profile
+has an amplitude and a frequency and no time at all; what makes this three
+axes is that the occupancy and the code rms are taken PER FIELD and their
+spread reported, because a converter's operating point is not guaranteed
+constant down a tape and every level derived from it moves when it moves -
+measured, 1.17 per cent of full scale on the test capture against 10.16 on the
+home tape, which is a real difference between two decks and not noise."""
+
+[[node]]
+name = "capture_filter"
+scope = "field"
+stage = "rf_playback"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "capture_filter", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_capture_filter"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_capture_filter("
+reads = ["raw_data"]
+writes = ["capture_rolloff"]
+must_follow = ["capture_profile"]
+components = [
+  { name = "roll-off", note = "a Butterworth corner and order fitted to the pooled noise floor above the video band, where the format put nothing" },
+  { name = "converter floor", note = "free and never assumed, because it decides where the filter stops being observable and fixing it would smuggle in the answer" },
+  { name = "aperture", note = "the comparison component: a sample-and-hold of one sample period, sinc(f/fs), -3.92 dB at Nyquist with no parameters at all" },
+]
+why = """THE ANALOGUE LOW-PASS AFTER THE RF TAP. Ethan: *"I also have a low
+pass filter just after the RF tap on my VCR. Model that based on the noise
+profile of the capture, where it rolls off consistent with an analog low pass
+filter. There may be many orders in the filter. The comparison component is
+the nyquist roll off."*
+
+THE NOISE IS THE PROBE, so the stage needs no stimulus and reads no picture:
+above the video band-pass's own upper corner the capture carries nothing the
+format put there, so the measured spectrum up there IS the filter's squared
+magnitude scaled by a constant. Pooled over a colour frame's worth of fields
+before fitting, because a single field's periodogram is one realisation and
+four parameters fitted to it would be fitting the draw.
+
+MEASURED by this stage on three decodes taken here, each pooled over four
+fields before a single fit:
+
+  bars SP at its own 50 MSps through `--no_resample`, 6.825 to 24.500 MHz
+      4.0 poles at a 14.783 MHz corner, 24.0 dB an octave, noise at -47.3 dB
+      over a converter floor at -58.1, observable to 18.692 MHz, the aliased
+      fold 21.2 dB below the floor, residual 3.31 dB against an 8.61 dB fall
+  the home tape at its native 40 MSps, 6.825 to 19.600 MHz
+      13.0 poles at 14.019 MHz, 78.0 dB an octave, -42.1 dB over -61.9,
+      observable to 16.362 MHz, fold 38.6 dB below, residual 0.96 dB against
+      a 22.06 dB fall
+  the same bars capture RESAMPLED from 50 to 40 MSps
+      7.5 poles at 15.481 MHz, 45.0 dB an octave, residual 1.42 dB
+
+THE THIRD READING IS WHY THIS STAGE CARRIES A REFUSAL OF ITS OWN. A resampler
+is itself a low-pass at the new Nyquist, so a fit taken on a resampled stream
+reads the resampler's corner and not the VCR's - 7.5 poles at 15.481 MHz
+against 4.0 at 14.783, on one tape and one afternoon. The stage detects it
+from the samples rather than from the command line: a resampled stream has
+left the converter's own lattice, which is a test it can make on the very
+samples it just fitted, and on the home capture - 40 MSps natively and never
+resampled - the lattice stays on its 256-code step and the caveat does not
+fire.
+
+THE SPURS ARE WHY THE NATIVE FIT IS THE WORST OF THE THREE.
+`capture_chain_noise` measures this chain's own lines at the converter
+crystal's sub-harmonics and at exactly 6.000000 and 12.000000 MHz, and a
+running median 200 kHz wide rejects them but not their shoulders; at 50 MSps
+the fitted band runs another five megahertz into the region where they sit.
+
+THE TIME AXIS IS DERIVED, WHICH IS STATED RATHER THAN GLOSSED. A noise power
+spectrum has no phase, so nothing in this measurement can witness a delay. The
+sampler's aperture is a time-domain quantity known exactly from the sample
+period, and the fitted cascade's group delay follows from its magnitude by
+Bode's relation; neither is an independent reading and both are reported as
+what they are."""
+
+[[node]]
+name = "rf_stages"
+scope = "field"
+stage = "rf_recording"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "rf_stages", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_rf_stages"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_rf_stages("
+writes = ["rf_stage_separability"]
+components = [
+  { name = "control", note = "one mechanism entered on both sides must span exactly one direction and the specified emphasis round trip must be unity; the stage declines if either fails" },
+  { name = "record stage", note = "pre-emphasis, record amplifier, record head write, record current level dependence" },
+  { name = "playback stage", note = "head differentiation, head losses, preamplifier, equalisation, de-emphasis" },
+  { name = "null space", note = "the four collinearities neither machine owns, measured on this decode's own band" },
+]
+why = """THE TWO MACHINES, AND WHETHER THIS DECODE'S BAND CAN TELL THEM APART.
+Ethan named two of the four links as RF: *"VCR chain: VCR -> Tape; Tape ->
+VCR"*. They are different machines with their own emphasis, amplifier, head
+and equalisation, and a single measured response is their product.
+
+THE ANSWER IS NO AND THE STAGE MEASURES WHY, on the decode's own grid rather
+than on a nominal one - which is the reason it is worth running at all, since
+the band and the tape speed are properties of the decode. Measured by this
+stage on the bars SP decode, over the decoder's own 0.500 to 6.500 MHz video
+band-pass at SP: the magnetics alone span 1.566 of 6 directions, the record
+stage takes that to 2.008 of 9, the playback stage to 2.104 of 9, and both
+together to 2.356 of 12 at a condition of 2.13e5. Six more members buy 0.790
+of a direction. The home tape's decode gives the same figures to the digit,
+which is the point - the count is a property of the band and the tape speed,
+and those two decodes share both.
+
+WHAT NEITHER MACHINE OWNS, on the same band: the emphasis pair is exactly one
+direction (coherence 1.000000, residual 4.4e-16 nepers), the two wavelength
+losses compose in the exponent so only their sum survives (coherence
+1.000000000), a flat gain splits with residual 0 and a pure delay with 2.8e-17
+radians, and the band limit at either end reads 0.999604 coherent - the only
+one of the four that is a limit rather than an identity, and the only one a
+wider capture would break. On the baseband abscissa the emphases span 1.675 of
+4 at a condition of 8.4e13, and that condition number IS the emphasis null
+arriving as arithmetic.
+
+THE CONTROL RUNS FIRST AND CAN FAIL, AND IT IS THE GAUGE THIS STAGE IS NOT
+FITTED WITH. An earlier component in this arc reported 4.65 effectively
+distinguishable of 5 and was wrong, and what exposed it was a linear control
+that should have read 1.00 and read 4.97. Here the control asserts two things
+known independently of any measurement - one mechanism entered on both sides
+spans exactly one direction, and the specified emphasis round trip is unity -
+and it passes on both decodes at 1.0000 directions and 4.44e-16 nepers. A
+count taken through a construction that failed them would be reporting the
+construction, so the stage declines rather than quoting one.
+
+THE TIME AXIS IS THE MODULE'S OWN FINDING RATHER THAN AN OMISSION. Phase is
+carried, complex, through the minimum-phase Hilbert partner - and it buys one
+direction for the PAIR, the total delay, and none for either machine, because
+a record delay and a playback delay are only ever observed as their sum."""
+
+[[node]]
+name = "filter_model"
+scope = "field"
+stage = "rf_recording"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "filter_model", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_filter_model"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_filter_model("
+reads = ["dspicture", "sync_pulse_shape"]
+writes = ["deemphasis_departure"]
+must_follow = ["hz_to_output", "sync_shape"]
+measures = [ { node = "sync_shape", as = "pulse" } ]
+components = [
+  { name = "shelf", note = "gain, mid frequency and Q, built by the decoder's own gen_video_main_deemp_fft so a fitted parameter could be handed straight back" },
+  { name = "width", note = "the pulse's own width against the standard's 4.7 us, which is ONE number and therefore at most one recoverable degree of freedom" },
+  { name = "sensitivity", note = "how far each chain parameter moves that width, so a parameter that cannot account for a deficit is excluded rather than fitted" },
+]
+why = """THE VCR'S OWN FILTERS AS PARAMETERS RATHER THAN AS A CURVE. *"This
+machine's shelf sits at 268 kHz, not the assumed 274"* is a statement about a
+machine that transfers to its other recordings; a spline coefficient says
+nothing that travels. The parametrization is THE DECODER'S OWN - the shelf is
+built by calling the same function the runtime builds its de-emphasis with, at
+this decode's own sample rate and block length - so what is reported is the
+departure from what this decode already assumed.
+
+SYNC ONLY. The pooled sync pulse the sync group already takes is read against
+the standard's own 4.7 microsecond pulse, `pair_dimension.spec_sync`, the same
+reference `sync_depth`'s frequency axis uses, and the log ratio of the two
+spectra over the format's 3 MHz luma band is what the assumed shelf failed to
+account for.
+
+AND IT DECLINES, WHICH IS THE POINT. This arc has already recorded that the
+shelf is not determinable from sync pulses: the fit lands on the difference
+between the measured pulse and the analytic ideal rather than on the machine.
+MEASURED by this stage on two decodes, four fields each, and they fail in two
+different ways which is itself the finding:
+
+  bars SP        mid 900000 +/- 0 Hz against the assumed 273756, gain 24.000
+                 +/- 0.000 dB against 13.979, Q 0.3796 +/- 0.0038 against
+                 0.4621 - and the bounds are 80000 to 900000 Hz and 4.0 to
+                 24.0 dB, so the mid and the gain sat AT them. A parameter
+                 driven to its bound was not determined by the data at all.
+                 Departure 0.8268 nepers rms, residual 0.7033, 85 per cent
+  home tape      mid 423111 +/- 5119 Hz, gain 10.678 +/- 0.114 dB, Q 0.7288
+                 +/- 0.0095 - inside the bounds and stable to a per cent
+                 across fields, and yet departure 0.6556 with residual
+                 0.6513, 99 per cent
+
+So one decode's fit runs to its bounds and the other's converges tidily, and
+NEITHER explains the departure it was fitted to. That is the recorded finding
+reproduced on a decode: a sync pulse is 213 kHz wide as a probe and the
+shelf's corner sits below that, so what the fit lands on is the difference
+between the measured pulse and the analytic ideal, not the machine. The stage
+reports the parameters and refuses to hand them back as a decode setting; the
+flat-field identification is the measurement that settles this one.
+
+THE THIRD AXIS IS THE WIDTH, IT IS MEASURED, AND IT IS THE GAUGE THE FIT IS
+NOT TAKEN ON. The bars decode's pulses are 4.6126 +/- 0.0008 us wide at half
+amplitude and the home tape's 4.6495 +/- 0.0010, against the standard's 4.700
+- deficits of 87 and 51 nanoseconds. The sensitivity table says no shelf
+parameter can account for them: the largest is the Q at -0.0019 microseconds
+per one per cent, so closing 87 nanoseconds would take a forty-six per cent
+change in it. The width is ONE number, at most one degree of freedom is ever
+recoverable from it, and this is what that costs stated rather than hidden
+behind a three-parameter fit."""
+
+[[node]]
+name = "transport_model"
+scope = "field"
+stage = "rf_playback"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "transport_model", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_transport"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_transport("
+reads = ["env", "linelocs"]
+writes = ["transport_rates"]
+must_follow = ["envelope"]
+components = [
+  { name = "envelope series", note = "one sample a line, the line's mean carrier level - where a tension or contact fault shows, because pressure sets spacing and spacing sets level" },
+  { name = "time base series", note = "one sample a line, the line period - where a speed fault shows, and it responds to a different set of parts" },
+  { name = "sweep", note = "the per-field decomposition into constant, linear and quadratic: a height offset, a guide standing wrong, and the tape curving across its width" },
+]
+why = """THE MECHANICAL TRANSPORT AS PREDICTED FREQUENCIES. Every rotating
+part turns at a rate its own diameter fixes, so the specification says where
+to look before anything is measured and a line found at a predicted rate names
+the part that made it. The prediction coming first is what separates this from
+trawling a spectrum for whatever peak is tallest.
+
+IT DECLINES BEFORE IT SEARCHES, AND IT WITHHOLDS THE SEARCH UNTIL THE TAPE IS
+LONG ENOUGH. `find_lines` looks in an 8 per cent band around each predicted
+rate, so a transform bin only lands inside the fastest one's band - the drum's
+29.9700 Hz, which the format fixes - once the series runs 0.4171 seconds, and
+a search reported before that says "no predicted rate found" on every decode
+ever run. That is a statement about the report's timing and not about the
+transport, so the requirement is announced early and the verdict waits for it.
+An early wiring of this stage reported at the fourth field, 0.0691 seconds in,
+and found nothing on either series; it was the timing.
+
+MEASURED by this stage on fourteen-frame decodes, 0.4322 seconds and 6800
+lines each: 2 of the 8 modelled parts are resolvable - the drum and the
+capstan at 4.8253 Hz - and the other six are slower than one cycle in the
+record. The DRUM IS FOUND on both series of both tapes, at 30.0802 Hz against
+a predicted 29.9700, and the capstan in neither:
+
+  tape                     envelope        time base
+  bars SP, resampled        723.2x            13.4x
+  bars SP at its own rate   720.7x            13.9x
+  the home tape            1975.9x            71.2x
+
+The two bars readings are the cross-check that the line is the tape's and not
+the sample rate's, and the home tape's is three times as strong on the
+envelope and five times on the time base - a different deck, and its drum is
+worse.
+
+A DRUM DISTURBANCE IS AN AMPLITUDE MODULATION, so the time base cannot null it
+and the envelope is where it lives: a factor of fifty between the two series
+on the test tape and twenty-eight on the home tape, measured.
+
+AND THE SWEEP DIVIDES DIFFERENTLY ON THE TWO. Pooled over 25 fields, the bars
+decode's per-line envelope is 17.3 per cent parabolic bow against 3.0 per cent
+guide tilt, and the home tape's is 24.3 per cent guide tilt against 7.0 per
+cent bow - the tape curving across its width on one and a guide standing at
+the wrong height on the other, told apart by the SHAPE along the sweep rather
+than by size.
+
+AND THE CONFOUND IS NAMED RATHER THAN GLOSSED. The drum turns once per two
+fields, so its rate IS the head alternation's; sampled once per FIELD the two
+are bit-identical and no search could attribute a line there. This samples
+once per LINE, where the same correlation falls to 0.0296 - but the
+head-to-head amplitude difference still sits at that frequency in the
+envelope, so the drum line is reported with that attached."""
+
+[[node]]
+name = "band_delay"
+scope = "field"
+stage = "rf_playback"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "band_delay", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_band_delay"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_band_delay("
+reads = ["raw_data"]
+writes = ["band_differential_delay"]
+components = [
+  { name = "luma clock", note = "the rise out of the sync tip, thresholded at the midpoint IN IRE between tip and blanking, which no picture reaches" },
+  { name = "chroma clock", note = "the burst's envelope centroid, its phase carried beside it and deliberately NOT combined - the phase needs an origin that survives the capture and this one does not" },
+  { name = "head split", note = "labelled by the field parity the format fixes, because the module's own gap-based labeller needs two fields and a single field cannot supply one" },
+]
+why = """THE TWO BANDS AS ONE CLOCK, READ TWICE. Ethan, 2026-09-06: *"The
+difference in time between the luma and chroma bands are the measurement we
+can use to observe the delay on each video head. This applies to playback and
+recording. Use this to relate on the time axis for the head measurements."*
+
+One head wrote both bands in one pass and one head reads both back in one
+pass, so the drum's phase, the capstan, the tape's stretch and the capture
+clock all move the two together and cancel in their difference. What survives
+is a delay that depends on frequency across a band ratio of 6.197, and that is
+the head's own dispersion. Both clocks are in reserved intervals.
+
+MEASURED by this stage on two decodes, four fields each and about 340 lines a
+field. The interval BTS-3 clause 2.4.9 specifies is 1857.1 ns:
+
+  bars SP playback tap    2060.2 ns, a departure of +203.0
+  the home tape           1774.7 ns, a departure of  -82.5
+
+Two tapes, two DIFFERENT SIGNS, and that is the reading rather than a
+nuisance: whatever is common to the instrument cancels between them.
+
+THE REFUSALS ARE PRESERVED AND NOT OVERWRITTEN. The offline measurement's
+record tap is the instrument's own null - the same drive reaches whichever
+head is switched in, so the two heads must agree there, and they do at 1.3 and
+0.8 standard errors. Its per-head figure at the playback tap is BOUNDED at 4.6
+nanoseconds rather than measured, because two captures that should agree
+disagree in sign, and the runtime figure is reported against that bound rather
+than replacing it: measured here, the bars decode gives +0.20 +/- 0.90 ns
+between the two field parities at 0.2 standard errors and the home tape
+-24.97 +/- 33.04 at 0.8, so both are consistent with zero and neither
+improves on the bound.
+
+AND THE SIGN TEST IS THE GAUGE THIS STAGE IS NOT FITTED WITH. A Wallace
+spacing loss is minimum phase, so its delay is fixed by its magnitude and a
+POSITIVE separation LENGTHENS this interval. The bars departure of +203.0 ns
+is therefore consistent with a separation and would need +1.014 micron; the
+home tape's -82.5 ns is NOT a separation at any size and would need -0.412
+micron, which is within a hundredth of a micron of the -0.39 the offline tap
+difference needs. The stage quotes the equivalent separation WITH its sign for
+exactly that reason - the number alone would have hidden the refusal.
+
+ALL THREE AXES, ALL MEASURED. The burst's amplitude gates every line and is
+what refuses a chrominance-free recording; the two bands are the frequency
+axis and their ratio is what buys the measurement; the interval is the time."""
+
+[[node]]
+name = "head_switch_pair"
+scope = "field"
+stage = "rf_recording"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "head_switch_pair", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_head_switch_pair"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_head_switch_pair("
+reads = ["raw_data"]
+writes = ["record_head_switch"]
+accumulates = [ { key = "_rf_measurements", race = "none", note = "model_stages.py, the previous field's raw samples and its absolute read position, so two fields can be spliced; written on the field thread only" } ]
+components = [
+  { name = "record mark", note = "where the recorded colour-under rotation reverses - written into the oxide at record time and replayed identically on any deck for ever afterwards" },
+  { name = "playback mark", note = "the luminance switch, a live event belonging to the machine doing the playing" },
+  { name = "separation", note = "the distance between them, which is a statement about WHICH MACHINE made the recording" },
+]
+why = """THE ONE MARK THAT CARRIES THE RECORDING MACHINE. Ethan, 2026-09-06:
+*"Record head switch is the point where the phase rotates over time ... The
+point where the phase rotates at record time in the chroma is the point where
+the heads switch at record time."* SMPTE 32M-2004 clause 3.9.2.1.5 makes the
+colour-under phase advance ninety degrees a line on one track and retard
+ninety on the other, so the recorded phase rotates steadily while the head
+sweeps and the reversal is where the record head switched.
+
+IT MUST BE READ IN THE RAW RADIO FREQUENCY, which is why this is an RF stage
+and not a chroma one: in a decoded chroma file the rotation is a hundred and
+eighty degrees a line, the decoder having already up-converted and undone the
+record side's own quarter turn.
+
+IT NEEDS TWO FIELDS AND SPLICES THEM EXACTLY. A reversal is credited only when
+a run of at least sixty lines in each state brackets it, and a single field's
+read span puts the mark within a handful of lines of one end. Measured on the
+bars SP capture at 50 MSps: one field finds a clean rotation axis at +90.14
+degrees and NO mark; two spliced fields find one record mark and its
+luminance partner. The splice is cut at the absolute offset between the two
+read positions, so the stream carries no seam, and a pair that does not abut
+is declined rather than spliced.
+
+MEASURED by this stage on two decodes, four spliced pairs each:
+
+  bars SP, recorded and played on the same Sony SLV-778HF
+      rotation +90.24 +/- 0.01 degrees a line, 0.9952 of lines projecting
+      more than nine tenths onto that axis, separation -0.406 +/- 0.000 lines
+  the home tape, recorded on a machine we have never seen
+      rotation +90.05 +/- 0.07 degrees, 0.9720 clean, separation
+      +8.421 +/- 0.436 lines
+
+THE SEPARATION IS THE GAUGE THE ROTATION IS NOT FITTED WITH, and it separates
+the two decks by twenty standard errors. The record mark is found in the
+recorded COLOUR rotation and the luminance switch independently in the
+LUMINANCE, so their distance is a comparison of two instruments and not of one
+with itself; it comes to four tenths of a line on a tape played on the deck
+that wrote it and eight and a half lines on a foreign one, which is the five
+to ten the offline measurement records. Both decodes read the specified
+quarter turn to within a quarter of a degree, so a RATE of 3933.6 Hz.
+
+THE NEGATIVE CONTROL IS PART OF THE DESIGN. On a recording with no chrominance
+the clean fraction collapses from 0.996 to 0.286, the axis wanders, and no
+field boundary is found - the instrument reports nothing rather than reporting
+noise, and this stage passes that refusal through to the log."""
+
+[[node]]
+name = "interference"
+scope = "field"
+stage = "rf_playback"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "interference", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_interference"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_interference("
+reads = ["raw_data", "linelocs"]
+writes = ["interference_key"]
+components = [
+  { name = "key", note = "fourteen complex signatures - particle noise, modulation noise, dropout, head contact tilt, beat, vestigial sideband, group delay, sound trap, the specified sub emphasis, four echoes and the record level dependence" },
+  { name = "span", note = "the share of this capture's own channel the key reaches, judged against the share a basis of that size would capture from anything by chance" },
+]
+why = """THE INTERFERENCE TYPES AS COMPONENTS THE TRANSFORM CAN DIFFERENTIATE
+OVER. Ethan: *"randomness is a residual here that we can effectively
+differentiate over since we can model different types of radio interference,
+maybe that's all the RF stage boils down to using all of our measured
+components."*
+
+Given a random phase per field so none could correlate trivially, four of five
+disturbances are not random to the transform at all: a beat has a frequency
+even when its phase is random and a dropout has a shape even when its position
+is not. Only particle noise sits at the sphere floor. So what a single
+measurement lumps together as noise is mostly modellable interference.
+
+THE SYNC TIP AND NOTHING ELSE. The signatures live across the RF band, which
+is exactly where the picture's own sidebands are, so the spectrum is taken
+over the flat interior of every sync tip - `sync_depth.TIP_INTERIOR`, the same
+window the depth stage reads its level on - and nowhere else. During the tip
+the carrier sits at the frequency the standard fixes for the synchronizing
+level and nothing modulates it.
+
+MEASURED by this stage on 0.500 to 6.500 MHz at a writing speed of 5.8000 m/s,
+four fields each. Of the 14 modelled types, 13 are linearly independent enough
+to be counted at all and they span 7.355 effective directions at a condition
+of 10.7 on the bars decode and 7.332 at 10.6 on the home tape; 14 of 14 are
+subtractable, which is the requirement every key entry has to meet.
+
+AGAINST EACH CAPTURE'S OWN CHANNEL - the spectrum inside 48 field-sync broad
+pulses at 92 kHz resolution with the sync-tip carrier line excised, read
+against the tape's ideal response:
+
+  bars SP, resampled to 40 MSps   inside 0.9655, outside 0.0345
+  the same at its own 50 MSps     inside 0.9663, outside 0.0337
+  the home tape                   inside 0.9747, outside 0.0253
+
+against a null of 0.2034 - what a basis of 12 vectors captures from anything
+at all over 59 bins - so an excess of +0.762 to +0.771. What is outside the
+span is between 2.5 and 3.5 per cent, and that is the honest upper bound on
+what any further fitting could recover, because nothing in the model
+represents it. The two bars readings differ by 0.0008 across a resampling,
+which is the check that the number is the channel's and not the sample rate's.
+
+THE RESOLUTION IS THE LIMIT AND THE 1/T PROBE LAW SETS IT. A line-sync pulse
+is 4.70 microseconds and resolves 213 kHz; a field-sync broad pulse is 27.1
+and resolves 37, and only its flat interior is used, which is where the 92 kHz
+comes from. The first wiring of this stage read the LINE pulse and got 12 bins
+for an 11-vector basis, where the completeness is 1.0000 by arithmetic and
+says nothing at all; the stage now declines unless the band holds three times
+the key's own size in bins, and names which pulse it was reading.
+
+ALL THREE AXES, AND THE SIGNATURES ARE COMPLEX BY CONSTRUCTION: the real part
+is what a mechanism does to amplitude and the imaginary part what it does to
+phase, which is the time axis and is why the echo family is a Fourier basis
+over delay and separates where the tape's monotone decays do not. The count is
+taken with real parameters, so a gain and a delay of the same shape are
+different mechanisms - measured, that distinction moves the effective count
+from 2.20 to 3.79 on the propagation set."""
+
+[[node]]
+name = "rf_transform"
+scope = "field"
+stage = "rf_playback"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "rf_transform", predicate = "!= 0", default = 1, declared_default = true }
+entry = "vhsdecode.model_stages:transform_rf"
+site = "vhsdecode/field.py"
+anchor = "model_stages.transform_rf("
+reads = ["raw_data", "env", "demod_raw"]
+writes = ["rf_transform"]
+state_writes = ["_rf_transform"]
+must_follow = ["envelope"]
+measures = [ { node = "envelope", as = "envelope" } ]
+feeds_forward = [ { target = "rf_eq", via = "_rf_transform", delay = "one_shot_redo", freeze = "latched_once" } ]
+components = [
+  { name = "latch", note = "the table frozen once, the first time every vertex of every channel in use holds the evidence asked for, and published as one immutable snapshot the workers read and never mutate: fills continue for the report, the applied table does not change from block to block, a second latch is refused because a new capture is a new transform, and the blocks demodulated before the snapshot existed are repaid by one redemodulation" },
+  { name = "per_head", note = "one table per video head, the head differential folded into the common table so a block costs a single multiply, and a schedule that labels each block by its absolute sample position - anchored on a switch the decoder located, with the field period as the known constant it is - because the workers demodulate ahead of assembly and are not told which head is coming" },
+  { name = "report", note = "what the transform holds, per field: the fills accepted and refused at every vertex, the latched contrasts with their amounts and causal splits, each field's own remainder against the departure removed from it, and the floors - instrument, null pool, banks and the capture's hypercube - in one currency, where a null pool standing above the hypercube is structure to name and not noise to discard" },
+  { name = "remove_residuals", note = "the second treatment of the null space he asked for, removing each individual residual rather than substituting the null space in: the full fold, every contrast a residual in its own right subtracted by the amount it reproduces across the two banks of fields, so a residual describing the path is removed in full and one describing the field it came from is left alone; off, the substitute treatment stands - the pruned fold, the kept contrasts alone at amount one, the null contrasts never computed" },
+  { name = "exact_inverse", note = "Ethan, 2026-09-07: 'Let's see what happens if we take this to hyperspace as the null space model, the exact inverse within our possible area of measure.' On, the inverse is taken EXACTLY - amount one, no correction-gain law - within the region the measurement reaches, the measured band on the causal axis and the admitted contrasts on the folded axes, so the remainder after it is by construction only what lies outside the area of measure, and that outside is the null-space model, reported and never inverted; off, the correction-gain law's half stands, which keeps three quarters of the benefit under a model error the exact inverse would double" },
+  { name = "wave", note = "Ethan, 2026-09-07: 'I believe there is still a wave underneath the convergence that itself can be differentialed as random noise and subtracted out, if we don't already have that.' Each field's remainder after the latch, per vertex, folded on the bits of the field index - the instrument that found the drum, the guides and the reels as lines offline - and each time-scale contrast admitted by the amount the second half of the run reproduces of the first; on, the admitted wave is subtracted at each field by the signs of that field's bits and what does not reproduce is discarded as the random noise it is; off, the wave is folded and reported and the latched constant alone is applied" },
+]
+# THE VERTICES. Thirteen measurements taken on the raw capture, none of
+# which writes a sample; each keeps its own declaration, gate and anchor.
+absorbs = [
+  "capture_profile", "capture_filter", "rf_stages", "filter_model",
+  "transport_model", "band_delay", "head_switch_pair", "interference",
+  "head_model", "head_differential", "magnetic", "magnetic_circuit",
+  "tape_path",
+]
+why = """THE ONE RADIO-FREQUENCY TRANSFORM, the picture's construction taken
+ahead of the demodulator. Ethan, 2026-09-07: *"I need to have a VHS RF stage
+transformed the same way. We do the full spherical shape, but, replace the
+noise with null space, which is a constant that we do not derive at all."*
+The thirteen measurements it absorbs each fill a vertex of the cube
+`single_transform` declares for the radio frequency - band, head and
+polarity live, the tap carried as the known constant a single capture makes
+it - and the causal axis, frequency, is the one that is not folded: the
+recorded radio frequency is causal, so every contrast splits into a delay, a
+minimum-phase part fixed by its own magnitude and an all-pass excess.
+
+THE CONSTANT HE NAMES IS THE CAPTURE'S OWN HYPERCUBE, and it is measured with
+no judge: the sample rate fixes the box where data can exist at all and the
+format fixes the sub-box where the signal may exist inside it, so what lies
+outside is signal-free by construction and its noise density is the constant
+subtracted from every contrast and discarded. It stands beside the floors the
+transform reads from itself, and where the null contrasts hold more than the
+file's constant the excess is a mechanism to name and not noise to discard.
+
+IT FEEDS FORWARD RATHER THAN WRITING A SAMPLE, because the correction belongs
+where the chain is still linear, and that is on the worker threads ahead of
+the demodulator, where one complex table fixes every level at once. The
+table is latched on the field thread and published as an immutable snapshot
+that `rf_eq` reads - one common table, one per head, and the schedule that
+chooses between them by a block's absolute sample position - and the blocks
+demodulated before it was published are repaid by one redemodulation, which
+is what `one_shot_redo` names."""
+
+[[node]]
+name = "head_model"
+scope = "field"
+stage = "rf_playback"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "head_model", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_head_model"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_head_model("
+reads = ["raw_data", "linelocs", "env", "demod"]
+writes = ["head_parameters"]
+measures = [ { node = "envelope", as = "envelope" } ]
+accumulates = [ { key = "_reserved_band_levels", race = "none", note = "model_stages.py, one record a field, written on the field thread only and shared by all five stages of this group" } ]
+components = [
+  { name = "flat gain", note = "the two heads' level difference, which the carrier-normalization law annihilates exactly and which is therefore measurable ONLY on the RF envelope" },
+  { name = "separation", note = "Wallace's exp(-2 pi d / lambda), linear in frequency and so also in the carrier law's null space" },
+  { name = "drift", note = "each head's own level down the tape, described against an EFFECTIVE sample size with a unit-root test beside it" },
+]
+why = """THE HEAD AS PHYSICS RATHER THAN AS A CURVE. A magnetic recording head
+has a known transfer function built from mechanisms established long before
+this format existed - Wallace's separation loss, the gap's sinc, the coating's
+thickness loss, the azimuth's sinc across the track - and fitting to THAT is
+what makes a fitted number a separation in nanometres rather than a spline
+coefficient.
+
+A DIFFERENCE AND NEVER ONE HEAD, which is this wiring's own refusal. The three
+levels are read by two instruments - the decoder's own analytic envelope in the
+luma band, and a narrow complex envelope at the colour-under carrier - and each
+carries its own arbitrary scale, so one head's three levels hold an instrument
+constant no fit can tell from the head's own flat gain. The same two
+instruments read both heads, so that scale cancels exactly in the head
+difference at every frequency, and with it the tape, the record-side path, the
+de-emphasis and the decoder's own filters.
+
+THREE RESERVED CARRIERS AND NOT ONE. A head's response is a shape across
+frequency and one window holds one carrier, so the stage reads the
+synchronizing pulse's flat interior, the back porch after the burst, and the
+colour burst - the last of these six times further down the band than either of
+the others, which is the lever that separates a constant from a slope. No
+sample of active picture enters any of them.
+
+THE TWO FREE PARAMETERS ARE THE MODULE'S OWN CHOICE.
+`head_model.CARRIER_LAW_NULL_SPACE` names `gain_db` and `spacing_m` as
+invisible to any video-domain measurement, because the carrier-normalization
+law annihilates a constant and a linear term exactly - measured through that
+module at 0.0e+00 and 1.8e-15 nepers against 0.15 to 0.32 for gap, thickness
+and azimuth. This is the one place in the decoder that reads the envelope, and
+therefore the only place those two can be fitted at all.
+
+THE DELAY IS THE CLOSED FORM AND NOT `group_delay_s`, and the stage measures
+the reason on its own fitted separation rather than quoting it. That function
+Hilbert transforms the log magnitude on whatever grid the caller passes, and a
+separation loss is a straight line, so the transform's own periodicity
+dominates: the same head on five grids gives +165.5, +166.9, +539.7, +114.8 and
+-34.3 ns against a closed form of -40.76, the sign itself decided by a window
+nobody knows to choose. The stage reports three of those grids beside
+`magnetic_circuit.band_delay_difference`, which has no grid at all.
+
+THE PER-FIELD LOOP CANNOT SEE THE DRUM, AND THAT IS MEASURED HERE. The drum
+turns once every two fields, so sampled once a field its phase is exactly
+(-1)^k - the same vector as the head A/B alternation. The stage builds both
+regressors and reports the largest difference between them, and it is zero. A
+once-per-revolution effect and a head difference are one direction in any
+per-field fit; separating them needs a per-LINE loop, 262 times faster, which
+is a missing loop rather than a missing capture.
+
+MEASURED BY THIS STAGE, 2026-09-07, on two decodes of four fields and two drum
+revolutions each - the bars SP playback tap and the `home` tape, whose only
+common ancestor is the format:
+
+                        bars SP              home
+  carriers read     0.6294 / 3.4365 /    0.6294 / 3.4813 /
+                    3.7161 MHz           3.7520 MHz
+  flat gain           +2.6482 dB          -2.2487 dB
+  separation         +45.44 nm           -21.41 nm
+  residual            0.00738 nepers      0.01526 nepers
+  variance explained  98.9 %              82.2 %
+
+BOTH PARAMETERS CHANGE SIGN BETWEEN THE TWO TAPES, and that is the arc's own
+finding arriving from a new direction: the per-head constant belongs to the
+(recording, playback) PAIR and not to a machine. One deck played both, so a
+playback-side difference would have carried the same sign to both.
+
+AND THE GRID DEPENDENCE IS MEASURED ON EACH DECODE'S OWN FITTED SEPARATION
+rather than quoted. Asked for the same band-to-band delay, `group_delay_s`
+returns +301.4, +961.1 and +223.7 ns on the bars decode and +322.5, +1025.6
+and +262.7 on the home tape over grids of 0.2-7 MHz, 0.5-7 MHz and
+0.05-20 MHz, where the closed form returns -8.66 and -4.11. An order of
+magnitude and a change of sign, decided by a window nobody knows to choose.
+
+The drum-against-parity regressors differ by exactly 0 on both decodes."""
+
+[[node]]
+name = "head_differential"
+scope = "field"
+stage = "rf_playback"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "head_differential", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_head_differential"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_head_differential("
+reads = ["raw_data", "linelocs", "env", "demod", "dspicture"]
+writes = ["head_differential_set"]
+measures = [ { node = "envelope", as = "envelope" } ]
+accumulates = [ { key = "_reserved_band_levels", race = "none", note = "model_stages.py, shared with head_model - the levels are read once a field however many of the group are enabled" } ]
+components = [
+  { name = "amplitude", note = "a separation difference by Wallace's law, solved jointly with a flat gain across the two bands - eleven times the precision on the gain that either band gives alone" },
+  { name = "phase", note = "a pure delay, taken from the two heads' pooled sync profiles as a complex ratio; what remains after the delay is removed is EXCESS phase, and a separation has none" },
+  { name = "frequency", note = "a fractional scaling of the axis, reported as a BOUND - geometry bounds it far below what the data can, which is the finding rather than a shortfall" },
+]
+why = """THE HEAD PAIR AS ETHAN'S SET OF THREE. *"It will be the amplitude,
+phase, and frequency of this differential pair. We have three sets of three
+differential pairs, which form a matrix to calculate over the residuals."*
+Everything the two heads share cancels in their difference, so what survives
+belongs to the heads alone, and exactly three physical parameters can survive
+it - each with its own closed form.
+
+THE AMPLITUDE IS SOLVED ON TWO BANDS AT ONCE, and the module measures why that
+is worth doing: over the luma band alone a constant and a term linear in
+frequency are nearly the same shape (condition 27.0, sigma 186 nm on the
+clearance and 0.78 dB on the gain), and over the two bands together they are
+not (condition 3.1, 23 nm and 0.070 dB). Eleven times the precision on the gain
+and eight on the clearance, from a lever the format itself provides.
+
+THE PHASE IS READ ON THE SYNC PROFILES AND NOT ON THE ENVELOPE, because a phase
+needs a reference and the sync pulse is the one reference the specification
+prints. The two heads' pooled profiles are transformed and divided, and
+`residual_phase_bound` removes the best-fitting pure delay; what is left is
+EXCESS phase. That is the discriminating quantity: Wallace's law is a real
+attenuation and carries no phase, while a gap or an azimuth difference would
+turn the phase through its sinc null. The offline measurement puts the excess
+within plus or minus 1.7 degrees on four captures, and this stage reports its
+own figure against that rather than replacing it.
+
+THE FREQUENCY QUANTITY IS RETURNED AS A BOUND, BY DESIGN. `frequency_verdict`
+will not report a coefficient without an out-of-sample result that clears, and
+none is offered here. Geometry binds it far more tightly than the data can: a
+head standing proud by dr sweeps at (R + dr)/R, and dr is the same protrusion
+the amplitude quantity measures as a separation, so the amplitude measurement
+PREDICTS the frequency quantity's size. The stage reports which of the two
+bounds binds, and on the evidence in hand it is geometry by a wide margin.
+
+WHY AZIMUTH IS NOT ONE OF THE THREE, and the control that says so. Azimuth loss
+is sinc(W tan(dtheta)/lambda), sinc is EVEN and tan is odd, so a single drum
+misalignment reaching head A as +delta and head B as -delta gives the two
+IDENTICAL magnitude responses. `azimuth_cancels_control` is that statement as
+code, and it runs before the reading rather than after it.
+
+THE CONTROLS RUN FIRST AND THE STAGE DECLINES IF ONE FAILS. A construction that
+manufactures a direction would report a mechanism BECAUSE the construction
+split it, and this arc has already recorded one component reading 4.65 of 5 for
+exactly that reason.
+
+MEASURED BY THIS STAGE, 2026-09-07, on two decodes of four fields and two drum
+revolutions each:
+
+                            bars SP           home
+  AMPLITUDE
+    flat gain               +2.6482 dB        -2.2487 dB   both significant
+    clearance              +45.44 nm         -21.41 nm     both significant
+    band ratio measured      0.470             0.711
+    band ratio, a clearance  5.678             5.742
+    band ratio, a gain       1.000             1.000
+  WALLACE, on the luma band alone
+    level split             +1.1185 dB        -1.5152 dB
+    separation             33.26 nm          44.56 nm
+    shape                   0.0788 dB rms     0.1163 dB rms
+    implied half width      0.4362 MHz        0.4805 MHz
+    half width actually read 0.1399 MHz        0.1353 MHz
+  PHASE, on the pooled sync profiles, 18 bins over 0.159 to 2.864 MHz -
+  the format's own stated luma band and not the decoder's 6.6 MHz low pass,
+  above which the pooled pulse carries nothing and a ratio is two small
+  numbers divided
+    pure delay              -3.65 ns          -1.51 ns
+    excess                   9.610 deg rms     4.186 deg rms
+    excess, peak            33.033 deg        10.807 deg
+  FREQUENCY
+    bound from the data      0.134             0.289
+    bound from geometry      1.07e-06          1.44e-06
+  FIXED RESPONSE, over a 0.067 s span
+    level ratio              0.46              1.60
+    shape ratio              3.17              3.02
+
+THE JOINT SOLVE AND `head_model` AGREE TO THE DIGIT on the gain and the
+clearance, and that agreement is worth something because the two are different
+solvers on the same three carriers - a bounded non-linear least squares
+through the physical model against a two-column linear solve - so a defect in
+either construction would separate them.
+
+FOUR OF THESE ARE GAUGES THE STAGE IS NOT FITTED WITH, and three of them
+report a departure. The measured band ratio lands between the two mechanisms
+on both tapes rather than on either, so the difference is neither a pure gain
+nor a pure clearance. The implied half width is three times the band actually
+read, so the departure is not a straight line through the origin - the
+consistency test could have passed and did not. The excess phase is 5.7 and
+2.5 times the 1.7 degrees the offline instrument bounds it at on four
+captures, on two profiles a head, which is the group's own pooling span and is
+thin for a phase. And the SHAPE is resolved between heads on both tapes at 3.2
+and 3.0 times each head's own within-head variation while the LEVEL is
+resolved on neither."""
+
+[[node]]
+name = "magnetic"
+scope = "field"
+stage = "rf_recording"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "magnetic", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_magnetic"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_magnetic("
+reads = ["raw_data", "linelocs", "env"]
+writes = ["record_level_axis"]
+measures = [ { node = "envelope", as = "envelope" } ]
+components = [
+  { name = "crossover", note = "where the self-demagnetisation cap takes over from the record level, in hertz - the whole of the shape, in one number" },
+  { name = "level axis", note = "how many independent directions a set of record levels provides, by the same participation ratio the rest of the arc uses" },
+  { name = "control", note = "linear_control, which must read exactly 1.00 without the cap and read 4.97 when the construction was wrong" },
+]
+why = """THE RECORD LEVEL IS AN AXIS AND NOT A SHAPE. Ethan: *"I think the
+physical models we used are extra dimensions into the magnetic information,
+such as record level for example. There should be a shape that defines that
+against the curve the tape will exhibit."* There is, and the module measured
+what it is: record level reaches the response through the recording depth and
+the transition length, and both land inside the family that already collapsed
+to 1.58 distinguishable of 6, at coherences of 0.9995 and 1.0000. Adding them
+LOWERS the count, to 1.40.
+
+WHAT IS NEW IS THE LEVEL DEPENDENCE, AND THE CAP IS THE ENTIRE REASON.
+Differentiating the response with respect to level gives 2.90 of 5 directions
+with the self-demagnetisation cap in place and 1.01 without it. So the whole
+information content comes from `d <= lambda/(2 pi)` binding at DIFFERENT
+FREQUENCIES FOR DIFFERENT LEVELS: the crossover between level-limited and
+cap-limited recording moves along the band as the level changes, and that
+movement is the shape.
+
+THE CONTROL RUNS FIRST AND CAN FAIL. Without the cap a depth linear in level
+must give exactly ONE direction however many levels are used. A first estimate
+of this axis read 4.65 of 5 and was wrong - the depth had been written as a
+fraction of the cap, which makes the dimensionless group independent of
+frequency - and what exposed it was this control reading 4.97 where it had to
+read 1.00. The stage declines rather than reporting a count taken through a
+construction that fails it.
+
+THE PHASE IS EXACTLY ZERO AND THE STAGE SAYS SO. `magnetic.level_signature`
+returns a complex array whose every phase is zero, which is a fiction rather
+than a measurement: the ratio of two thickness losses is a real, positive,
+minimum-phase amplitude ratio, and a minimum-phase response's phase is the
+Hilbert transform of its log magnitude and is not zero. The stage measures the
+declared phase - it comes back as zero to machine precision - and reports
+`minimum_phase_level_signature` beside it, which supplies the phase the
+magnitude implies. THAT PHASE IS DERIVED AND NOT MEASURED, and both the log
+line and the function's docstring say so.
+
+THE TIME AXIS IS DERIVED TOO, AND ITS LIMIT IS THE HONEST PART. The record
+level was set once, when the recording was made, and is not a per-field
+quantity; nothing in a decode moves it. What a decode can supply is the
+playback envelope's own drift down the tape, which is turned into a drive ratio
+against the decode's own median and carried through `crossover_hz` - so the
+series is a derived level, stated as derived, and the axis it moves along is
+measured.
+
+MEASURED BY THIS STAGE, 2026-09-07. The axis itself is a construction on the
+decode's own band and tape speed, so both decodes give it alike - 0.500 to
+6.500 MHz at 5.8000 m/s, the record level spanning 2.435 of 5 directions at a
+condition of 4.08, with the crossover running from 12.308 MHz at a level of
+0.5 to 2.051 MHz at 3.0, and the control passing at 1.0065 against an expected
+1.00. That sameness is the honest reading rather than a failure to look: two
+captures of one format at one tape speed have the same band, and a figure that
+moved between them would be reading the capture and not the format.
+
+THE DECODE-SPECIFIC PART IS THE DERIVED TIME AXIS, and it does differ:
+
+                        bars SP            home
+  envelope spread      0.0675 nepers      0.0838 nepers
+  as a drive ratio     0.9223 - 1.0665    0.9143 - 1.1098
+  crossover moves      5.770 - 6.673 MHz  5.545 - 6.730 MHz
+  slope a field       -5.137e-02          +6.037e-02
+  significance         2.33 sigma          1.89 sigma
+  random walk          not ruled out       not ruled out
+
+THE PHASE, MEASURED: the declared level signature reads 0.0000 degrees rms -
+exactly zero, to machine precision, on every level - and the minimum-phase
+reconstruction of the same magnitude reads 0.6137. The magnitudes are
+identical to 2.2e-16, so the two differ in nothing but the phase, and only one
+of them is the response."""
+
+[[node]]
+name = "magnetic_circuit"
+scope = "field"
+stage = "rf_playback"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "magnetic_circuit", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_magnetic_circuit"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_magnetic_circuit("
+reads = ["raw_data", "linelocs", "env", "demod"]
+writes = ["two_band_separation"]
+measures = [ { node = "envelope", as = "envelope" } ]
+components = [
+  { name = "amplitude route", note = "the two bands' LEVEL difference read back as a separation, 282.2 nanometres per neper at the standard's own bands" },
+  { name = "time route", note = "the two bands' TIMING difference read back as the same separation, 5.018 nanometres per nanosecond - one is a difference of levels, the other a difference of slopes of phase" },
+  { name = "coherence gate", note = "the burst's own within-window phase coherence, which refuses a capture with no colour-under carrier rather than fitting one" },
+]
+why = """THE SAME SEPARATION READ TWICE, SO THAT THE TWO ROUTES CAN DISAGREE.
+A pair is not two views of one arithmetic: these two share a parameter and
+nothing else. Wallace's loss is minimum phase, so its group delay is fixed by
+its magnitude and the two are `f2 - f1` against `ln(f2/f1)` - they weight the
+band differently even when they agree, and a discrepancy says the path is not
+the pure minimum-phase separation loss the model assumes. That is a finding
+rather than a failure.
+
+THE TIME ROUTE'S CLOSED FORM IS WHY IT IS MEASURABLE AT ALL. Two captures with
+no common clock cannot measure an absolute delay - any instrument comparing
+them removes a linear phase, which removes a constant from the group delay at
+every frequency alike - but a DIFFERENCE BETWEEN TWO BANDS is invariant under
+exactly that removal. So the one time quantity the apparatus can see is the one
+the physics puts information into, and it is
+`tau(f2) - tau(f1) = -(2 d / (pi v)) ln(f2 / f1)`.
+
+THE COHERENCE GATE IS LOAD-BEARING AND THE ERROR BAR IS NOT ENOUGH. The offline
+measurement records a luminance-only capture, whose colour-under coherence is
+0.127, reporting a head delay difference of +2229.70 +/- 104.29 ns - twenty-one
+standard deviations of pure nonsense that a reported error bar alone would have
+accepted. `PHASE_COHERENCE_FLOOR` is 1/sqrt(3), the coherence at which a single
+average's phase error reaches one radian, and this stage measures its own
+coherence to feed it: the band's SIGNAL SHARE, taken with a control. The same
+colour-under band is read inside the synchronizing pulse, where no such
+carrier can be, so the tip gives this capture's own noise floor at that
+frequency through the same filter on the same lines, and what the burst window
+stands above it is the share. The figures below record the wrong gate that
+came first and why it had to go.
+
+AND THE COERCIVITY QUESTION IS DISPOSED OF RATHER THAN LEFT OPEN. The module's
+`coercivity_constrains` finds the record field the medium demands, and this
+project's own arithmetic makes it unreachable by a factor of 15.934 for the
+chrominance. That is not a requirement that fails: SMPTE 32M 7.5.1.2.2 states
+that *"the chrominance signal shall be recorded with the luminance FM signal
+acting as bias"*, and `tape_bias` measures what that bias leaves behind at
++2.084 +/- 0.048 dB per MHz at 43 sigma. The factor is the quantitative reason
+the format had to bias the chroma, and the stage reports it as that.
+
+THE RECORD SIDE'S PHASE IS REFUSED IN THE LOG. `record_side_observability` says
+a record head reaches amplitude and not phase without a matched record tap, and
+that on a single deck the head that wrote a track is the head that reads it -
+so even with a tap the write and read shares are not two terms to be separated
+but one head measured twice. A playback decode has no tap at all, and the stage
+says so rather than attributing its reading to a side.
+
+MEASURED BY THIS STAGE, 2026-09-07, on two decodes of four fields and two drum
+revolutions each:
+
+                            bars SP              home
+  bands read            0.6294 against       0.6294 against
+                        3.5763 / 3.5736 MHz  3.6165 / 3.6139 MHz
+  tilt                 -0.14528 +/- 0.00008  +0.07101 +/- 0.00346 nepers
+  AMPLITUDE route      +45.51 +/- 0.02 nm   -21.95 +/- 1.07 nm
+  delay                 -2.98 +/- 0.32 ns    +7.80 +/- 0.66 ns
+  TIME route           +15.63 +/- 1.67 nm   -40.64 +/- 3.44 nm
+  difference           -29.88 +/- 1.67 nm   -18.69 +/- 3.61 nm
+  significance          17.90 sigma           5.18 sigma
+  ratio                  0.343                1.852
+
+THE TWO ROUTES DISAGREE ON BOTH TAPES, and the pair is what makes that
+visible. They agree in sign on each tape and their ratio falls on OPPOSITE
+SIDES OF ONE between the tapes, so the discrepancy is not a fixed factor
+somewhere in the instrument. A pure minimum-phase separation loss would have
+to give the two numbers alike; something in the path is not that, which is the
+finding the pair exists to produce.
+
+THE AMPLITUDE ROUTE AGREES WITH `head_model` AND `head_differential` to a
+tenth of a nanometre on the bars decode and to half a nanometre on the home
+tape - three estimators, two of them fitting a physical model and this one
+inverting a closed form, on the same three carriers.
+
+THE GATE REFUSES A CAPTURE WITH NO SUBJECT, and it took a wrong gate to find
+the right one. Measured on `multiburst-y-only-NTSC-SP`, which carries no
+chrominance at all, against the bars decode:
+
+                              bars SP        y-only
+  coherence, the gate          0.9984        0.0379   (floor 0.5774)
+  burst over the tip floor    28.02 dB       0.15 dB
+  within-window resultant      0.9988        0.8539
+  verdict                      stands        REFUSED
+  the delay it refused        -2.98 ns      +35.54 ns
+  the separation that implies +15.63 nm    -186.25 +/- 167.91 nm
+
+THE FIRST GATE WAS THE RESULTANT AND IT WOULD HAVE PASSED THE Y-ONLY CAPTURE
+at 0.8539 - because a filter three quarters of a megahertz wide cannot turn
+its phase inside a 2.5 microsecond window whatever is fed to it, so that
+statistic measures the FILTER. The gate now used is the band's own signal
+share, taken with a control: the same band read inside the synchronizing
+pulse, where no colour-under carrier can be, is this capture's own noise floor
+at that frequency through the same filter on the same lines. The y-only
+capture's burst window stands 0.15 dB above it, which is nothing, and the
+delay the gate refuses would have reported -186 nm with a 168 nm error bar.
+
+THE COERCIVITY, on each decode's own carrier: a transition length of
+0.1545 um costing 5.20 dB at 3.5763 MHz and 5.26 dB at 3.6165 MHz, present at
+every wavelength in the band rather than as a wall at the end of it, with the
+coating's thickness binding the bandwidth first - 1.257 um against the
+material's 0.971."""
+
+[[node]]
+name = "tape_path"
+scope = "field"
+stage = "rf_playback"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "tape_path", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_tape_path"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_tape_path("
+reads = ["raw_data", "linelocs", "env"]
+writes = ["clearance_budget"]
+measures = [ { node = "envelope", as = "envelope" } ]
+components = [
+  { name = "budget", note = "every mechanism's contribution to the clearance in metres, at the specified tension and this decode's own writing speed" },
+  { name = "axes", note = "the frequency axis, which is one direction without phase and 1.734 with it, and the time axis over THIS capture's own field count" },
+  { name = "controls", note = "three of them, and each can fail in both directions - a Wallace family that must read exactly 1.00, an entrainment exponent, and a contact pressure" },
+]
+why = """SEVEN MECHANISMS THAT SET ONE CLEARANCE, AND THE BUDGET SAYS WHICH IS
+WORTH CHASING. At the middle of the specified tension range the clearance is an
+aerodynamic problem and a contact problem in roughly equal measure - air
+entrainment 0.0987 um against tape tension 0.0500, a ratio of 1.97 to one -
+with the mechanical terms a tenth of it and the wrap's contribution NEGATIVE,
+which is the sign the contact law gives rather than an error.
+
+THIS STAGE HAS NO MEASUREMENT PAIR AND SAYS SO IN THE LOG. Its three controls
+are CONTROLS - constructions whose answers are known independently, kept as
+code because a control that cannot fail is not a control - and they are not a
+second view of a measurement. And `joint_axis` against `time_axis` is an
+ARITHMETIC IDENTITY by the module's own docstring: each mechanism's joint
+signature is the outer product of its time shape with a frequency factor common
+to all seven, so the Gram matrices are the same matrix and the two counts must
+agree to numerical precision. That agreement is a construction CHECK - if the
+joint count ever exceeded the time count the grid would have manufactured a
+direction - and presenting it as a pair would be presenting arithmetic as
+evidence.
+
+THE TIME AXIS IS THE DECODE-SPECIFIC PART. Every rate is stated by
+`transport_model` from the part's diameter and the tape speed before anything
+is measured, so what a capture decides is not the rates but whether it is long
+enough to hold them: the axis is computed over THIS decode's own field count
+and field rate, and a capture too short for a reel rotation cannot separate the
+mechanisms that turn at one. Two mechanisms return an exactly zero series and
+that is the honest answer rather than a defect - the wrap and the penetration
+are set when the deck is threaded, and nothing that does not move can be told
+from anything else that does not move.
+
+THE ONE CONTACT WITH MEASURED DATA IS A STRAIN AGAINST A TIME BASE. The full
+width of the specified tension range, 0.30 to 0.45 newtons, is 9.9 nanoseconds
+over one NTSC line through the base film's modulus - and the decode's own line
+periods, read off `linelocs` before the time base correction nulls them, are a
+measured scatter to put beside it. The modulus is an ASSUMPTION, stated as one:
+no specification in this project's sources gives it, which is why it is an
+argument to `path_signature` rather than a constant inside it, and why
+`modulus_sensitivity` exists to measure how much of the answer rests on it.
+
+MEASURED BY THIS STAGE, 2026-09-07. The budget and the two axes are
+constructions on the decode's own band, tape speed and field count, so both
+decodes give them alike - at 5.8000 m/s and the specified 0.375 N the
+clearance is air entrainment 0.0987 um, tape tension 0.0500, guide geometry
+and stiffness 0.0161, wrap and penetration -0.0097, head protrusion 0, a total
+of 0.1550 um at 956.3 Pa; the frequency axis spans 1.000000 of 7 directions on
+amplitude alone and 1.734 with the phase; and over four fields the time axis
+spans 2.222 of 7 at a condition of 11.8, with the wrap and the entrained film
+returning exactly zero series because neither moves at all.
+
+THE IDENTITY CHECK PASSES ON BOTH: the joint axis reads 2.222168 against the
+time axis's 2.222168, agreeing to 8.88e-16 on the bars decode and to 0 on the
+home tape. That is the construction check and not a pair.
+
+AND THE ONE MEASURED COMPARISON SEPARATES THE TWO TAPES BY FORTY. The
+specified tension range strains the tape by 3.901e-04 and displaces one
+63.5556 us line by 9.916 ns; the line periods read off `linelocs` before the
+time base correction nulls them scatter by 100.671 ns on the bars decode and
+3916.375 ns on the home tape, over 1088 periods each. So the widest tension
+difference the specification permits accounts for a tenth of the bars tape's
+own time-base scatter and a four-hundredth of the home tape's, and whatever
+moves those time bases is not tension at any value the specification allows.
+That is a control against a measurement, and it is reported as one."""
+
+[[node]]
 name = "decode_chroma"
 scope = "field"
 stage = "picture"
@@ -619,8 +1938,353 @@ entry = "vhsdecode.chroma:decode_chroma"
 site = "vhsdecode/chroma.py"
 anchor = "def decode_chroma("
 reads = ["out_chroma"]
+writes = ["uphet", "chroma_under_tbc"]
+why = """Heterodyne up-conversion, de-emphasis, comb and automatic gain.
+
+It writes a second channel as well as the picture's chroma:
+`chroma_under_tbc` is the DOWN-converted chroma on the output time base, the
+only point in the decode where the signal the tape actually holds exists on
+a regular grid. `luma_beat` releases it, so anything reading it stands ahead
+of that stage. Declared rather than left implicit for the reason `demod_raw`
+was: a channel written by a node and read by another, with no edge between
+them, is a hole the graph cannot see."""
+
+[[node]]
+name = "picture_transform"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "picture_transform", predicate = "!= 0", default = 1, declared_default = true }
+entry = "vhsdecode.model_stages:transform_picture"
+site = "vhsdecode/chroma.py"
+anchor = "model_stages.transform_picture("
+reads = ["dspicture", "uphet", "chroma_under_tbc"]
+writes = ["dspicture", "uphet"]
+mutates_in_place = true
+must_follow = ["hz_to_output", "decode_chroma"]
+must_precede = ["cti"]
+accumulates = [ { key = "_single_transform", race = "none", note = "main thread only; published snapshots are read elsewhere" } ]
+components = [
+  { name = "latch", note = "the correction frozen once, the first time every vertex of every channel in use holds the evidence asked for: the vertices go on accumulating for the report, the applied correction does not change from field to field - rule 4 of the ringing rules, and the reason `colour_free_luma` and `source_correction` each latch on their own - and a second latch is refused, because a new capture is a new transform" },
+  { name = "causal_split", note = "every contrast's departure split on the axis that is not folded, frequency, because the recorded signal is causal: the Bode relation gives the phase a minimum-phase response with that magnitude must have, and the excess over it is a delay - one number, the slope against frequency - plus the all-pass that remains, the share taken after the delay is removed because a delay is not a failure of minimum phase" },
+  { name = "report", note = "what the transform holds, per field: the fills accepted and refused at every vertex, the latched contrasts with their amounts and causal splits, each field's own remainder against the departure removed from it, and the floors - instrument, null pool, banks and the capture's hypercube - in one currency, where a null pool standing above the hypercube is structure to name and not noise to discard" },
+  { name = "remove_residuals", note = "the second treatment of the null space he asked for, removing each individual residual rather than substituting the null space in: the full fold, every contrast a residual in its own right subtracted by the amount it reproduces across the two banks of fields, so a residual describing the path is removed in full and one describing the field it came from is left alone; off, the substitute treatment stands - the pruned fold, the kept contrasts alone at amount one, the null contrasts never computed" },
+  { name = "exact_inverse", note = "Ethan, 2026-09-07: 'Let's see what happens if we take this to hyperspace as the null space model, the exact inverse within our possible area of measure.' On, the inverse is taken EXACTLY - amount one, no correction-gain law - within the region the measurement reaches, the measured band on the causal axis and the admitted contrasts on the folded axes, so the remainder after it is by construction only what lies outside the area of measure, and that outside is the null-space model, reported and never inverted; off, the correction-gain law's half stands, which keeps three quarters of the benefit under a model error the exact inverse would double" },
+  { name = "wave", note = "Ethan, 2026-09-07: 'I believe there is still a wave underneath the convergence that itself can be differentialed as random noise and subtracted out, if we don't already have that.' Each field's remainder after the latch, per vertex, folded on the bits of the field index - the instrument that found the drum, the guides and the reels as lines offline - and each time-scale contrast admitted by the amount the second half of the run reproduces of the first; on, the admitted wave is subtracted at each field by the signs of that field's bits and what does not reproduce is discarded as the random noise it is; off, the wave is folded and reported and the latched constant alone is applied" },
+]
+# THE VERTICES. Each node named here keeps its own declaration, gate and
+# anchor, so it can still be turned on for its own log line; what this node
+# takes from it is the measurement, which fills one vertex of the picture
+# cube, and what it removes is the order they were run in.
+absorbs = [
+  "sync_shape", "precursor", "sync_depth", "vertical_interval", "tape_speed",
+  "level_from_frequency", "source_agc", "vcr_agc", "composite_channel",
+  "multipath", "standard_levels", "source_correction",
+  "chroma_head_switch", "colour_free_luma", "burst_sync_lock", "colour_under",
+  "iq_imbalance", "burst_instrument", "colour_framing", "vectorscope",
+  "picture_stage", "chroma_leakage", "tape_bias",
+]
+why = """THE ONE PICTURE TRANSFORM. Ethan, 2026-09-07: *"There doesn't need
+to be sequencing, just all the dimensions execute at once in a single
+transform."* Every node this one absorbs takes a measurement and fills one
+vertex of one cube - the cube `single_transform` declares for the picture,
+with a mechanism named for every contrast that is kept - so one fold serves
+them all, and the realisations are applied to the luma and the chroma in one
+write with nothing sequenced between them. Three of its four axes are live in
+one decode, colour, head and polarity; the fourth, the field, is carried as
+the known constant it is, because in one decode the field parity IS the head
+label.
+
+WHY A SEQUENCE WAS NEVER NEEDED. The absorbed nodes were built one at a time,
+each when it was understood, and a pipeline was written to order them; but
+the folds commute, and operations that commute need one transform rather
+than a sequence. The nodes keep their declarations, gates and anchors; what
+this node removes is the order.
+
+THE NULL SPACE IS A DECLARATION AND NOT A THRESHOLD, AND IT IS TREATED BOTH
+WAYS HE ASKED FOR. A contrast is kept where a named mechanism produces it.
+Substituted, the rest is never computed - the pruned fold declines to descend
+where nothing below is kept - at the cost of whitening and of an error bar,
+so a component's admission is geometric rather than statistical. Removed,
+every contrast is a residual in its own right, subtracted by the amount it
+reproduces across two banks of fields, which restores the error bar from the
+data itself. Both are built, both are reported, and which is better is
+decided by the held-out remainder on real decodes."""
+
+[[node]]
+name = "chroma_head_switch"
+scope = "field"
+stage = "picture"
+axis = ["time"]
+gate = { option = "chroma_head_switch", predicate = "!= 0", default = 1, declared_default = true }
+entry = "vhsdecode.model_stages:correct_chroma_head_switch"
+site = "vhsdecode/chroma.py"
+anchor = "model_stages.correct_chroma_head_switch("
+reads = ["uphet", "dspicture"]
 writes = ["uphet"]
-why = "Heterodyne up-conversion, de-emphasis, comb and automatic gain."
+mutates_in_place = true
+must_follow = ["decode_chroma", "hz_to_output"]
+accumulates = [ { key = "_chroma_head_switch", race = "none", note = "model_stages.py, written on the field thread only - the chroma path is serial" } ]
+components = [
+  { name = "detect", note = "WHERE, from the luma-chroma residual alone - 12 to 31 sigma above the quiet span on SP, 6 to 11 on EP" },
+  { name = "compensate", note = "the chroma's OWN departure from its four-line lock, pooled over fields of one parity" },
+]
+why = """The record-side colour-under rotation flips where the video heads
+change over and the decoder's up-conversion does not follow it, so the hue at
+the foot of every field departs from the hue the rest of the field holds. A
+JOIN like `luma_beat`, read the other way: the LUMA re-enters the chroma, as
+the detector. The phase applied is not the residual the detector fires on -
+both channels depart at the switch and their difference over-corrects about
+twofold, a table recorded in the model rather than discovered again."""
+
+[[node]]
+name = "burst_sync_lock"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "burst_sync_lock", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_burst_sync_lock"
+site = "vhsdecode/chroma.py"
+anchor = "def _run_burst_sync_lock("
+reads = ["uphet", "linelocs"]
+writes = ["burst_sync_vernier"]
+must_follow = ["decode_chroma", "hz_to_output"]
+must_precede = ["cti"]
+components = [
+  { name = "coarse", note = "the SYNC-ONLY line positions, linelocs2 - reading the corrected ones would read back the decoder's own burst refinement and return a lock true by construction" },
+  { name = "fine", note = "the burst as a complex phasor over the reserved window, one degree of which is 0.776 ns" },
+]
+why = """ONE MEASUREMENT IN TWO UNITS. Ethan: "burst is a constant phase, and
+time is known across the period of the burst, it should be locked absolutely
+to the sync pulse within the field by comparing the position relative to the
+position in the burst." Within a gated subcarrier of known frequency, phase
+and elapsed time are interchangeable - phi = 2 pi f t - so phase, frequency and
+time are one relation rather than three axes measured separately.
+
+THE TWO REFERENCES FAIL IN OPPOSITE WAYS AND COMPOSE EXACTLY. The sync edge
+happens once a line, so there is no question which one is being looked at, but
+it is a band-limited edge in noise. The burst's phase is fixed by
+specification, so a departure is the channel's, but phase repeats every
+subcarrier cycle. The sync chooses the cycle; the burst places the line within
+it. The condition is a single inequality and it is checked rather than
+assumed: the sync's own error must be under half a subcarrier period or the
+vernier picks the wrong cycle and is wrong by exactly 279 ns - a failure that
+looks like a clean measurement, which is why the margin is reported.
+
+APPLIES NOTHING. Its product is compared with the displacement the decoder's
+own burst refinement applied, two estimates of one quantity that share no
+arithmetic.
+
+MEASURED on three decodes. On the 75 per cent bar tape the sync alone
+localises to 31.5 ns against the burst's 0.776 ns a degree - a vernier forty
+times finer than the reference it refines - the lock's spread is 0.79 ns, and
+the decoder's own burst refinement agrees at |r| = 0.958 over 245 lines, the
+sign being the convention (a line the burst says is late is one the decoder
+moves earlier). The claim `absolute within the field` FAILS by a small margin
+on both tapes that resolve: the systematic drift down the field is 1.24 and
+0.86 ns against spreads of 0.79 and 0.78, so the two references walk apart by
+about a degree and a half of subcarrier from the top of the picture to the
+bottom.
+
+AND IT DECLINES WHERE THE INEQUALITY FAILS, WHICH IS THE POINT OF CHECKING IT.
+On home some fields carry 229.6 ns of sync error and on countdown 636.7,
+against the 139.7 ns half period the vernier needs; those fields are refused
+rather than returned wrong by exactly one subcarrier period."""
+
+[[node]]
+name = "colour_under"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "colour_under", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_colour_under"
+site = "vhsdecode/chroma.py"
+anchor = "def _run_colour_under("
+reads = ["chroma_under_tbc"]
+writes = ["colour_under_channel"]
+must_precede = ["luma_beat"]
+accumulates = [ { key = "_chroma_measurements", race = "none", note = "model_stages.py, written on the field thread only - the chroma path is serial" } ]
+components = [
+  { name = "carrier", note = "the carrier's own position from the burst's phase slope, against the specified 40 f_H" },
+  { name = "headroom", note = "how close the lower sideband comes to folding through zero, against the DECODER's band-pass ceiling rather than a nominal one" },
+  { name = "delay", note = "the same slope read as a group delay, which is what the phase was shown to be rather than the amplitude's causal partner" },
+]
+why = """THE LOW CARRIER, measured where it still exists as itself. Not to be
+confused with the `chroma_under` node above, which is the RF-scope filter that
+forks the colour-under out of the raw data; this reads what that fork produced
+after the time base correction and before the heterodyne puts it back at the
+subcarrier.
+
+MEASURES AND APPLIES NOTHING, and everything it reads is in the RESERVED
+INTERVAL: the burst is nine cycles of a known tone sitting in the colour-under
+band, so the carrier, the level and the delay all come from that window and
+none of them from the picture. The window resolves 397.7 kHz by the 1/T law
+and the reading says so, because a figure without its resolution invites being
+read as though it located something.
+
+FIRST IN THE CHROMA LIST, which is a requirement and not a preference:
+`luma_beat` releases `chroma_under_tbc`."""
+
+[[node]]
+name = "iq_imbalance"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "iq_imbalance", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_iq_imbalance"
+site = "vhsdecode/chroma.py"
+anchor = "def _run_iq_imbalance("
+reads = ["chroma_under_tbc"]
+writes = ["quadrature_imbalance"]
+must_precede = ["luma_beat"]
+accumulates = [ { key = "_chroma_measurements", race = "none", note = "model_stages.py, written on the field thread only - the chroma path is serial" } ]
+components = [
+  { name = "image", note = "the period-two component after each run is de-rotated by the rotation that run actually carried" },
+  { name = "rotation", note = "SMPTE 32M 3.9.2.1.5's quarter turn a line, read from the data rather than assumed - it ADVANCES on one track and RETARDS on the other" },
+  { name = "control", note = "the same statistic a little away from period two, where no imbalance can put anything" },
+]
+why = """THE CHROMA'S QUADRATURE IMBALANCE, which is what a sheared
+vectorscope IS. Ethan: *"The vectorscope looks like an IQ imbalance on the
+chroma channel ... I think we can see the IQ imbalance by using the entire
+complex shape of the burst itself in all dimensions."*
+
+An imbalanced pair maps `b` to `alpha b + beta conj(b)`, and the conjugate
+term counter-rotates - a circle becomes an ellipse and the colour coordinate
+system shears. It is invisible to a magnitude, because a phasor and its
+conjugate have the same modulus, which is why nothing here is reduced to one.
+
+ON THE COLOUR-UNDER AND NOWHERE ELSE. At the composite burst's 180 degrees a
+line the signal and its image are the same sequence - coherence 1.0000,
+condition 1.3e14 - and no fit separates them; at the colour-under's 90 degrees
+they counter-rotate at coherence 0.0000 and condition 1.0. The record-side
+rotation is not an obstacle to this measurement, it is the whole of what makes
+it possible. Hence the site, beside `colour_under` and ahead of `luma_beat`,
+which releases the array both read.
+
+REPORTS AND DOES NOT CORRECT. The correction is one complex division and the
+measurement supplies both terms; what it does not supply is a margin. Measured
+on the radio frequency at both taps, the image stands at 1.77 to 1.97 times
+its own control on the bars and 5.77 only on the chroma-noise record tap - and
+at 44 dB rejection on the record tap against 19 on the playback tap of the
+same signal, which places the imbalance on the PLAYBACK side rather than on
+the tape."""
+
+[[node]]
+name = "burst_instrument"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "burst_instrument", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_burst_instrument"
+site = "vhsdecode/chroma.py"
+anchor = "def _run_burst_instrument("
+reads = ["uphet"]
+writes = ["burst_three_dimensions"]
+must_follow = ["decode_chroma"]
+must_precede = ["cti"]
+accumulates = [ { key = "_chroma_measurements", race = "none", note = "model_stages.py, written on the field thread only - the chroma path is serial" } ]
+components = [
+  { name = "frequency", note = "the burst envelope's spread against the specified rectangle, which IS the chroma band's shape" },
+  { name = "amplitude", note = "the level with SMPTE 32M 3.9.2.1.3's record-side 6 dB doubler undone, so it refers to the chroma and not to the burst" },
+  { name = "time", note = "the phase, 0.776 ns a degree against the 14 ns a sync edge affords" },
+  { name = "per_line", note = "the specification's own per-line model - constant amplitude, 180 degrees a line - and the residual after it" },
+  { name = "field_constant", note = "the same specification read per field, and whether the two readings agree; measured, they do not, by 1.6 to 2.7 times" },
+]
+why = """THE BURST IS TO THE CHROMA WHAT THE SYNC PULSE IS TO THE LUMA: a known
+shape sent through the channel, so what comes back is the channel. Ethan:
+*"It's going to be based on the up-heterodyned burst shape, the entire three
+dimensions, how the color stretches, the active area is contents we want to
+keep."* Three dimensions, and the active area untouched - the burst is in the
+reserved interval and this reads nothing else.
+
+A MEASUREMENT AND NOT A CORRECTION, deliberately. The specified separator tilt
+`amplitude_differential` carries is odd about the burst's centre, so it moves
+no bulk phase and shows only as a ramp across the burst, and it is NOT
+confirmed on the SP tapes. It is reported and applied nowhere.
+
+BEFORE THE CORRECTIONS, so an instrument does not read its own effect, and
+before `cti`, which reshapes exactly the amplitude a physical measurement of
+the chroma is taken across."""
+
+[[node]]
+name = "colour_framing"
+scope = "field"
+stage = "picture"
+axis = ["frequency", "time"]
+gate = { option = "colour_framing", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_colour_framing"
+site = "vhsdecode/chroma.py"
+anchor = "def _run_colour_framing("
+reads = ["uphet", "phase_sequence"]
+writes = ["colour_frame_contract"]
+must_follow = ["burst_phase", "decode_chroma"]
+accumulates = [ { key = "_chroma_measurements", race = "none", note = "model_stages.py, written on the field thread only - the chroma path is serial" } ]
+components = [
+  { name = "map", note = "the decoder's shipped (isFirstField, parity) table against the sequence the specification fixes at the sync edge; the NTSC map passes on all four states" },
+  { name = "sequence", note = "whether fieldPhaseID ascends and wraps, which 45 of 683 shipped decodes did not" },
+]
+why = """THE ONE STAGE HERE THAT DECLINES ON EVERY DECODE, and the refusal is
+the finding. The subcarrier and the record heterodyne oscillator both advance
+a fractional three quarters of a cycle a field, so the 270 degrees that
+carries the four-field sequence cancels exactly in the down-conversion and the
+colour-under advances 10500 whole cycles a field. The quantity is not on the
+tape, so no measurement can take it off, and a stage that cannot measure its
+subject must say so rather than guess.
+
+WHAT IT CHECKS INSTEAD is checkable: the shipped map against the specified
+sequence, and the counter's own output against the contract that it ascends.
+A counter carries the framing forward from wherever it started and no counter
+survives a splice, so making its failures visible per decode is the honest
+half of what is available.
+
+NO AMPLITUDE AXIS, AND THERE CANNOT BE ONE. The quantity is a state index out
+of four and an index has no magnitude. What would carry an amplitude is the
+CONFIDENCE of a measured framing, and that is unavailable for the reason
+above rather than for want of an estimator."""
+
+[[node]]
+name = "vectorscope"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "vectorscope", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_vectorscope"
+site = "vhsdecode/chroma.py"
+anchor = "def _run_vectorscope("
+reads = ["uphet"]
+writes = ["colour_coordinate_system"]
+must_follow = ["decode_chroma"]
+must_precede = ["cti"]
+accumulates = [ { key = "_chroma_measurements", race = "none", note = "model_stages.py, written on the field thread only - the chroma path is serial" } ]
+components = [
+  { name = "clustering", note = "the fourfold resultant, which folds an orthogonal pair onto one point, against the floor random orientations reach at four sigma" },
+  { name = "separation", note = "the twofold resultant, which is the cosine of the angle between the two axes and is zero for the right angle the encoding specifies" },
+  { name = "map", note = "the whole departure as alpha d + beta conj(d), whose second half is the shear no rotation can fix" },
+]
+why = """THE COLOUR'S COORDINATE SYSTEM, from the directions the transitions
+between colours run in. Ethan, with a scope in front of him: *"I believe these
+lines pointing to I.Q.-I,-Q need to be corrected and represent a measureable
+shape that we can use for correcting the color's coordinate system."*
+
+The module's standing finding that no BAR TARGET sits on an I or Q line - the
+closest is 19.54 degrees away - is about the six targets and is unchanged. His
+scope is set to whole line rather than to burst, so it shows the TRANSITIONS
+too, and a transition is a trajectory with a direction. Six targets fix six
+points; the transition directions fix the AXES those points are expressed in,
+which moves every colour at once instead of six.
+
+READS THE ACTIVE PICTURE, under the same exception `colour_lock` was granted
+for the residual colour carrier and with the same discipline: a derived null
+distribution decides whether the shape is there at all, and the stage declines
+in the log rather than reporting a coordinate system it has not established.
+It applies nothing - the correction would be a two-by-two linear map and
+nobody has ruled on it yet."""
 
 [[node]]
 name = "luma_beat"
@@ -639,6 +2303,224 @@ why = """A JOIN, not a tail stage: the chroma branch re-enters the luma. The
 colour-under's beat is removed from the picture, scaled by the chroma's own
 saturation - which is why it must read the chroma BEFORE the transient
 sharpener touches it."""
+
+[[node]]
+name = "colour_free_luma"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency"]
+gate = { option = "colour_free_luma", predicate = "!= 0", default = 1, declared_default = true }
+entry = "vhsdecode.model_stages:correct_colour_free_luma"
+site = "vhsdecode/chroma.py"
+anchor = "def _run_colour_free_luma("
+reads = ["uphet", "dspicture"]
+writes = ["dspicture"]
+mutates_in_place = true
+must_follow = ["decode_chroma", "hz_to_output"]
+must_precede = ["cti"]
+supersedes = ["luma_beat"]
+components = [
+  { name = "lock", note = "the fixed four-line offset between the decoded chroma and the luma's colour-under replica" },
+  { name = "transfer", note = "one complex number a field, fitted on the active area alone" },
+]
+why = """SUPERSEDES `luma_beat` rather than running beside it: both subtract
+the same colour-under coupling from the same picture, so running the two takes
+it out twice and the second fit is made against a picture the first has
+already emptied. `supersedes` is what makes that a refusal at startup rather
+than a decode that completes and is wrong. The difference between them is
+where the estimate is taken - the up-heterodyned chroma turned back through
+the measured four-line lock, one complex transfer per field, masked to the
+active area - rather than the down-converted colour-under with one transfer
+frozen for the whole decode."""
+
+[[node]]
+name = "picture_stage"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "picture_stage", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_picture_stage"
+site = "vhsdecode/chroma.py"
+anchor = "def _run_picture_stage("
+reads = ["uphet", "dspicture"]
+writes = ["picture_stage_alignment"]
+must_follow = ["decode_chroma", "hz_to_output"]
+must_precede = ["cti"]
+accumulates = [ { key = "_chroma_measurements", race = "none", note = "model_stages.py, keyed by stage name; the per-field locks, written on the field thread only - the chroma path is serial" } ]
+components = [
+  { name = "burst lock", note = "the burst window's complex lock and its LINE COHERENCE, the length of the mean phasor against the mean length" },
+  { name = "active lock", note = "the same reading in the active window, which on picture-bearing material is the vector sum of the hues and is reported as such" },
+  { name = "drift", note = "the burst's phase across the field read as a frequency - the reading that does not depend on the picture" },
+  { name = "separability", note = "how many of the four named modifications this decode's own baseband tells apart; a property of the MODEL, not of the tape" },
+]
+why = """THE REFERENCES AND ALIGNMENTS THAT ACT AFTER THE RADIO-FREQUENCY
+MATRIX. Ethan named four: *"sync pulse amplitude and phase; genlocking, which
+aligns the colour burst to hsync; burst locking, which aligns the hsyncs to
+the colour burst; and the time-base residual, which is the existing residual
+subtracted from a constant."*
+
+WHY THEY ARE A STAGE OF THEIR OWN. Every mechanism in the magnetic key acts
+on the carrier ahead of a NON-LINEAR demodulator, which is why the standing
+law forbids inverting them with a video-domain filter. These act on the
+demodulated line, on quantities the radio-frequency stage does not carry at
+all - the horizontal reference, the subcarrier's phase against it, and the
+line-to-line timing - and their abscissa is the video baseband.
+
+THEY ARE A DIFFERENT KIND OF FAMILY AND NOT MORE MEMBERS OF A COLLINEAR ONE.
+On the NTSC baseband to 4.2 MHz the four reach 3.844 of 4 at condition 1.35,
+which is 0.961 of their count, against the tape magnetics' 1.58 of 6 at
+condition 1.06e4 - 0.263 of theirs. The six magnetic losses are six values of
+ONE dimensionless group; these four depend on four different ones.
+
+HERE, ON THE CHROMA PATH, BECAUSE THIS IS THE ONLY PLACE THE MEASUREMENT CAN
+BE TAKEN - the up-heterodyned chroma and the sync-referred line origin coexist
+only inside `decode_chroma`, which is the argument `chroma_leakage` already
+stands on. Before `cti`, which accelerates the sweep between colour states at
+exactly the transitions the burst window abuts.
+
+THE ACTIVE WINDOW IS READ AND IS REPORTED AS PICTURE, WHICH IS THE MODULE'S
+OWN FINDING AND NOT A LAPSE. The two windows are two readings of one lock and
+they disagree: on two recordings made by one machine within minutes of each
+other the burst-to-active difference is -42 degrees on colour bars and +78 on
+a chroma noise pattern, and a lock cannot depend on what was filmed. The
+active window IS strongly line-coherent - 0.73 to 0.9999 - so a residual
+carrier is there to read, but its phase is the picture's. Nothing is corrected
+from it.
+
+WHAT DOES SAY THE HETERODYNE IS LOCKED is the burst across the field: fitting
+its phase against line number gives a drift of -0.01, -0.01 and +0.05 Hz on
+the three tapes, so the fixed-frequency assumption costs nothing these
+captures can see.
+
+AND WHAT SEPARATES GENLOCK FROM BURST LOCK IS NOT A BAND BUT A PRECISION.
+Genlock rotates the subcarrier's phase, a constant phase on the burst's band;
+burst lock displaces the line origin, a delay whose phase is linear in
+frequency and which reaches the luma too. Constant against linear is a
+difference in kind, so the luma ought to break the tie - and it does not,
+because a delay's sensitivity goes as `f |X(f)|` and the specified line's only
+high-frequency content is the burst itself. They come out 1.028 of 2 on the
+full baseband and 1.023 of 2 on the burst band alone. What separates them is
+the sync's own position, located to a ninetieth of a 4fsc sample - 0.776
+nanoseconds - at one degree of burst phase.
+
+MEASURED BY THE RUNTIME STAGE, 2026-09-06, four fields each:
+
+    decode              burst   active   difference  drift Hz   across
+                        coh.    coh.     deg                    the line
+    75 bars SP          0.9999  0.9646    -33.3      +0.273     -18724
+    home                0.9998  0.9562    +46.9      +0.232       -416
+    countdown           0.9987  0.8015    +73.6      -0.830      -7789
+    multiburst y-only   0.9748  0.1082    +89.4      +0.499     +14653
+
+The burst holds 0.975 to 0.9999 on every capture while the burst-to-active
+difference takes four different values on four captures from two decks - and
+the y-only multiburst, whose picture carries no chrominance at all, drops
+the active coherence to 0.108 while its burst still locks at 0.975. That is
+the negative control for "the active reading is the picture's" rather than
+an argument for it. On this decode's own baseband to 7.16 MHz the four
+modifications come out 3.501 of 4 at condition 1.82.
+
+THE GAUGE IT IS NOT FITTED WITH is where the sync edge actually lands. This
+node states the precision that would separate genlock from burst lock and
+says nothing about whether the decoder reaches it; measured on the written
+time base corrected output as the robust scatter of the interpolated
+half-amplitude crossing, it is 5.34 ns on the bars tape, 11.46 on home,
+20.93 on countdown and 88.54 on the multiburst pattern - 6.9 to 114 times
+the 0.776 ns required. So on this decoder they ARE one dimension, on every
+capture, by a factor of seven at best."""
+
+[[node]]
+name = "chroma_leakage"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "chroma_leakage", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_chroma_leakage"
+site = "vhsdecode/chroma.py"
+anchor = "def _run_chroma_leakage("
+reads = ["uphet", "dspicture"]
+writes = ["chroma_in_the_luma"]
+must_follow = ["decode_chroma", "hz_to_output", "luma_beat", "colour_free_luma"]
+must_precede = ["cti"]
+accumulates = [ { key = "_chroma_measurements", race = "none", note = "model_stages.py, written on the field thread only - the chroma path is serial" } ]
+components = [
+  { name = "subcarrier", note = "the up-converted colour finding its way back into the luma at 3.579545 MHz" },
+  { name = "colour-under", note = "the recorded carrier surviving the separation at 40 f_H, 629.371 kHz" },
+  { name = "control", note = "the same statistic at 0.83 of the subcarrier, where no chroma can be, so the threshold is measured on this material rather than assumed" },
+]
+why = """CHROMA LEFT IN THE LUMA, on both of the channels Ethan names. *"I am
+still seeing chroma leakage in the luma ... The test should be written that
+asserts no chroma leakage from the color under and the upconverted color
+exists in the luma channel."* The assertion is in the model, it FAILS on every
+decode measured - 3.5 to 4.4 times its own control - and it is carried as an
+expected failure rather than weakened. This is the same measurement taken
+where the decoder can take it.
+
+LAST OF THE MEASUREMENTS AND AFTER EVERY CORRECTION, which is what the
+placement means: the question is about the luma being DELIVERED, so a decode
+with `colour_free_luma` enabled should show this figure fall. Before `cti`,
+which reshapes the chroma the statistic is correlated against.
+
+THE FRAMING IS THE TRAP IT STEPS OVER. The colour-under advances 10500 whole
+cycles a field and carries no field sequence; the UP-CONVERTED channel does
+carry one, and pooling both blindly drives a real leak toward zero. Measured
+on the chroma-noise decode the blind figure is 0.0225 and the framed one
+0.2080, a factor of nine a blind test would have called cleanliness."""
+
+[[node]]
+name = "tape_bias"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "tape_bias", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_tape_bias"
+site = "vhsdecode/chroma.py"
+anchor = "def _run_tape_bias("
+reads = ["dspicture"]
+writes = ["tape_bias_residual"]
+must_follow = ["decode_chroma", "hz_to_output", "luma_beat", "colour_free_luma", "chroma_leakage"]
+must_precede = ["cti"]
+accumulates = [ { key = "_chroma_measurements", race = "none", note = "model_stages.py, written on the field thread only - the chroma path is serial" } ]
+components = [
+  { name = "product", note = "the third-order product of the two carriers, at 80 f_H = 1.258741 MHz, where the format's own arithmetic puts it" },
+  { name = "interleave", note = "the half-line-rate offset the colour under's quarter-turn-a-line rotation gives the product, measured rather than assumed" },
+  { name = "control", note = "the same statistic in the neighbouring transform bins, 1.25 f_H away, where no product can be - a LOCAL control, so it does not assume the picture's spectrum is flat over a wide span" },
+]
+why = """THE CHROMA IS RECORDED ON THE LUMA'S OWN BIAS, and this is what that
+bias fails to linearise. SMPTE 32M 7.5.1.2.2: *"The chrominance signal shall be
+recorded with the luminance FM signal acting as bias"*; JVC VTG82063 1.1.6 says
+the same for baseline VHS four times over. The bias is a FEW-CYCLE bias - a
+tape element sees three tenths of a cycle across the switching band, computed
+from the arc's own Karlqvist field - so a third-order product survives at
+`f_y - 2 f_c`, which demodulates into the picture at `2 f_c`. The guide names
+that product as the reason the colour under sits at 40 f_H rather than
+anywhere else.
+
+IT IS SEPARABLE BECAUSE IT ALTERNATES. The colour under is rotated a quarter
+turn a line, so the product is at 80 f_H +- f_H/2 - half a line rate off the
+luminance's own harmonics, which is what "interleaved" means and which no
+picture content shares. Measured on the chroma-noise SP decode the alternating
+part stands at 2.2651 IRE against a neighbouring-bin control of 0.0323, and
+the measured offset is -0.4978 cycles a line on twelve fields of twelve, the
+nearest bin a 231-line transform has to exactly one half. On the `home` decode,
+which carries no steady chroma, the reading is 0.0283 against 0.0241 and the
+offset is exactly zero.
+
+NOT A CORRECTION, AND THE REASON IS EVIDENCE RATHER THAN EFFORT. The same
+mechanism imposes a luma-dependent chroma gain of +2.084 +- 0.048 dB per MHz of
+luma carrier, measured between this deck's record and playback taps against an
+FM-envelope control of -0.095 +- 0.065. A DECODE HOLDS ONE TAP, so the number
+it could measure is the source's differential gain plus the record chain's plus
+the tape's, and correcting the sum would take the picture's own colour out with
+the artefact.
+
+DISTINCT FROM `chroma_leakage`, which is why it stands beside it rather than
+inside it: that stage measures the colour under SURVIVING THE SEPARATION at
+40 f_H, which is a filter's business and a filter's to fix, while this measures
+a product WRITTEN ON THE TAPE at 80 f_H that no separation filter can reach."""
 
 [[node]]
 name = "cti"
@@ -660,7 +2542,537 @@ why = """LAST, after every stage that measures the chroma. A cosmetic
 sharpener: it accelerates the sweep between colour states, so anything
 measuring a physical property of the chroma must read it first. Its reach is
 measured per field from the burst - the chroma path's own step response -
-rather than set by a knob."""
+rather than set by a knob.
+
+RETIREMENT: `--stages -cti` is the whole of the directive that asks the
+transform-based chroma stage to supersede this one, so no second control was
+added for it. Measured cost of removing it, on line-to-line chroma phase
+scatter inside a flat colour over eight fields of a 75% bars decode: 1.00 to
+1.01 degrees, one per cent. The COLOUR FILTERING named in the same directive
+is a different answer and is not retired - removed, the same gauge goes 1.00
+to 2.23 degrees, and the acceptance test before it goes is a superseding stage
+reaching 1.00 or below with the comb off."""
+
+[[node]]
+name = "level_from_frequency"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "level_from_frequency", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_level_from_frequency"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_level_from_frequency("
+reads = ["raw_data", "dspicture"]
+writes = ["carrier_levels"]
+must_follow = ["hz_to_output", "sync_depth"]
+must_precede = ["standard_levels"]
+accumulates = [ { key = "_chroma_measurements", race = "none", note = "model_stages.py, keyed by stage name; the per-decode carrier readings, written on the field thread only" } ]
+components = [
+  { name = "carrier", note = "the synchronizing tip's and blanking's own frequencies, band-limited to the luma first because the instantaneous frequency of the SUM of the two recorded carriers is neither of theirs" },
+  { name = "gap", note = "the same spacing in IRE at the specification's 7.14 kHz an IRE, which is the level" },
+  { name = "pair", note = "the picture's own gain beside it; the two share no stage, so their agreement bounds both" },
+]
+why = """THE LEVELS READ WHERE THEY ARE FINEST, WHICH IS NOT THE PICTURE.
+SMPTE 32M-2004 clause 3.9.1.1.4 puts the synchronizing tip at 3.4 MHz and
+peak white at 4.4, so the 140 IRE excursion IS the 1.0 MHz deviation and a
+level and a frequency are one quantity in two units. The level-domain
+reading inherits the demodulator, the de-emphasis, the time base and every
+correction after them; this one is taken on `field.data["input"]` and
+inherits none of them.
+
+THE MODULE'S RECORDED FINDING, which this stage brings into the runtime: on
+the bars tape the carrier holds 40.82 IRE and on countdown 42.14 to 43.62,
+against 34.925 and 36.518 delivered by the decoded picture - the same 1.15
+to 1.19 ratio on two tapes recorded on different equipment years apart. THE
+LEVEL DEFICIT IS THEREFORE NOT ON THE TAPE, and every earlier reading of it
+was taken on the decoded picture and attributed to the chain.
+
+TWO CAUTIONS TRAVEL WITH IT. A window on an unlocked passage returned 61.8
+IRE with a tip scatter of 74 kHz against 7 to 10 in the good windows, so the
+scatter is what separates a measurement from a dropout - and the gate here
+is `sync_depth`'s own, the standard's 1 IRE tolerance read robustly and
+expressed in hertz. And one of the three tapes could not be measured offline
+at all because libsndfile cannot seek it; from inside the decode that
+obstacle does not exist, because the field's own radio-frequency block is
+already in hand.
+
+MEASURED BY THE RUNTIME STAGE, 2026-09-06, 191 or 192 pulses over four
+fields of 64 lines each:
+
+    decode              tip MHz  blanking  gap IRE  carrier  picture
+    75 bars SP           3.4280   3.7234    41.46   1.0366   0.9738
+    multiburst y-only    3.4322   3.7250    40.97   1.0242   0.9745
+    home                 3.4644   3.7654    42.52   1.0631   0.9466
+    countdown            3.3822   3.7291    48.76   1.2191   DECLINED
+
+The tape holds its levels and the decode does not, on every capture. The
+last row is this node earning its place: countdown's tip is unreadable in
+the picture - 79 per cent of it on the container floor, which makes
+`sync_depth`, `source_agc`, `vcr_agc` and `standard_levels` all decline -
+and the carrier reading is untouched, because a clip imposed after the
+demodulator does not exist before it.
+
+THE RATIO IS 1.065 AND NOT 1.17, AND THE DIFFERENCE IS THE UNITS TRAP. The
+module's picture-side numbers came from the written JSON as
+`(white16bIre - black16bIre)/100`, which `--level_adjust` inflates to
+400.768 units an IRE where the decode used 358.4. The bar tape's picture
+gain is 0.9738 on the decode's own scale, and the earlier 0.873 times
+1.1182 is 0.976.
+
+THE GAUGE IT IS NOT FITTED WITH is the picture's bar plateaus regressed
+through the origin on SMPTE 170M's luminances: 0.9734 against the sync
+pulse's 0.9738, while the carrier stands 6.5 per cent above both."""
+
+[[node]]
+name = "source_agc"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "source_agc", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_source_agc"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_source_agc("
+reads = ["dspicture"]
+writes = ["source_gain_control"]
+must_follow = ["hz_to_output", "sync_depth"]
+must_precede = ["standard_levels"]
+accumulates = [ { key = "_chroma_measurements", race = "none", note = "model_stages.py, keyed by stage name; the per-field offset, gain and asymmetry, written on the field thread only" } ]
+components = [
+  { name = "offset", note = "the back porch against the specified zero - an OFFSET, because a gain cannot move a zero" },
+  { name = "gain", note = "the blanking-to-tip spacing against the specified forty - a GAIN, because an offset cannot change a spacing" },
+  { name = "asymmetry", note = "the trajectory's own increments, fast down and slow up; ORDINAL only, because the drive is never observed" },
+]
+why = """CHAIN POSITION 7, AND DERIVED BY ASSERTION RATHER THAN FITTED TO A
+RESIDUAL. Ethan: *"AGC can be derived by asserting the levels should be
+constant, and back porch should be ire 0."* Blanking is the reference zero
+and the synchronizing level 40 IRE beneath it (ITU-R BT.1700), so on a signal
+that has passed through nothing both are constants on every line of every
+field. What is measured instead is the chain, and the part of it that MOVES
+belongs to the only element whose purpose is to move.
+
+THE TWO OBSERVABLES SEPARATE BY CONSTRUCTION AND NOT BY FITTING: a gain
+cannot move a zero and an offset cannot change a spacing, so the back porch
+measures one and the sync depth the other with nothing solved between them.
+
+WHAT IS NOT IDENTIFIABLE, DECLARED RATHER THAN GLOSSED. The driving level is
+never observed - only the control's output is - so the two time constants
+cannot both be recovered, and an earlier attempt at one-step prediction was
+self-referential and returned the lower ends of its own search ranges. What
+IS identifiable is the ASYMMETRY, because it is a property of the trajectory:
+a control that falls fast and recovers slowly takes large downward steps and
+small upward ones whatever drove it. The module's own controls put a planted
+ratio of 10 at 1.0 and one of 100 at 4.3, so the statistic ORDERS controls
+and is not the ratio, and the stage says so in the log rather than quoting a
+number it cannot support.
+
+THE FREQUENCY AXIS IS DERIVED AND IS LABELLED SO. `levels_as_frequencies` is
+the specification applied to the measurement, not a second measurement: the
+levels ARE the carrier's frequencies once the signal is on tape, so a gain of
+g puts the recorded deviation at g megahertz and moves the sidebands, the
+guard to the colour-under and the band the head must carry with it. The band
+the control could act over at all needs the two time constants, and those
+need the drive.
+
+MEASURED BY THE RUNTIME STAGE, 2026-09-06, four fields of 245 lines each:
+
+    decode              offset   moves   gain     moves    asymmetry
+    75 bars SP          -0.013   0.259   0.9752   0.0077     0.995
+    multiburst y-only   -0.019   0.381   0.9803   0.0128     1.058
+    home                +0.204   0.876   0.9480   0.0107     1.084
+    countdown              -       -       -        -      DECLINED
+
+IT IS INERT ON THE EFFECT IT EXISTS FOR, and that is the finding. The
+asymmetry runs 0.995 to 1.084 where the module's own planted control at a
+ratio of ten reads 1.0 and one at a hundred reads 4.3. The two LEVELS are
+not inert - home's porch stands +0.204 IRE from zero and moves 0.876 IRE
+within a field - it is only the axis that would identify a CONTROL that is
+silent.
+
+THE GAUGE IT IS NOT FITTED WITH is the radio-frequency carrier, read by
+`level_from_frequency` on the same fields with no stage in common: 1.0242,
+1.0366 and 1.0631 against this node's asserted 0.9803, 0.9752 and 0.9480.
+The gain this node measures is the PICTURE's, and the tape's is above it on
+every capture."""
+
+[[node]]
+name = "vcr_agc"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "vcr_agc", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_vcr_agc"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_vcr_agc("
+reads = ["dspicture"]
+writes = ["recorder_gain_control"]
+must_follow = ["hz_to_output", "sync_depth"]
+must_precede = ["standard_levels"]
+accumulates = [ { key = "_chroma_measurements", race = "none", note = "model_stages.py, keyed by stage name; the per-field drifts and the bound they imply, written on the field thread only" } ]
+components = [
+  { name = "pair", note = "the two level series, which answer to different mechanisms and are allowed to disagree - a level shift moves both together, a gain drift moves only the spacing" },
+  { name = "curvature", note = "the bend a relaxation would leave inside the window, per unit of the fitted slope; the series are straight, so the bound runs the other way and excludes the fast loops" },
+  { name = "clip cost", note = "what a clipped tip costs a loop referenced to it, which is exactly absent from the one level it is read at" },
+]
+why = """CHAIN POSITION 8: the recording machine's own gain, after the
+transmission path at 1 to 7 and BEFORE the input clip at 9 - and that order
+is why the two cannot be folded together, because THE AGC SETS THE LEVEL AT
+WHICH THE CLIP IS REACHED. Ethan: *"AGC happens in the VCR"*, and *"Remember
+the clipping constraint, and AGC may also be a concern here, since this shifts
+the frequency response of the composite channel."*
+
+NO STANDARD STATES THE TIME CONSTANT, and that is established rather than
+assumed: BT.1700 defers every radio-frequency characteristic to BT.1701, and
+BT.1701-1 Table 1 read in full gives the radiated level map, the sidebands,
+the sound carrier, the pre-emphasis and the group-delay precorrection while
+stating NOTHING about receiver AGC, clipping, limiting or overload. So the
+five candidates spanning five decades are labelled an assumption everywhere
+they appear, and this stage is what narrows them.
+
+THE PROBE IS THE FIELD, AND THAT IS THE EXTENSION. `sync_geometry.probes`
+stops at the vertical interval's 572 microseconds because that is the longest
+contiguous run of sync in the signal; but both levels are readable on EVERY
+line, so a level series across a field is a probe of the field's own length -
+26 times the interval's reach, and the first in this arc to cover the 1 ms
+row - and it is still sync-only, because both levels are read in the reserved
+intervals and never in the picture.
+
+THE READING IS A BOUND AND NOT A VALUE, AND THE BOUND IS CONSERVATIVE BY
+CONSTRUCTION. A loop relaxing inside the window bends its trajectory by a
+known function of the window over the time constant; the measured series are
+straight, so the bend is not resolved and every relaxation that WOULD have
+shown at the stated significance is excluded. The whole residual is charged
+to noise, which understates the sensitivity on purpose: a real bend inflates
+the scatter it is measured against, so it can only weaken the bound.
+
+WHY IT STILL FOLLOWS THE SYNC TIP WHEREVER IT SITS. Negative modulation puts
+the tip at peak carrier (BT.1701-1 Table 1 item 8; BT.470-6 Table 3 items 7
+and 8), so the tip is the one part of the signal whose amplitude is known a
+priori - and that makes a clip there invisible where it is measured, because
+the loop drives the CLIPPED level to nominal and succeeds. Which is why the
+clip detector rests on the tip's NOISE and not on its depth.
+
+MEASURED BY THE RUNTIME STAGE, 2026-09-06. The probe runs 15571
+microseconds over 245 lines and resolves 64.2 Hz on every decode:
+
+    decode             spacing  sigma  blanking  sigma   tau at    corner
+                       drift           drift             least
+    75 bars SP         +0.1379   4.9   +0.2571   1.0    1.27 ms   125.5 Hz
+    multiburst y-only  +0.0275   0.3   +0.2068   3.3    0.52 ms   304.1 Hz
+    home               -0.2663   4.8   -0.9226   5.0    1.95 ms    81.8 Hz
+    countdown             -       -       -       -        -      DECLINED
+
+THE PAIR DISAGREES DIFFERENTLY ON EACH TAPE, which is what a pair exists to
+produce: the bars tape resolves the GAIN and not blanking, the multiburst
+pattern resolves blanking at 3.3 sigma and not the spacing at all, and home
+moves both together. A single level read twice could never do that.
+
+AND THE FIVE-DECADE ASSUMPTION IS NARROWED TO ONE. No series bends, so every
+relaxation fast enough to have shown resolvable curvature is excluded, and
+of the five assumed constants only 50 ms survives on two decodes and only
+1 ms and 50 ms on the third.
+
+THE GAUGE IT IS NOT FITTED WITH is the same level ACROSS fields, which this
+node never reads - it fits within a field and asks only whether the line
+bends. Field to field the level scatters 0.0169 IRE over 26 fields on the
+bars tape and 0.0314 over 28 on home, both under the 0.0461 IRE ten-bit
+output floor and consistent with a corner above the 59.94 Hz field rate;
+and on countdown, where this node declines, the same statistic is 2.911 IRE
+with a 12.93 IRE swing."""
+
+[[node]]
+name = "composite_channel"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "composite_channel", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_composite_channel"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_composite_channel("
+reads = ["dspicture"]
+writes = ["specified_composite_channel"]
+must_follow = ["hz_to_output", "sync_depth"]
+must_precede = ["standard_levels"]
+accumulates = [ { key = "_chroma_measurements", race = "none", note = "model_stages.py, keyed by stage name; the pooled sync profiles the channel is read from, written on the field thread only" } ]
+components = [
+  { name = "luma", note = "the specification is FLATNESS and the 4.2 MHz belongs to the transmission channel, so the limit is attached from the capture's source profile and never to the signal" },
+  { name = "tolerance", note = "the multiburst's 0.5 IRE on 50 - 0.086 dB - which is the error bar the standard itself puts on a response measurement" },
+  { name = "exactness", note = "the colour-under at exactly 40 f_H and the subcarrier at exactly 455/2, checked against the decode's own line rate" },
+  { name = "chroma chain", note = "every specified step of the VHS chrominance path with its clause, including the record-side burst doubler" },
+]
+why = """THE FIRST ANSWER IS A NEGATIVE ONE AND IT IS THE IMPORTANT ONE.
+SMPTE 170M-2004 clause 7.1: *"This standard does not impose a bandwidth
+restriction on the luminance part of the NTSC signal."* There is no specified
+luma response to scale by - the specification IS flatness - and the familiar
+4.2 MHz is the CHANNEL's, which the note to clause 7 says outright. A model
+attaching it to the signal would apply a broadcast limit to a tape that never
+saw one, so it is taken from the capture's own source profile and a capture
+with no recorded history is read as a plain line input, because that is the
+assumption that adds nothing.
+
+WHY IT STANDS BESIDE `source_correction` RATHER THAN DUPLICATING IT. That
+stage measures the head-common luma departure from the same specified flat
+and CORRECTS it. What it cannot supply is the reference's own status -
+whether the departure is a defect or a channel the standard permits, and what
+tolerance the standard puts on such a measurement. This supplies both and
+applies nothing.
+
+WHAT IS SPECIFIED WITH NUMBERS IS THE CHROMINANCE, and all of it is cited
+rather than fitted: the separator band-pass centred at 3.58 MHz with its
+half-power points at 3.08 and 4.08 (SMPTE 32M clause 3.9.2.1.1), the record
+level 7 to 10 dB below saturation (3.9.2.1.2), the burst raised 6.0 +/- 0.5
+dB BEFORE recording (3.9.2.1.3), the down-conversion to exactly 40 f_H
+(3.9.2.1.4) and the 90 degrees a line of carrier rotation (3.9.2.1.5).
+
+THE BURST DOUBLER IS THE TRAP AND IS REPORTED WHETHER OR NOT ANYTHING ASKS.
+Six decibels means the recorded burst is TWICE the recorded chroma, so a
+level taken from a played-back burst and applied to the picture's colour is
+out by a factor of two until it is undone - and it is a record-side step,
+present on every tape and absent from every composite reference.
+
+MEASURED BY THE RUNTIME STAGE, 2026-09-06, four fields, 14 bins at 213 kHz:
+
+    decode              source       departure   over the    bins above
+                                     dB rms      tolerance   4.2 MHz
+    75 bars SP          composite       8.98      103.9 x        0
+    home                home vcr        9.13      105.7 x        0
+    countdown           television      8.51       98.5 x        0
+    multiburst y-only   composite      12.95      149.8 x        0
+
+THE BROADCAST LIMIT IS NOT OBSERVABLE ON ANY OF THEM, and the profile system
+is what turns that into a statement: countdown is read as a `television`
+source, so the 4.2 MHz limit IS attached to its specified response - and not
+one of its bins reaches it, because the sync pulse carries evidence only to
+2.86 MHz.
+
+THE GAUGE IT IS NOT FITTED WITH IS THE MULTIBURST, which is the measurement
+the specification names for this quantity and lives in the active picture
+where this node never reads. Its six packets, specified equal to within 0.5
+IRE on 50, come back at 0.00, -0.17, -2.01, -7.57, -25.42 and -28.99 dB at
+0.5, 1.0, 2.0, 3.0, 3.58 and 4.2 MHz - 16.06 dB rms from equality against
+the 12.95 dB rms this node read from the sync pulse on the same capture. And
+it confirms the headline finding directly: the channel is 25.4 dB down at
+the subcarrier and 29.0 dB down at 4.2 MHz, so the tape has already removed
+the band the broadcast limit would have removed."""
+
+[[node]]
+name = "multipath"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "multipath", predicate = "!= 0", default = 1, declared_default = true }
+kind = "measurement"
+entry = "vhsdecode.model_stages:measure_multipath"
+site = "vhsdecode/field.py"
+anchor = "model_stages.measure_multipath("
+reads = ["dspicture"]
+writes = ["tapped_delay_channel"]
+must_follow = ["hz_to_output", "sync_depth"]
+must_precede = ["standard_levels"]
+accumulates = [ { key = "_multipath", race = "none", note = "model_stages.py, the per-field sync profiles the two halves are pooled from; written on the field thread only" } ]
+components = [
+  { name = "taps", note = "complex, because a delayed copy moves magnitude and phase together and fitting the phase alone lets a tap match a phase it has no magnitude for" },
+  { name = "held out", note = "fitted on the first half of the fields and judged on the second, because the taps are a property of a path and must hold on evidence they did not build" },
+  { name = "reach", note = "the delays are BOUNDED BY THE PROBE and not chosen - a sync pulse cannot see a ghost beyond about 2.35 us nor resolve one closer than its own edge" },
+]
+why = """THE MECHANISM CLAIM IS WITHDRAWN AND THIS NODE DOES NOT REINSTATE
+IT. A general propagation model will not account for this arc's all-pass
+residual: an echo WEAKER than the direct path is minimum phase and
+contributes none of it, one STRONGER contributes about seven radians, and the
+measurement sits between the two regimes at 0.87 to 2.07 - matching neither -
+while two of the three tapes never passed a transmitter and carry 0.87 to
+0.93 of it. What is reported here is what a tapped-delay channel DESCRIBES,
+never what it is.
+
+WHAT IS STILL WORTH MEASURING. Ethan, after the general model was ruled out:
+*"Let's continue onto the specific modeling, all dimensions not just
+phase."* Held out, the two NON-broadcast tapes hold almost exactly - 52.6 per
+cent against 52.5 in sample on home, 38.2 against 37.4 on the bars tape -
+and countdown, the ONE tape where propagation multipath is possible at all,
+collapses from 56 per cent to 17 with its PHASE going negative, so the fit
+makes the held-out phase worse than doing nothing. That is backwards from the
+hypothesis, and it is the reason the mechanism stays withdrawn.
+
+AND THE TAPS ARE THE SAME ON BOTH HEADS, WHICH PLACES THEM. Home's four come
+out at 0.152, 0.341, 0.152 and 0.569 microseconds on head A and at the same
+delays with the same amplitudes and phases to three decimals on head B; the
+bars tape's at 0.152, 0.645, 0.379 and 0.834 likewise. Whatever they
+describe is downstream of the head switch.
+
+THE HELD-OUT SPLIT IS IN TIME AND NOT BY HEAD, and that is what makes it a
+test rather than a comparison: fields that arrived later are evidence the fit
+never saw, where the other head is a different channel.
+
+MEASURED BY THE RUNTIME STAGE, 2026-09-06, eight fields each - four fitted,
+four judged - over 14 bins with the delays bounded by the probe at 3.14
+microseconds:
+
+    decode              in sample  held out  magnitude   phase
+    75 bars SP            46.0 %    45.8 %    +59.1 %   -23.8 %
+    multiburst y-only     49.2      46.9      +58.9     +19.2
+    home                  63.9      64.0      +59.8     +68.1
+    countdown             61.3      29.9      +16.1     +65.2
+
+COUNTDOWN COLLAPSES AND THE OTHERS DO NOT, which reproduces the offline
+finding on the runtime's own fields: the one capture where propagation
+multipath is possible at all loses half its explanatory power on fields the
+fit never saw, while the two non-broadcast tapes hold to within 0.3 of a
+percentage point.
+
+AND THE THREE AXES FAIL SEPARATELY. The magnitude holds out at 58.9 to 59.8
+per cent on the three non-broadcast captures and collapses to 16.1 on
+countdown; the phase holds on three and goes NEGATIVE on the bars tape,
+where the fit makes the held-out phase worse than doing nothing. A pooled
+share alone would have called that a success at 45.8 per cent.
+
+THE GAUGE IT IS NOT FITTED WITH is a second capture from the same deck: the
+75-bar and multiburst y-only patterns were played back on one machine in one
+session and the fit never sees more than one of them, yet they return 45.8
+and 46.9 per cent held out with magnitudes of 59.1 and 58.9 and share two of
+their four delays exactly, at 0.185 and 3.097 microseconds."""
+
+[[node]]
+name = "standard_levels"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "standard_levels", predicate = "!= 0", default = 1, declared_default = true }
+entry = "vhsdecode.model_stages:correct_standard_levels"
+site = "vhsdecode/field.py"
+anchor = "model_stages.correct_standard_levels("
+reads = ["dspicture"]
+writes = ["dspicture"]
+mutates_in_place = true
+must_follow = ["hz_to_output", "precursor", "sync_depth", "level_from_frequency", "source_agc", "vcr_agc", "composite_channel", "multipath"]
+must_precede = ["source_correction"]
+components = [
+  { name = "baseline", note = "the porch's level with the two known chroma carriers PROJECTED OUT, not its mean - the frequencies are specified, so the design matrix is fixed before a sample is read" },
+  { name = "leakage", note = "each carrier as ONE COMPLEX amplitude at a specified multiple of the line rate; an amplitude without its phase cannot say whether two lines' leakage adds or cancels" },
+  { name = "trend", note = "the baseline's drift down the field, rejected on the median absolute deviation so a contiguous bad run cannot drag it, and applied per line" },
+  { name = "compliance", note = "where the corrected excursion lands against the standard's own limits - a REPORT about the picture, never an input to the correction" },
+]
+why = """THE ZERO, AND ONLY THE ZERO. Ethan: *"after RF correction, I do want
+to normalize the signal so it sits within the video standard"*, and *"the
+important thing is that the back porch is centered at 0 ire ... The scaling
+of the video is done in our scaling step in the picture stage."*
+
+THE DIVISION OF LABOUR IS EXPLICIT AND WAS SETTLED BEFORE THIS STAGE
+EXISTED. `sync_depth` owns the GAIN - the blanking-to-tip spacing over the
+specified forty - and applies it about the measured blanking, which leaves
+the zero exactly where it found it; its own text says a shift of the zero
+*"is a different defect and belongs to `standard_levels`"*. This is that
+defect and touches nothing else.
+
+TWO ANCHORS, NOT THREE, AND THIS ONE OWNS THE FIRST. The map from a measured
+signal to the standard is affine, so it is determined by two levels and
+over-determined by three. The sync tip and blanking are the two to use
+because they are in the reserved intervals, present on every line and
+content-free, where reference white appears only when the picture happens to
+contain it - which is also why the compliance check is worth taking: the two
+anchors land by construction and prove nothing, and the excursion is what
+remains to be measured.
+
+WHAT IT ADDS OVER `--ire0_adjust backporch`, WHICH ALREADY MOVES THE ZERO.
+That mode takes ONE window level for the whole field. Two things are wrong
+with a window level as a zero and both are repaired here. The colour-under
+carrier sits at 40 f_H and the subcarrier at 455/2 f_H, both EXACT multiples
+of the line rate, so both leak onto the back porch at frequencies known
+before a sample is read; averaging the window returns the baseline plus
+whatever that leakage averages to, which is zero only if the window spans a
+whole number of cycles of every leaking carrier - it does not. And one number
+a field cannot follow a zero that moves: `sync_depth.field_slope` measures
+blanking drifting 0.34 to 0.60 IRE across a field on all three of this arc's
+tapes, seven to thirteen times the ten-bit output floor of 0.0461 IRE.
+
+A CARRIER THE WINDOW CANNOT COMPLETE IS WITHHELD RATHER THAN OFFERED. A
+projection onto a period the window does not contain is nearly singular and
+absorbs the baseline it exists to protect, so each specified multiple is
+admitted only where the porch is at least one of its periods long and the
+refused ones are named in the log. On a 4fsc NTSC decode the porch holds
+1.12 microseconds, which is 4.0 cycles of the subcarrier and 0.70 of the
+colour-under - so the subcarrier is projected out and the colour-under is
+withheld and said to be.
+
+MEASURED BY THE RUNTIME STAGE, 2026-09-06:
+
+    decode                     baseline   projection   trend    lines
+                               IRE        corrects     swing    rejected
+    75 bars SP, --ire0_adjust   -0.007      +0.004      0.487     0.4 %
+    multiburst y-only SP        -0.041      +0.003      0.907     0.0 %
+    home, --ire0_adjust         -0.097      -0.326      3.200     5.3 %
+    75 bars SP, no ire0_adjust  +4.417      +0.001      0.435     0.4 %
+    countdown                      -           -          -      DECLINED
+
+THE LAST TWO ROWS ARE THE CASE. With the decoder's own back-porch anchoring
+on, the field-mean baseline is already near zero by construction and what is
+left is the trend and the projection; with it OFF the same field's porch
+stands 4.417 IRE high and this node is the only thing that moves it. On
+countdown it declines - 79.0 per cent of the pulse's interior on the
+container floor - and that decode's luma is byte-identical with the node on.
+
+THE GAUGE IT IS NOT FITTED WITH IS THE PICTURE. Regressing the eight
+plateaus of the 75 per cent bar pattern on SMPTE 170M's luminances, on the
+decode with no `--ire0_adjust`: the intercept goes from +3.253 IRE to -0.983
+against the -0.927 the decoder's own anchoring reaches, and THE GAIN IS
+UNCHANGED, 0.98830 to 0.98836. An offset correction must not touch the gain
+and it does not, to six parts in a hundred thousand.
+
+THE SECOND GAUGE IS THE FRONT PORCH, the reserved interval on the other side
+of the pulse. Its line-to-line scatter about its own trend falls 0.236 to
+0.168 IRE on the bars tape and 0.577 to 0.317 on home. Its field-long SLOPE
+does not agree, going -0.077 to -0.302 and -0.063 to +0.637 IRE a field, so
+the back porch's trend is not entirely shared with the front porch - which
+is reported rather than left out, with the caution that the front porch is
+the interval this arc has measured to be content-dependent at 41 to 66
+sigma."""
+
+[[node]]
+name = "source_correction"
+scope = "field"
+stage = "picture"
+axis = ["amplitude", "frequency", "time"]
+gate = { option = "source_correction", predicate = "!= 0", default = 1, declared_default = true }
+entry = "vhsdecode.model_stages:correct_source_response"
+site = "vhsdecode/field.py"
+anchor = "model_stages.correct_source_response("
+reads = ["dspicture"]
+writes = ["dspicture"]
+mutates_in_place = true
+must_follow = ["hz_to_output"]
+accumulates = [ { key = "_source_correction", race = "none", note = "model_stages.py, the per-head sync profiles and the latched kernel; written on the field thread only" } ]
+components = [
+  { name = "head split", note = "the head DIFFERENCE is the playback heads' own channel and is excluded by construction; the head-COMMON part is what is corrected" },
+  { name = "channel", note = "the head-common sync response against SMPTE 170M clause 7.1's flat luma, on the 14 bins the specified pulse supports at its own 213 kHz resolution" },
+  { name = "corrector", note = "the fractional inverse in the log domain at the gain law's quarter, phase from Bode and no delay fitted beside it, capped per bin at that bin's own evidence" },
+]
+why = """THE OTHER HALF OF THE CHAIN. Every other stage in this file corrects
+what the tape and the two decks did; this one corrects the luma response the
+signal already carried when the recording VCR received it - the composite
+video chain between the source and the recorder's input, which nothing in the
+runtime reached before. LAST in the picture stage because undoing a chain runs
+backwards: what survives every VCR model is what the source put there.
+
+MEASURED, and the measurement is why the stage exists. Decoding both of the
+VCR's RF test points for one pattern - record RF at CN261 pin 1, playback RF
+at pin 2, the same signal generator into the same deck - the departure of the
+luma from the specified flat is 12.90, 11.74 and 8.21 dB rms ALREADY AT THE
+RECORD TAP against 13.08, 13.18 and 8.97 at the playback tap, so between 89
+and 99 per cent of it is added before the tape and the tape-and-playback
+channel accounts for only 1.95 to 2.53 dB. The VCR models can never reach the
+rest.
+
+WHAT IT CANNOT SEPARATE, declared rather than glossed: the record tap sits
+after the recorder's own front end, so "pre-tape" is the source chain AND that
+front end, and the sync pulse's 213 kHz resolution cannot tell two smooth
+responses in series apart. The source share is bounded by that measurement and
+is not resolved, which is why the correction runs at the gain law's quarter.
+
+SYNC ONLY. The correction derives from the sync pulse and never from
+visible-area content, so the multiburst and pulse-and-bar in the active area
+are gauges it is not fitted with."""
 
 [[node]]
 name = "residual_channels"

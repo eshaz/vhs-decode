@@ -117,6 +117,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from vhsdecode.models import burst_sync_lock as bsl
 from vhsdecode.models import pair_dimension as pdim
 
 # --------------------------------------------------------------------------
@@ -1117,3 +1118,197 @@ def controls(**kwargs) -> Dict[str, object]:
     results["passes"] = bool(all(value["passes"] for value in results.values()
                                  if isinstance(value, dict)))
     return results
+
+
+# --------------------------------------------------------------------------
+# THE COLOUR LOCK, READ ONE FIELD AT A TIME
+#
+# Ethan's directive for this stage, in his own order: the active area's
+# residual carries the colour lock, so the residual colour carrier gives the
+# amplitude and the phase for the up-heterodyne; the up-heterodyne need not
+# use a fixed frequency; the luma retains residual chroma, so with the
+# active area masked IN and the colour-under phase locked, the
+# up-heterodyned residual colour is subtracted from the luma to leave a
+# colour-free luma; that connection is fed back into the chroma stage for
+# alignment on all dimensions; and the correction is applied on ONE FIELD AT
+# A TIME with any averaging removed.
+#
+# Everything above this line in this module is a closed-form spectrum of the
+# specified line - the sensitivity of a signature to a parameter, with no
+# field in it anywhere. What follows is the first measurement in the module
+# that reads a field, and it is written to Ethan's last clause first: there
+# is no accumulator, no rolling mean and no state, so a caller that hands it
+# one field gets that field's answer and nothing of any other.
+# --------------------------------------------------------------------------
+
+
+def colour_lock(chroma_field, sample_rate_hz: float,
+                burst_window: Tuple[int, int],
+                active_window: Tuple[int, int],
+                first_line: int = 0,
+                subcarrier_hz: float = SUBCARRIER_HZ) -> Dict[str, object]:
+    """THE UP-HETERODYNED COLOUR CARRIER'S LOCK, from one field, twice.
+
+    `chroma_field` is one decoded chroma field as lines by samples, already
+    up-heterodyned onto the subcarrier and time-base corrected - what a
+    `*_chroma.tbc` holds. `burst_window` and `active_window` are the two
+    column spans the decode's own JSON gives as colourBurstStart to
+    colourBurstEnd and activeVideoStart to activeVideoEnd; nothing about the
+    geometry is assumed here. `first_line` is the field line number of the
+    first row handed in, which is needed because the specified alternation
+    depends on it.
+
+    WHAT IS MEASURED. In each window the carrier's complex phasor is taken
+    at the subcarrier, referred to the line's own origin - which is the sync
+    datum, so this phase IS the burst-to-sync relationship SMPTE 170M clause
+    8.5 specifies - and the standard's own half-cycle-per-line alternation
+    is removed before the lines are combined, from
+    `burst_sync_lock.expected_burst_phase_rad`. Without that removal every
+    other line reads 180 degrees out and the field mean is nothing.
+
+    Each window then yields a COMPLEX lock, amplitude and phase in one
+    number, and a LINE COHERENCE - the length of the mean phasor against the
+    mean length - which says how much of that window is actually locked
+    rather than merely present.
+
+    THE PAIR, AND WHAT IT SAYS ON REAL TAPE. The two windows are two
+    independent readings of one lock and they can disagree. Measured
+    2026-09-06 on the first six fields of three decoded tapes in
+    /tmp/claude-1000, lines 30 to 239:
+
+        tape                  burst phase   active phase   difference   coh
+        dod_wide_75bars_SP      -33.0/+147   +11.9/-170.2   -39 to -45  0.97
+        dod_wide_home           -33.1/+147  -111.7/+59.8    +77 to +87  0.73-0.88
+        dod_wide_chromanoise_SP -32.9/+147  -110.0/+70.1    +77 to +79  0.9998
+
+    The burst window is locked to 0.9999 or better on every field of every
+    tape, and its phase sits at -33 or +147 degrees, exactly 180 apart,
+    which is the four-field colour sequence the arc has already
+    established. The active
+    area IS strongly line-coherent, 0.73 to 0.9999, so Ethan's premise holds:
+    a residual colour carrier is there to read.
+
+    BUT ITS PHASE IS THE PICTURE'S, NOT THE LOCK'S, on picture-bearing
+    material, and the same deck proves it: the burst-to-active difference is
+    -42 degrees on the colour bars and +78 degrees on the chroma noise
+    pattern, two recordings made by one machine within minutes of each
+    other. A lock cannot depend on what was filmed. The active area's mean
+    phasor at the subcarrier is the vector sum of the hues in the window,
+    and on these tapes that sum dominates whatever carrier leak sits
+    underneath it.
+
+    `within_line_frequency_hz` is the same statement in the other unit and
+    is the sharper form of it. The active window is split in half and the
+    phase difference between the halves is read as a frequency, which is
+    what Ethan's "the up-heterodyne need not use a fixed frequency" asks
+    for. Measured across every field:
+
+        dod_wide_75bars_SP       -18749.7 +- 11.0 Hz
+        dod_wide_home             -3488.6 +- 975.6 Hz
+        dod_wide_chromanoise_SP      -57.1 +- 18.7 Hz
+
+    Eighteen kilohertz is not a heterodyne error. Over the 13.27
+    microseconds between the two half-window centres it is 89.6 degrees,
+    which is the hue rotation between the left and right halves of a colour
+    bar pattern; the chroma noise field, whose hues carry no left-right
+    structure, reads 57 Hz on the same deck at the same speed. So this
+    reading is usable as a frequency only where the picture's chroma has no
+    structure across the line, and the value is returned with its own
+    coherence beside it so that a caller can see when it does not.
+
+    WHAT DOES SAY THE HETERODYNE IS LOCKED is the burst across the field:
+    fitting the burst phase against line number over lines 30 to 239 gives
+    a drift of -0.01 +- 0.07, -0.01 +- 0.08 and +0.05 +- 0.09 Hz on the
+    three tapes, so on this material the up-heterodyne holds to a tenth of
+    a hertz within a field and the fixed-frequency assumption costs nothing
+    that these captures can see. `burst_drift_hz` is that number.
+
+    WHAT THE RUNTIME WOULD CALL. `vhsdecode/chroma.py` belongs to another
+    lane and is not touched here, so this is the modelling side of the
+    correction rather than the correction. Its
+    `upconvert_chroma_phase_comp` already takes a per-burst frequency and
+    interpolates it line to line, so Ethan's second clause is met there
+    already; what this adds is a second, independent reading of the same
+    lock, per field and with no averaging, that the runtime could compare
+    its burst sequence against before up-converting - and a measurement
+    that says, on this material, that the comparison would be dominated by
+    the picture rather than by the channel.
+    """
+    field = np.asarray(chroma_field, dtype=np.float64)
+    if field.ndim != 2:
+        raise ValueError("one field, as lines by samples")
+    rows = field - field.mean(axis=1, keepdims=True)
+    columns = np.arange(field.shape[1], dtype=np.float64)
+    seconds = columns / float(sample_rate_hz)
+    rotator = np.exp(-2j * np.pi * float(subcarrier_hz) * seconds)
+    numbers = np.arange(int(first_line), int(first_line) + field.shape[0],
+                        dtype=np.float64)
+    # THE SPECIFIED ALTERNATION COMES OFF BEFORE THE LINES ARE COMBINED.
+    # 227.5 cycles of subcarrier a line is the standard's own figure and
+    # `burst_sync_lock` already holds it; a second transcription here would
+    # be a second chance to disagree with it.
+    alternation = np.exp(-1j * bsl.expected_burst_phase_rad(numbers))
+
+    def window(span):
+        start, stop = int(span[0]), int(span[1])
+        if not 0 <= start < stop <= field.shape[1]:
+            raise ValueError("a window must lie inside the line, and %d to "
+                             "%d does not" % (start, stop))
+        phasors = (rows[:, start:stop] @ rotator[start:stop]) * alternation
+        mean = complex(np.mean(phasors))
+        lengths = float(np.mean(np.abs(phasors)))
+        return {
+            "lock": mean,
+            "amplitude": abs(mean),
+            "phase_deg": float(np.degrees(np.angle(mean))),
+            "line_coherence": abs(mean) / lengths if lengths > 0 else 0.0,
+            "per_line": phasors,
+            "centre_s": 0.5 * (seconds[start] + seconds[stop - 1]),
+            "columns": (start, stop),
+        }
+
+    burst = window(burst_window)
+    active = window(active_window)
+
+    # the up-heterodyne's frequency, read across the active window rather
+    # than assumed to be the one it was mixed with
+    start, stop = int(active_window[0]), int(active_window[1])
+    middle = (start + stop) // 2
+    first = window((start, middle))
+    second = window((middle, stop))
+    gap = second["centre_s"] - first["centre_s"]
+    step = complex(np.sum(second["per_line"] * np.conj(first["per_line"])))
+    within = (float(np.angle(step)) / (2.0 * np.pi * gap)) if gap else float("nan")
+
+    # and the same question asked of the burst across the whole field, which
+    # is the reading that does not depend on the picture
+    phases = np.unwrap(np.angle(burst["per_line"]))
+    if len(numbers) > 2 and np.ptp(numbers) > 0:
+        per_line = float(np.polyfit(numbers, phases, 1)[0])
+        drift = per_line / (2.0 * np.pi) * float(sample_rate_hz) / field.shape[1]
+    else:
+        drift = float("nan")
+
+    difference = burst["lock"] * np.conj(active["lock"])
+    return {
+        "burst": burst,
+        "active": active,
+        # the pair, as one complex number: its angle is the disagreement in
+        # phase and its magnitude the product of the two amplitudes
+        "difference": difference,
+        "difference_deg": float(np.degrees(np.angle(difference))),
+        "amplitude_ratio": (burst["amplitude"] / active["amplitude"]
+                            if active["amplitude"] > 0 else float("inf")),
+        # the up-heterodyne's frequency, measured rather than fixed
+        "within_line_frequency_hz": within,
+        "within_line_coherence": float(min(first["line_coherence"],
+                                           second["line_coherence"])),
+        "burst_drift_hz": drift,
+        "lines": int(field.shape[0]),
+        "first_line": int(first_line),
+        "subcarrier_hz": float(subcarrier_hz),
+        "why": ("the burst and the active area are two readings of one "
+                "lock, so they can disagree; on picture-bearing material "
+                "the active one is the vector sum of the hues in the "
+                "window and its line coherence is what says so"),
+    }

@@ -58,6 +58,16 @@ class DemodCacheTape(DemodCache):
                     fftdata=fftdata,
                     mtf_level=0,
                     cut=True,
+                    # The block's absolute start sample on the capture:
+                    # `DemodCache.doread` loads block b from `b * blocksize`
+                    # (blocksize being blocklen less the two cuts), so this
+                    # is where the block's FFT grid begins on the tape, and
+                    # it is what the RF transform picks a head's table by.
+                    # The keyword is always accepted: `rf` is the
+                    # `VHSRFDecode` this cache is built with in
+                    # `VHSDecode.__init__`, and no other decoder's
+                    # `demodblock` is reached through this worker.
+                    block_start=blocknum * self.blocksize,
                 )
 
                 output["request"] = request

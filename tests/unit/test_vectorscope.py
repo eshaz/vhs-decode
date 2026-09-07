@@ -139,3 +139,104 @@ class TestTheSamplingFrame:
     def test_it_names_where_the_rotation_is_already_applied(self):
         """So the 33 in chroma.py stops being a magic number."""
         assert "chroma.py" in vs.quadrature_note()["already_applied_at"]
+
+
+class TestTheCoordinateSystemFromTheStreaks:
+    """Ethan, 2026-09-06, with a composite vectorscope in front of him: 'I
+    believe these lines pointing to I.Q.-I,-Q need to be corrected and
+    represent a measureable shape that we can use for correcting the
+    color's coordinate system.'
+
+    The six bar TARGETS are not on those lines and that finding stands.
+    The transitions between them are, and a direction is measurable.
+    """
+
+    @staticmethod
+    def _streaks(first_deg, second_deg, count=4000, seed=0, burst=180.0):
+        """Transitions drawn along two axes, at the burst-relative angles
+        given, with random lengths and random directions along each - which
+        is what a streak is: an orientation with no arrow."""
+        rng = np.random.default_rng(seed)
+        pick = rng.random(count) < 0.5
+        angle = np.where(pick, np.radians(burst + first_deg),
+                         np.radians(burst + second_deg))
+        return rng.normal(0.0, 1.0, count) * np.exp(1j * angle)
+
+    def test_an_orthogonal_pair_is_found_and_called_orthogonal(self):
+        out = vs.transition_axes(self._streaks(33.0, 123.0))
+        assert out["clustered"]
+        # A perfect pair reaches 1 exactly, and the floor at this count is
+        # 0.061 - so the margin is the whole of the interval, not a factor
+        # that could be written arbitrarily large.
+        assert out["clustering"] > 0.95
+        assert out["clustering_floor"] < 0.1
+        assert out["orthogonal"]
+        assert out["versus_burst_deg"] == pytest.approx(33.0, abs=1.0)
+
+    def test_scatter_is_refused_rather_than_reported(self):
+        """A stage that cannot measure its subject must decline."""
+        rng = np.random.default_rng(3)
+        steps = rng.normal(0.0, 1.0, 2000) * np.exp(
+            2j * np.pi * rng.random(2000))
+        out = vs.transition_axes(steps)
+        assert not out["clustered"]
+        assert out["clustering"] < out["clustering_floor"]
+
+    def test_a_shear_is_measured_and_not_mistaken_for_a_rotation(self):
+        """If the two axes are not ninety apart no rotation corrects it."""
+        out = vs.transition_axes(self._streaks(33.0, 103.0))
+        assert not out["orthogonal"]
+        assert out["separation_deg"] == pytest.approx(70.0, abs=2.0)
+        assert out["axes_separately_resolved"]
+
+    def test_the_separation_carries_its_own_resolution(self):
+        """The estimator collapses at exactly the answer the specification
+        predicts, so the reading has to say what it can resolve."""
+        few = vs.transition_axes(self._streaks(33.0, 123.0, count=40))
+        many = vs.transition_axes(self._streaks(33.0, 123.0, count=8000))
+        assert few["separation_resolution_deg"] > \
+            many["separation_resolution_deg"]
+        assert few["orthogonal"] and many["orthogonal"]
+
+    def test_the_sign_of_the_rotation_is_reported_both_ways(self):
+        """33 and -33 are 66 degrees apart on a quantity defined modulo
+        ninety, so a reading that agrees in magnitude and disagrees in sign
+        looks like a 24 degree error unless both are given."""
+        forward = vs.transition_axes(self._streaks(33.0, 123.0))
+        assert forward["rotation_sense"] == "as specified"
+        assert forward["departure_as_specified_deg"] == pytest.approx(
+            0.0, abs=1.0)
+        backward = vs.transition_axes(self._streaks(-33.0, 57.0))
+        assert backward["rotation_sense"] == "reversed"
+        assert backward["departure_reversed_deg"] == pytest.approx(
+            0.0, abs=1.0)
+
+    def test_the_statistic_cannot_tell_a_vector_from_its_reverse(self):
+        """Which is what lets it read an envelope referenced to each line's
+        own origin, where consecutive lines differ by 180 degrees."""
+        steps = self._streaks(33.0, 123.0)
+        flipped = steps * np.where(np.arange(steps.size) % 2, -1.0, 1.0)
+        first = vs.transition_axes(steps)
+        second = vs.transition_axes(flipped)
+        assert second["pair_angle_deg"] == pytest.approx(
+            first["pair_angle_deg"], abs=1e-9)
+        assert second["separation_deg"] == pytest.approx(
+            first["separation_deg"], abs=1e-9)
+
+    def test_a_pure_rotation_has_no_shear_and_a_stretch_does(self):
+        rng = np.random.default_rng(7)
+        isotropic = (rng.normal(0.0, 1.0, 8000)
+                     + 1j * rng.normal(0.0, 1.0, 8000))
+        turned = isotropic * np.exp(1j * np.radians(17.0))
+        assert vs.coordinate_map(turned)["shear_ratio"] < 0.05
+        stretched = 2.0 * isotropic.real + 1j * isotropic.imag
+        sheared = vs.coordinate_map(stretched)
+        assert sheared["stretch"] == pytest.approx(2.0, abs=0.1)
+        assert sheared["stretch_axis_deg"] == pytest.approx(0.0, abs=3.0)
+
+    def test_the_isotropy_assumption_is_returned_as_one(self):
+        rng = np.random.default_rng(11)
+        out = vs.coordinate_map(rng.normal(0.0, 1.0, 500)
+                                + 1j * rng.normal(0.0, 1.0, 500))
+        assert "isotropic" in out["assumption"]
+        assert "bar" in out["assumption"]

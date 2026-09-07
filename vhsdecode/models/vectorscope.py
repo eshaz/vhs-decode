@@ -331,3 +331,383 @@ def quadrature_note() -> Dict[str, object]:
         "already_applied_at": "chroma.py's ntsc_color_framing_phase_shift, "
                               "which is this same 33 degrees",
     }
+
+
+# --------------------------------------------------------------------------
+# The colour difference coordinate system, read off the transition streaks
+# --------------------------------------------------------------------------
+
+"""THE I AND Q LINES ARE NOT EMPTY AFTER ALL, and the correction above is
+narrower than it reads. Ethan, 2026-09-06, with a composite vectorscope in
+front of him: *"I believe these lines pointing to I.Q.-I,-Q need to be
+corrected and represent a measureable shape that we can use for correcting
+the color's coordinate system."*
+
+Both statements stand together, and the distinction between them is the
+whole of what follows. `nearest_axis` is right that no BAR TARGET sits on
+an I or Q line - the closest is 19.54 degrees away and that figure is
+computed, not measured. But a scope set to whole line rather than to burst
+shows the TRANSITIONS between the bars as well as the bars, and a
+transition is a trajectory: it leaves one target and arrives at another
+along a direction. Those directions are what his screenshot shows lying
+near I, near minus I, near Q and near minus Q, and a direction is a
+measurement whether or not anything rests on it.
+
+WHAT THAT BUYS, AND WHY IT IS THE STRONGER OF THE TWO CORRECTIONS. The six
+targets fix six POINTS. The transition directions fix the AXES those
+points are expressed in - the colour difference coordinate system itself.
+Correcting points moves six colours; correcting the coordinate system
+moves every colour at once, and it is the only one of the two that can be
+made from material that is not a bar signal.
+
+THE SHEAR IS THE PART THAT MATTERS. If the two measured axes are not
+ninety degrees apart, no rotation puts them right: the departure is a
+two-by-two linear map and it takes four numbers, not one. Every real
+two-by-two map on the chroma plane is exactly
+
+    d  ->  alpha d + beta conj(d)
+
+for one pair of complex numbers, and that identity is what makes the whole
+of this measurable as a complex quantity rather than as a list of angles.
+`alpha` carries the rotation and the common gain, `beta` carries the shear
+and the direction it acts along, and `beta` is zero for a channel whose
+coordinate system is only turned. A magnitude cannot express either.
+
+AND IT IS AXIAL, NOT DIRECTIONAL, which decides the statistic. A streak
+running along a line has an orientation and no arrow, so the quantity is
+defined modulo 180 degrees and the mean of the raw angles is meaningless.
+The standard treatment doubles the angle; here the doubling has to happen
+TWICE, and both readings are used:
+
+  * the FOURFOLD resultant pools an orthogonal pair onto a single point,
+    so its magnitude is exactly the test that the streaks cluster on two
+    axes rather than scattering, and its angle is where the pair sits;
+  * the TWOFOLD resultant is `cos` of the separation between the two
+    axes, so it is zero for a truly orthogonal pair and grows with the
+    shear. It is the departure from ninety degrees, read directly.
+
+THE BURST SUPPLIES THE ABSOLUTE REFERENCE and nothing else can. SMPTE 170M
+note 2 to clause 10 makes the phase origin the burst plus 180, so the pair's
+orientation is only meaningful once it is expressed against the burst - and
+`colour_under.burst_observables` records why it must be the burst's PHASE
+and never its level: three unknown gains multiply the burst's amplitude and
+none of them rotates it.
+
+READING THE ACTIVE PICTURE, HONESTLY. The streaks are in the picture, not
+in the reserved interval, so this stands under the same exception
+`colour_lock` was granted for the residual colour carrier and it keeps the
+same discipline: a null distribution decides whether the shape is there,
+and the measurement DECLINES rather than reporting a coordinate system it
+has not established. The orientation of `n` independent random axes has a
+fourfold resultant exceeding `r` with probability `exp(-n r^2)`, the same
+Rayleigh law the colour lock's gate is taken from, so the floor is derived
+and not chosen.
+
+WHAT THE STREAKS MEASURE, AND WHAT THEY DO NOT, measured on four decodes
+with the stage wired and running. The two readings behave differently and
+the difference is the whole of how they may be used:
+
+    decode                pair vs burst   vs the specified 33   separation
+    75 bars SP              56.90 deg      0.10, reversed        70.78 deg
+    75 bars EP              56.55          0.45, reversed        71.13
+    countdown               49.14          7.86, reversed        59.63
+    chroma noise SP         10.90         22.10, as specified    15.53
+
+THE ORIENTATION AGAINST THE BURST IS A CHANNEL MEASUREMENT, and it lands on
+the specification. A rotation of the coordinate system turns every streak
+together whatever the content is, so the pair's angle from the burst is a
+property of the frame - and on both bar tapes it sits 33 degrees from the
+burst to within half a degree, which is the rotation clause 10 specifies.
+It sits there with the OPPOSITE SIGN, and that is the finding rather than
+an error: the axes are at minus 33 degrees where the encoding puts them at
+plus 33. Two tape speeds, twenty-seven fields each, agreeing to 0.35
+degrees between them.
+
+THE SEPARATION IS THE CONTENT AND THE CHANNEL TOGETHER, and reading it as
+the channel alone would be wrong. Which directions the transitions run in
+depends on which hues the picture holds: a bar signal's trajectories are
+fixed by its six targets, so 70.78 degrees on bars is a statement about
+bars through this channel and not about the channel. The evidence is in
+the table - the two bar decodes agree to 0.35 degrees while the
+chroma-noise pattern gives 15.53 and the countdown 59.63 on the same deck.
+So a DIFFERENCE between two decodes of the SAME pattern is a channel
+measurement and an absolute value is not, and the same caveat
+`coordinate_map` states for its isotropy assumption applies here.
+
+AND IT AGREES WITH THE QUADRATURE IMBALANCE MEASURED INDEPENDENTLY, to the
+extent two instruments on different material can. `iq_imbalance` reads the
+image on the raw radio frequency at the playback tap at 0.1067, and this
+module's `coordinate_map` reads a shear ratio of 0.1151 per field on the
+bars - eight per cent apart, from a scope trace and a radio-frequency burst
+with a whole decoder between them. Read through the decoder's own
+colour-under burst the same imbalance comes back at 0.0194, five times
+smaller, so the three do NOT all agree and the disagreement is recorded
+rather than averaged: the two that agree are both taken where the image is
+still present, and the small one is taken after the decoder's chroma band
+pass and time base correction have been through it.
+
+ONE FIGURE FROM HIS SCREENSHOT, USED AS A CHECK ON THE CONVENTION rather
+than as a measurement of the tape: the display reads the burst at 19.72 IRE
+and calls it 98.6 per cent of specification. The specification is 40 IRE
+PEAK TO PEAK, so 98.6 per cent of it is 39.44 and not 19.72 - the scope is
+reporting the AMPLITUDE, which `burst_reference` defaults to, and
+19.72 / 20.0 = 0.986 reproduces the display's own percentage exactly. The
+burst on that machine is therefore 1.4 per cent low, and the convention
+this module reads amplitudes in is confirmed against an instrument.
+"""
+
+# The separation the encoding specifies between the two modulation axes.
+# SMPTE 170M clause 10 modulates Q on the sine and I on the cosine of the
+# same subcarrier, which is a quadrature pair by construction - so ninety
+# degrees is the specification's own number and not a convention.
+SPECIFIED_AXIS_SEPARATION_DEG = 90.0
+
+# The significance the streak clustering has to clear. The same four sigma
+# `chroma_head_switch` detects at and `model_stages` gates the colour lock
+# with, so one significance governs the chroma path rather than three.
+CLUSTER_SIGMA = 4.0
+
+
+def _axial_floor(count: int, sigma: float = CLUSTER_SIGMA) -> float:
+    """The fourfold resultant `count` random orientations would reach.
+
+    The resultant of the mean of `n` independent unit phasors exceeds `r`
+    with probability `exp(-n r^2)` (Rayleigh), so requiring that to be no
+    larger than the two-sided Gaussian tail at `sigma` gives the floor
+    below which a measured clustering is indistinguishable from scatter.
+    Derived, so the gate moves with the evidence rather than being chosen.
+    """
+    if int(count) < 1:
+        return 1.0
+    tail = math.erfc(float(sigma) / math.sqrt(2.0))
+    return float(math.sqrt(-math.log(tail) / float(count)))
+
+
+def transition_axes(steps, weights=None, sigma: float = CLUSTER_SIGMA,
+                    burst_phase_deg: float = BURST_PHASE_DEG
+                    ) -> Dict[str, object]:
+    """THE COORDINATE SYSTEM, from the directions the colour transitions run.
+
+    `steps` are complex chroma DIFFERENCES - one colour minus the colour
+    before it - so each is a vector along the trajectory between two
+    targets. Their orientation is what carries the axes; their sign does
+    not, because a transition from yellow to blue and one from blue to
+    yellow lie on the same line.
+
+    Returns the four things a coordinate system is made of, each as the
+    complex quantity it came from as well as the angle a reader wants:
+
+      `fourfold`        the axial resultant of `exp(4 i theta)`. An
+                        orthogonal pair maps onto one point under it, so
+                        its MAGNITUDE is the test that the streaks cluster
+                        on two axes and its ANGLE, quartered, is where the
+                        pair sits.
+      `twofold`         the resultant of `exp(2 i theta)`, which for two
+                        axes at `theta1` and `theta2` is exactly
+                        `exp(i(theta1+theta2)) cos(theta1-theta2)`. It is
+                        therefore zero for a right angle and its magnitude
+                        IS the sine of the departure from one.
+      `separation_deg`  `arccos` of that magnitude: the angle between the
+                        two axes, against the ninety the encoding
+                        specifies.
+      `versus_burst`    the pair's orientation measured from the burst,
+                        which is the signal's only absolute phase.
+
+    `weights` lets a caller weight each step by its own length, which is
+    the right thing when the steps are measured rather than planted: a
+    long transition carries more evidence about its direction than a short
+    one does, and an unweighted mean lets the noise between two identical
+    bars vote as loudly as a full excursion.
+    """
+    values = np.asarray(steps, dtype=np.complex128).ravel()
+    if values.size < 4:
+        raise ValueError("an axis measurement needs a run of transitions")
+    magnitude = np.abs(values)
+    good = magnitude > 0.0
+    if not np.any(good):
+        raise ValueError("every transition is zero length")
+    unit = values[good] / magnitude[good]
+    if weights is None:
+        weight = magnitude[good]
+    else:
+        weight = np.asarray(weights, dtype=np.float64).ravel()[good]
+    total = float(weight.sum())
+    if total <= 0.0:
+        raise ValueError("the weights sum to zero")
+    # The angle is doubled once to make it axial and again to fold an
+    # orthogonal pair onto one point. Both are taken as powers of the unit
+    # phasor rather than as trigonometry on an angle, so no branch cut is
+    # crossed and the quantity stays complex throughout.
+    twofold = complex((weight * unit ** 2).sum() / total)
+    fourfold = complex((weight * unit ** 4).sum() / total)
+    # An effective count, because the weights are unequal: Kish's formula,
+    # the sum squared over the sum of squares, which is the count of equal
+    # weights carrying the same information. Using the raw count instead
+    # would understate the floor wherever a few long transitions dominate.
+    effective = total * total / float((weight * weight).sum())
+    floor = _axial_floor(effective, sigma)
+    separation = math.degrees(math.acos(min(abs(twofold), 1.0)))
+    pair_angle = math.degrees(np.angle(fourfold)) / 4.0
+    sum_angle = math.degrees(np.angle(twofold)) / 2.0
+    first = (sum_angle + 0.5 * separation) % 180.0
+    second = (sum_angle - 0.5 * separation) % 180.0
+    # THE SEPARATION IS ILL-CONDITIONED AT EXACTLY THE ANSWER THE
+    # SPECIFICATION PREDICTS, and saying so is the difference between a
+    # measurement and a number. A truly orthogonal pair puts the twofold
+    # resultant at zero, so what is measured there is the resultant of the
+    # noise alone - Rayleigh distributed with mean `sqrt(pi / 4 n)` - and
+    # `arcsin` of the SAME floor the clustering is judged against is
+    # therefore the departure from ninety degrees this many steps can
+    # resolve, and one significance governs both readings rather than two.
+    # Measured on a planted orthogonal pair of 400 steps this reads 84.5
+    # degrees where the truth is 90 - inside the 11.1 degree resolution -
+    # and on a planted 70 degree pair it reads 69.8, which is outside it.
+    # The estimator is behaving exactly as its own null says it will.
+    #
+    # The same collapse makes the two axes SEPARATELY unidentifiable there:
+    # `arg(twofold)` is their bisector and its argument is pure noise once
+    # the modulus is at the floor. So the pair is reported only where the
+    # twofold resultant clears the same floor, and `None` where it does not
+    # - which is not a failure but the correct reading of an orthogonal
+    # pair, whose two axes are fixed by `pair_angle_deg` alone.
+    resolution = math.degrees(math.asin(min(floor, 1.0)))
+    separated = abs(twofold) >= floor
+    versus_burst = (pair_angle - float(burst_phase_deg)) % 90.0
+
+    def _apart(first, second):
+        """The distance between two ORIENTATIONS of a quadrature pair.
+
+        Both live modulo ninety degrees, because a pair of axes ninety
+        apart is carried onto itself by a quarter turn, so 89 and 1 are two
+        degrees apart and not eighty-eight.
+        """
+        gap = (float(first) - float(second)) % 90.0
+        return min(gap, 90.0 - gap)
+
+    as_specified = _apart(versus_burst, IQ_ROTATION_DEG)
+    reversed_sense = _apart(versus_burst, -IQ_ROTATION_DEG)
+    return {
+        "fourfold": fourfold,
+        "twofold": twofold,
+        "clustering": abs(fourfold),
+        "clustering_floor": floor,
+        "effective_count": float(effective),
+        "clustered": bool(abs(fourfold) >= floor),
+        "pair_angle_deg": pair_angle % 90.0,
+        "axis_deg": (first, second) if separated else None,
+        "axes_separately_resolved": bool(separated),
+        "separation_deg": separation,
+        "separation_specified_deg": SPECIFIED_AXIS_SEPARATION_DEG,
+        "separation_error_deg": separation - SPECIFIED_AXIS_SEPARATION_DEG,
+        "separation_resolution_deg": resolution,
+        # ORTHOGONAL EXACTLY WHEN THE TWOFOLD RESULTANT IS AT ITS FLOOR,
+        # which is the same test `separated` is, read the other way: a
+        # right angle puts that resultant at zero by construction, so
+        # failing to resolve the two axes separately IS the finding that
+        # they are ninety degrees apart.
+        "orthogonal": bool(not separated),
+        "shear": abs(twofold),
+        "versus_burst_deg": versus_burst,
+        # THE SIGN OF THE ROTATION IS A REAL QUESTION AND IS ANSWERED HERE.
+        # Clause 10 puts both modulation axes at `IQ_ROTATION_DEG` from the
+        # colour difference pair, and the burst is the origin, so the pair
+        # should sit 33 degrees from the burst - but an orientation is
+        # defined modulo ninety and 33 and -33 are 66 degrees apart, so a
+        # reading that agrees in MAGNITUDE and disagrees in sign looks like
+        # a 23 degree error unless both are reported. Measured on a decode
+        # of `zaroff-75bars-NTSC-SP`, the pair sits 56.5 degrees from the
+        # burst, which is 33.5 degrees the other way - the specified
+        # rotation to half a degree, with the opposite sign.
+        "versus_specified_deg": min(as_specified, reversed_sense),
+        "specified_rotation_deg": IQ_ROTATION_DEG,
+        "rotation_sense": ("as specified" if as_specified <= reversed_sense
+                           else "reversed"),
+        "departure_as_specified_deg": as_specified,
+        "departure_reversed_deg": reversed_sense,
+        "sigma": float(sigma),
+        "cite": ("SMPTE 170M clause 10 for the quadrature pair; note 2 to "
+                 "the same clause for the burst as the phase origin"),
+        "why": ("a streak has an orientation and no arrow, so the mean of "
+                "the raw angles is meaningless; doubling makes it axial and "
+                "doubling again folds an orthogonal pair onto one point, so "
+                "the fourfold magnitude tests the shape and the twofold one "
+                "measures the departure from a right angle"),
+    }
+
+
+def coordinate_map(steps, weights=None) -> Dict[str, object]:
+    """THE SAME DEPARTURE AS A LINEAR MAP: one pair of complex numbers.
+
+    Every real two-by-two map on the plane is `d -> alpha d + beta conj(d)`
+    for exactly one complex pair, and that is the representation to carry
+    a rotation and a shear in together - the split is the map's conformal
+    and anti-conformal halves, and no magnitude expresses it.
+
+    The pair is recovered from two second moments of the measured steps.
+    Written against a source whose own excursions are isotropic - which is
+    what an encoder driving two quadrature axes with independent content
+    produces - the moments are
+
+        E|d|^2 = (|alpha|^2 + |beta|^2) sigma^2
+        E d^2  = 2 alpha beta sigma^2
+
+    so their ratio fixes `|beta| / |alpha|` outright and `sigma` cancels.
+    That ratio is the whole of the shear: zero for a coordinate system
+    that is only turned, and rising to one where the map has collapsed the
+    plane onto a line.
+
+    THE ISOTROPY IS AN ASSUMPTION AND IS RETURNED AS ONE. A bar signal's
+    transitions are not isotropic - six targets give a fixed set of
+    trajectories - so on bars this reads the CONTENT's own anisotropy
+    beside the channel's, and the two cannot be separated from one field
+    of one pattern. It is honest on a picture with many hues and it says
+    so rather than implying otherwise; the fourfold clustering in
+    `transition_axes` is the reading that does not depend on it.
+    """
+    values = np.asarray(steps, dtype=np.complex128).ravel()
+    if values.size < 4:
+        raise ValueError("a coordinate map needs a run of transitions")
+    if weights is None:
+        weight = np.ones(values.size, dtype=np.float64)
+    else:
+        weight = np.asarray(weights, dtype=np.float64).ravel()
+    total = float(weight.sum())
+    if total <= 0.0:
+        raise ValueError("the weights sum to zero")
+    power = float((weight * np.abs(values) ** 2).sum() / total)
+    pseudo = complex((weight * values * values).sum() / total)
+    if power <= 0.0:
+        raise ValueError("the transitions carry no power")
+    normalised = pseudo / power
+    eccentricity = min(abs(normalised), 1.0)
+    # |E d^2| / E|d|^2 = 2r / (1 + r^2) with r = |beta| / |alpha|, whose
+    # root inside the unit disc is this. The far root, 1/r, is the same
+    # map with its two halves exchanged - an orientation-reversing map -
+    # and the near root is the one an ordinary channel is.
+    if eccentricity <= 0.0:
+        ratio = 0.0
+    else:
+        ratio = float((1.0 - math.sqrt(max(1.0 - eccentricity ** 2, 0.0)))
+                      / eccentricity)
+    stretch = (1.0 + ratio) / (1.0 - ratio) if ratio < 1.0 else float("inf")
+    return {
+        "power": power,
+        "pseudo_power": pseudo,
+        "normalised_pseudo": normalised,
+        "shear_ratio": ratio,
+        "stretch": stretch,
+        "stretch_db": 20.0 * math.log10(stretch) if stretch > 0
+        and math.isfinite(stretch) else float("inf"),
+        # arg(alpha beta) is the doubled angle of the direction the stretch
+        # acts along, so half of it is that direction.
+        "stretch_axis_deg": float(math.degrees(np.angle(normalised)) / 2.0
+                                  % 180.0),
+        "is_conformal": bool(ratio < 1e-9),
+        "assumption": ("the source excursions are isotropic; a bar signal's "
+                       "are not, so on bars this carries the content's own "
+                       "anisotropy beside the channel's"),
+        "why": ("a rotation and a shear are one linear map, and the only "
+                "complete complex form of a real two-by-two map is "
+                "alpha d + beta conj(d) - so the shear is a number this "
+                "returns rather than a shape a magnitude cannot hold"),
+    }

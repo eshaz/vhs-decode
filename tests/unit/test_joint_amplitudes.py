@@ -142,25 +142,12 @@ class TestOrderIndependence:
         assert spread > 1e-3, spread
 
 
-class TestThePictureStageWiring:
-    """The change is present where it was made."""
-
-    def test_the_stage_keeps_an_undeflated_target(self):
-        import inspect
-
-        from vhsdecode.addons import ringing_cancellation
-
-        source = inspect.getsource(ringing_cancellation.fit_artifact_model)
-        assert "ring_target_whole" in source
-        assert "solve_pass(list(ring_poles), ring_target_whole" in source
-
-    def test_a_mismatched_support_keeps_the_peels_answer(self):
-        """Conservative on disagreement: a silently misaligned amplitude
-        set is worse than a sequentially fitted one."""
-        import inspect
-
-        from vhsdecode.addons import ringing_cancellation
-
-        source = inspect.getsource(ringing_cancellation.fit_artifact_model)
-        assert "keeping the peel's amplitudes" in source \
-            or "kept the" in source
+# THE WIRING TESTS THAT STOOD HERE ARE GONE WITH THEIR SUBJECT. They read
+# the source of `addons/ringing_cancellation.fit_artifact_model` to check
+# that the picture stage solved its component amplitudes jointly rather
+# than greedily. That module was deleted on 2026-09-06 and its correction
+# replaced by `vhsdecode/models/ringing_tesseract`, which fits no component
+# amplitudes at all: the kernel IS the measured departure, folded on the
+# tesseract's orthogonal contrasts, so there is no set of amplitudes for a
+# greedy pass to distort. The principle the rest of this file tests still
+# stands and is why the replacement does not fit components one at a time.

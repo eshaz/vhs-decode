@@ -1,6 +1,56 @@
 """The VHS Hi-Fi (AFM) carriers as a timing probe independent of the video
 path, and what the deck and the captures say about reaching them.
 
+CORRECTION, 2026-09-07 - READ THIS BEFORE THE MEASUREMENT BELOW. Two of the
+five records `MEASURED` reports on carry no Hi-Fi audio at all. Ethan,
+2026-09-06: *"These sample may not have hifi audio. The zaroff samples
+should have hifi carriers, home and cd will not."* So the `countdown` and
+`home` rows searched for a signal that was never recorded, and their -50 dB
+and -45 dB bounds are NOT evidence about leakage. They are withdrawn. Four
+of the ten (record, channel) pairs in that table are those two records, and
+the summary line "no AFM carrier at the video tap in any capture" overstates
+what the valid subjects support.
+
+WHAT SURVIVES, and it is weaker than what was withdrawn. The zaroff records
+are the only valid subjects - the tape was recorded on a Sony SLV-778HF,
+a Hi-Fi deck, which lays its carriers down whenever it records - and the
+record-tap control is unaffected and is the strongest part of the original
+measurement, because the audio carriers go to separate heads (clause 5.1)
+and can never appear at the video record-current tap. Re-measured over all
+32 zaroff playback captures and all 32 record captures rather than the one
+programme sampled here, the honest bound is the HUMP bound and not the
+narrow-line one: -40 dB on channel 1 for the chroma-bearing SP record,
+-45 dB for the y-only one, and -35 dB on channel 2.
+
+THREE THINGS THE WIDER RE-MEASUREMENT FOUND, all recorded in
+`capture_alignment.WIDE_SWEEP` with the arithmetic:
+
+  * THE NARROW-LINE STATISTIC IS NOT SAFE. It divides a peak by the scatter
+    of its own neighbourhood, so a flat neighbourhood manufactures
+    significance. Ten of 64 playback pairs cross 3 sigma and none of 64
+    record-tap control pairs does - yet the control shows LARGER bumps
+    (up to 27.1 dB over its floor against the firing pairs' 11.2 dB
+    median), and only its rougher surround stops it firing.
+  * THE COLOUR-UNDER SECOND HARMONIC IS MISATTRIBUTED. The confound named
+    below at 1.258741 MHz was tested on the y-only recordings, which carry
+    no chrominance: removing 18.93 dB of colour-under fundamental removed
+    0.14 dB there, where a square-law product would have lost about 38 dB.
+    What sits at that frequency is the luma lower-sideband continuum and
+    the tape's own noise. Excluding it by name buys nothing.
+  * THE OPERATIVE STATISTIC REVERSES. The argument below - that the zaroff
+    recordings had no audio connected, so the carrier is unmodulated and
+    the narrow line is the bound to quote - does not hold, because clause
+    5.6's 2:1 logarithmic compressor is at maximum gain on silence. Planted
+    at -45 dB, an unmodulated carrier is detected (line rise +3.03) and one
+    with 500 Hz of deviation is not (+2.74); 500 Hz is what that compressor
+    makes of an input 84 dB down. The hump statistic is nearly indifferent
+    to deviation and is the conservative one.
+
+This block is kept rather than the numbers being edited away, because this
+arc's rule is that a withdrawn claim stays visible with its reason. See
+`capture_alignment.WITHDRAWN`, `capture_alignment.carrier_route_bound` and
+docs/CAPTURE_ALIGNMENT.md.
+
 Ethan (2026-09-05): *"HiFi carriers - independent timing probe. AFM carriers
 ~1.3/1.7 MHz, different heads, different azimuth, deeper penetration.
 Wavelengths ~3.4-4.5 um, between chroma (9.2 um) and luma (1.45 um). Third
@@ -722,6 +772,22 @@ MEASURED: Dict[str, object] = {
     # spectrum bins, 1300811.8 and 1694488.5 Hz. So the hump excess is a
     # property of the video signal's own spectral shape, and there is no
     # playback-only component at either carrier.
+    # ADDED 2026-09-07 with the correction in this module's docstring. The
+    # rows above are left exactly as measured; these two keys say which of
+    # them are evidence about leakage and which are not.
+    "subjects_corrected": {
+        "valid": ["zaroff SP playback", "zaroff EP playback"],
+        "control": ["zaroff SP record (control)"],
+        "withdrawn": ["countdown", "home"],
+        "why_withdrawn": ("Ethan, 2026-09-06: 'home and cd will not' have "
+                          "Hi-Fi audio, so those rows searched for a "
+                          "signal that was never recorded"),
+    },
+    "bound_restated": ("the HUMP bound on the valid subjects: -40 dB on "
+                       "channel 1 (chroma-bearing SP), -45 dB (y-only SP), "
+                       "-35 dB on channel 2. The -50 dB figures above came "
+                       "from the withdrawn records. See "
+                       "capture_alignment.WIDE_SWEEP"),
     "control": "CN261 pin 1 (video record current) shows the same hump "
                "excess and the same peak bins as CN261 pin 2 (playback)",
     "narrow_line": "line_sigma runs -2.64 to +1.02 across all ten "

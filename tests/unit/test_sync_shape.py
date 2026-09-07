@@ -146,3 +146,235 @@ def test_the_differential_refuses_a_mismatched_basis():
     b = ss.shape_components(_shape(), FS, 1.5e6)
     with pytest.raises(ValueError, match="same basis"):
         ss.differential(a, b)
+
+
+# --------------------------------------------------------------------------
+# The time axis MEASURED rather than derived from the amplitude:
+# `transit_delay` and the two-transient pair `edge_pair`.
+# --------------------------------------------------------------------------
+
+from vhsdecode.models import pair_dimension as pdim   # noqa: E402
+
+SEGMENT = 130          # samples, the span one sync pulse needs at 4fsc
+BLANKING = 0.0
+TIP_IRE = pdim.SYNC_DEPTH_IRE
+
+
+def _pulse(fall=19.0, rise=None, samples=SEGMENT):
+    """A sync pulse of the SPECIFIED width and rise, in IRE.
+
+    SMPTE 170M table 2 through `pair_dimension`: 4.7 us wide, -40 IRE, 140
+    ns of 10 to 90 per cent rise. A hyperbolic tangent covers 10 to 90 per
+    cent in 2.197 of its own scale, which is where the divisor comes from
+    rather than from a fit.
+    """
+    if rise is None:
+        rise = fall + pdim.SYNC_WIDTH_S * FS
+    scale = pdim.SYNC_RISE_S * FS / (2.0 * np.arctanh(0.8))
+    t = np.arange(samples, dtype=np.float64)
+    gate = (0.5 * (1.0 + np.tanh((t - fall) / scale))
+            * 0.5 * (1.0 + np.tanh((rise - t) / scale)))
+    return BLANKING + TIP_IRE * gate
+
+
+def _minimum_phase_filtered(values, pole=0.55):
+    """One real pole inside the unit circle: minimum phase by construction,
+    so whatever delay it imposes is the delay its magnitude alone fixes."""
+    out = np.empty_like(values)
+    previous = values[0]
+    for index, sample in enumerate(values):
+        previous = (1.0 - pole) * sample + pole * previous
+        out[index] = previous
+    return out
+
+
+def test_a_planted_delay_comes_back():
+    """The instrument on a known answer. Nothing else it says means
+    anything until this does. Measured, the error over -20 to +50 ns is
+    0.0000, 0.0050, 0.0095, 0.0055, 0.0210 and 0.0825 ns, so the bar below
+    is loose by an order of magnitude and a scale error of the kind a
+    window introduces would break it at every size."""
+    reference = _pulse()
+    for planted in (-20.0e-9, -2.0e-9, 0.0, 2.0e-9, 5.0e-9, 12.0e-9,
+                    20.0e-9, 50.0e-9):
+        moved = _pulse(fall=19.0 + planted * FS)
+        got = ss.transit_delay(moved, reference, FS, ss.VHS_LUMA_BAND_HZ)
+        assert got["delay_s"] == pytest.approx(planted, abs=0.2e-9)
+        assert abs(got["delay_s"] - planted) < 0.01 * abs(planted) + 1e-12
+
+
+def test_a_planted_delay_is_all_excess():
+    """A pure delay is an ALL-PASS: its magnitude is flat, so the
+    minimum-phase partner of that magnitude is no delay at all and the
+    whole of the reading has to land in the excess term."""
+    reference = _pulse()
+    moved = _pulse(fall=19.0 + 20.0e-9 * FS)
+    got = ss.transit_delay(moved, reference, FS, ss.VHS_LUMA_BAND_HZ)
+    assert abs(got["minimum_phase_delay_s"]) < 0.15 * abs(got["delay_s"])
+    assert got["excess_delay_s"] == pytest.approx(got["delay_s"], rel=0.2)
+
+
+def test_a_minimum_phase_filter_leaves_almost_no_excess():
+    """The other side of the same split, and the check that the two terms
+    are not one term counted twice. A single real pole is minimum phase, so
+    its delay is fixed by its magnitude and the excess must nearly vanish -
+    where a pure delay of similar size lands entirely in the excess."""
+    reference = _pulse()
+    filtered = _minimum_phase_filtered(reference)
+    got = ss.transit_delay(filtered, reference, FS, ss.VHS_LUMA_BAND_HZ)
+    # measured: delay 63.386 ns, of which the magnitude alone fixes 54.043
+    # and 9.342 is left over - 85 per cent accounted for, where the pure
+    # delay above leaves 101 per cent
+    assert abs(got["minimum_phase_delay_s"]) > 0.6 * abs(got["delay_s"])
+    assert abs(got["excess_delay_s"]) < 0.4 * abs(got["delay_s"])
+
+
+def test_the_response_is_complex():
+    """Ethan's standing rule. A response given as a magnitude cannot carry
+    a delay, and the delay is the whole subject here."""
+    got = ss.transit_delay(_minimum_phase_filtered(_pulse()), _pulse(), FS,
+                           ss.VHS_LUMA_BAND_HZ)
+    response = np.asarray(got["response"])
+    assert np.iscomplexobj(response)
+    assert float(np.max(np.abs(response.imag))) > 1e-6
+
+
+def test_a_dispersive_response_is_refused_as_a_delay():
+    """`is_a_delay` is the guard that stops a scalar being quoted where the
+    phase is not linear. An all-pass with a phase quadratic in frequency
+    has no delay to speak of and a large residual."""
+    reference = _pulse()
+    spectrum = np.fft.rfft(reference - reference.mean())
+    frequencies = np.fft.rfftfreq(len(reference), 1.0 / FS)
+    curved = np.fft.irfft(spectrum * np.exp(
+        -2j * np.pi * (frequencies / 1e6) ** 2 * 12e-9), n=len(reference))
+    curved = curved + float(np.mean(reference))
+    got = ss.transit_delay(curved, reference, FS, ss.VHS_LUMA_BAND_HZ)
+    assert not got["is_a_delay"]
+    assert got["equivalent_residual_delay_s"] > abs(got["delay_s"])
+    plain = ss.transit_delay(_pulse(fall=19.0 + 20.0e-9 * FS), reference, FS,
+                             ss.VHS_LUMA_BAND_HZ)
+    assert plain["is_a_delay"]
+
+
+def test_the_transients_are_found_and_a_mis_framed_segment_is_refused():
+    where = ss.locate_transients(_pulse(), FS)
+    assert where["fall"] == pytest.approx(19, abs=2)
+    assert where["width_s"] == pytest.approx(pdim.SYNC_WIDTH_S, rel=0.05)
+    assert where["fall"] < where["midpoint"] < where["rise"]
+    half = _pulse()[:60]                       # no trailing edge in view
+    with pytest.raises(ValueError):
+        ss.locate_transients(half, FS)
+
+
+def test_the_pair_calls_a_delay_a_delay():
+    """A displacement of the whole pulse moves both transients the same
+    way: the common term carries it and the width term is empty."""
+    reference = _pulse()
+    planted = 12.0e-9
+    moved = _pulse(fall=19.0 + planted * FS)
+    got = ss.edge_pair(moved, reference, FS, ss.VHS_LUMA_BAND_HZ)
+    assert got["common_delay_s"] == pytest.approx(planted, abs=0.1e-9)
+    # THE GUARD THAT CAUGHT THE WINDOW. A displacement moves the two
+    # transients by the SAME amount, so a method that reads them unequally
+    # is putting a width change where there is none. Measured, the two
+    # differ by 0.16 ns on a 12 ns shift; through a Hann window they
+    # differed by 1.7 ns, which is larger than several of the width
+    # changes this pair is asked to report on real tape.
+    assert abs(got["width_change_s"]) < 0.05 * planted
+
+
+def test_the_pair_refuses_to_call_a_width_change_a_delay():
+    """THE MEASUREMENT THE PAIR EXISTS FOR. A pulse widened at both ends
+    moves its transients in OPPOSITE directions. One number from the whole
+    pulse cannot tell that from a delay; two disjoint transients can, and
+    the same confusion has already cost this lane a round once, when a fall
+    time stood in for a rise nobody had measured on its own."""
+    reference = _pulse()
+    widen = 6.0e-9
+    wider = _pulse(fall=19.0 - widen * FS,
+                   rise=19.0 + pdim.SYNC_WIDTH_S * FS + widen * FS)
+    got = ss.edge_pair(wider, reference, FS, ss.VHS_LUMA_BAND_HZ)
+    assert got["width_change_s"] == pytest.approx(2.0 * widen, rel=0.3)
+    assert abs(got["common_delay_s"]) < 0.25 * abs(got["width_change_s"])
+
+
+def test_the_pair_separates_a_delay_and_a_width_carried_together():
+    """Both at once, which is what the SP recording turned out to hold."""
+    reference = _pulse()
+    delay, widen = 10.0e-9, 5.0e-9
+    both = _pulse(fall=19.0 + (delay - widen) * FS,
+                  rise=19.0 + pdim.SYNC_WIDTH_S * FS + (delay + widen) * FS)
+    got = ss.edge_pair(both, reference, FS, ss.VHS_LUMA_BAND_HZ)
+    assert got["common_delay_s"] == pytest.approx(delay, abs=1.0e-9)
+    assert got["width_change_s"] == pytest.approx(2.0 * widen, rel=0.3)
+
+
+def test_the_two_transients_are_measured_on_disjoint_samples():
+    """A pair that shares samples is not a pair."""
+    reference = _pulse()
+    got = ss.edge_pair(reference, reference, FS, ss.VHS_LUMA_BAND_HZ)
+    cut = got["transients"]["midpoint"]
+    assert len(got["leading"]["frequency_hz"]) == cut // 2 + 1
+    assert len(got["trailing"]["frequency_hz"]) == (len(reference) - cut) // 2 + 1
+
+
+def test_the_band_limit_decides_which_bins_carry_the_shape():
+    """The same format constant the shape-and-noise split already uses: the
+    power above the luma band is noise by construction, and a bin below it
+    carries no shape and no usable phase."""
+    reference = _pulse()
+    got = ss.transit_delay(reference, reference, FS, ss.VHS_LUMA_BAND_HZ)
+    frequencies = np.asarray(got["frequency_hz"])
+    carried = np.asarray(got["carried"])
+    assert carried.any()
+    assert frequencies[carried].max() <= ss.VHS_LUMA_BAND_HZ
+    assert frequencies[carried].min() > 0.0
+    narrow = ss.transit_delay(reference, reference, FS, 1.5e6)
+    assert int(narrow["bins"]) < int(got["bins"])
+
+
+def test_a_segment_with_no_out_of_band_room_is_refused():
+    """The noise floor comes from above the band limit, so a segment whose
+    Nyquist sits inside the band has nothing to set it with."""
+    reference = _pulse()
+    with pytest.raises(ValueError, match="out-of-band"):
+        ss.transit_delay(reference, reference, FS, FS)
+
+
+def test_shapes_of_different_length_are_refused():
+    with pytest.raises(ValueError, match="same segment"):
+        ss.transit_delay(_pulse()[:100], _pulse(), FS, ss.VHS_LUMA_BAND_HZ)
+
+
+def test_a_level_step_across_the_segment_does_not_move_the_delay():
+    """The joining line is removed, so framing the segment on a back porch
+    that has not settled costs nothing. On the real profiles that line is
+    2.3 to 6.5 IRE against noise amplitudes of 0.06 to 0.24, so this is the
+    ordinary case rather than a corner of it."""
+    reference = _pulse()
+    planted = 8.0e-9
+    moved = _pulse(fall=19.0 + planted * FS)
+    # the synthetic pulse's own out-of-band content sets the scale
+    # `ends_match` compares against, and on this shape that is 1.35 IRE, so
+    # the ramp is taken well past it to make the flag change
+    ramp = np.linspace(0.0, 25.0, len(reference))
+    clean = ss.transit_delay(moved, reference, FS, ss.VHS_LUMA_BAND_HZ)
+    stepped = ss.transit_delay(moved + ramp, reference + ramp, FS,
+                               ss.VHS_LUMA_BAND_HZ)
+    assert stepped["delay_s"] == pytest.approx(clean["delay_s"], abs=0.05e-9)
+    assert stepped["end_step"] == pytest.approx(25.0, abs=0.1)
+    assert not stepped["ends_match"]
+    assert clean["ends_match"]
+
+
+def test_the_two_transients_agree_on_a_pure_delay():
+    """The pair's own consistency check, and the one that would have caught
+    the window: the leading and trailing readings of a shifted pulse must
+    be the same number, because there is only one shift."""
+    reference = _pulse()
+    for planted in (2.0e-9, 12.0e-9, 20.0e-9):
+        got = ss.edge_pair(_pulse(fall=19.0 + planted * FS), reference, FS,
+                           ss.VHS_LUMA_BAND_HZ)
+        assert got["leading_delay_s"] == pytest.approx(
+            got["trailing_delay_s"], abs=0.3e-9)

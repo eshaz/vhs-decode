@@ -16,8 +16,9 @@ from vhsdecode import carrier_tbc
 from vhsdecode import luma_amplitude
 from vhsdecode import luma_transient
 from vhsdecode import residual_channels
-from vhsdecode.addons import ringing_cancellation
-from vhsdecode.addons.ringing_cancellation import (
+from vhsdecode import model_stages
+from vhsdecode.models import ringing_tesseract
+from vhsdecode.models.ringing_tesseract import (
     apply_adaptive_luma_transient_improvement,
 )
 from vhsdecode.chroma import (
@@ -1046,6 +1047,9 @@ class FieldShared:
             getattr(self.rf.options, "luma_eq", 0)
             or getattr(self.rf.options, "luma_transient", 0)
             or getattr(self.rf.options, "head_switch", 0)
+            # The RF transform reads the same measurement, so it is fed on
+            # every valid field whether or not the luma equalizer is on.
+            or getattr(self.rf.options, "rf_transform", 0)
         ) and getattr(self, "valid", False):
             luma_amplitude.measured_amplitude_deviation(self)
 
@@ -1091,7 +1095,7 @@ class FieldShared:
         take to settle" rather than a second constant tuned here.
         """
         sys_params = self.rf.SysParams
-        settle_us = (ringing_cancellation.TRANSITION_SETTLE_BANDWIDTHS
+        settle_us = (ringing_tesseract.TRANSITION_SETTLE_BANDWIDTHS
                      / float(self.rf.DecoderParams["video_lpf_freq"]) * 1e6)
         settle = int(math.ceil(self.usectooutpx(settle_us)))
 
@@ -1274,7 +1278,12 @@ class FieldShared:
         # head is known, and applied a field later because that is the soonest
         # a demodulator running ahead of field assembly can be told which head
         # is coming.
-        if self.rf.options.luma_eq != 0:
+        #
+        # Not while the RF transform's table is live: the table then stands
+        # at the equalizer's site in the demodulator, so `LumaPathEQ` is not
+        # rebuilt here. The measurement underneath it keeps running on every
+        # field and is what feeds the transform.
+        if self.rf.options.luma_eq != 0 and not model_stages.rf_transform_live(self.rf):
             luma_amplitude.update_luma_equalizer(self, self.rf.options.luma_eq)
 
         # The transient correction is applied in the demodulator, which cannot
@@ -1342,12 +1351,14 @@ class FieldShared:
             dsout = y_comb(dsout, self.outlinelen, y_comb_value)
 
         if final:
-            # Horizontal-sync-interval artifact measurement, modeling and
-            # correction (ghost / ringing / smear - see
-            # ringing_cancellation).  Measures every field's sync
-            # intervals before correcting it, fits the artifact model,
-            # and inverts the modeled artifacts across the whole field.
-            # This replaces the older inverse-equalization pipeline.
+            # Horizontal-sync-interval artifact measurement, folding and
+            # correction on the tesseract graph (see
+            # models/ringing_tesseract).  Reads this field's sync pulses
+            # as two known transients, folds them on the polarity and the
+            # line-scale axes, collapses the identified contrasts to one
+            # real signal per landing, and subtracts it at every gated
+            # transient.  ONE FIELD AT A TIME - nothing is averaged across
+            # fields, which is why `average_fields` is passed and ignored.
             # The hsync_model debug plot is available WITHOUT enabling
             # the correction: with --debug_plot hsync_model alone the
             # model is measured and shown per field while the output
@@ -1358,9 +1369,9 @@ class FieldShared:
                 and self.rf.debug_plot.is_plot_requested("hsync_model")
             )
             if _ringing_enabled or _ringing_plot:
-                dsout, lti_params = ringing_cancellation.process_field(
+                dsout, lti_params = ringing_tesseract.process_field(
                     dsout,
-                    ringing_cancellation.build_geometry(
+                    ringing_tesseract.build_geometry(
                         self.rf.SysParams,
                         self.rf.DecoderParams,
                         self.outlinelen,
@@ -1415,6 +1426,197 @@ class FieldShared:
 
             dsout = self.hz_to_output(dsout)
             self.dspicture = dsout
+
+            # THE ONE PICTURE TRANSFORM. While `picture_transform` is on, the
+            # three luma groups below - sync and timing, head and medium,
+            # levels and source - are DEFERRED to
+            # `model_stages.transform_picture`, which `decode_chroma` calls
+            # once the chroma exists as well: it measures the luma these
+            # groups read (this `dspicture`) and the chroma together, folds
+            # them, and applies in one place every realisation the groups'
+            # corrections applied. The groups' calls stay in the file, gated
+            # off, because the declaration's anchors resolve to them and
+            # `--stages` still names each of them.
+            picture_transform = bool(self.rf.options.picture_transform)
+
+            # THE SYNC AND TIMING GROUP (vhsdecode/model_stages.py). Here,
+            # because this is the first point at which the picture exists on
+            # an IRE scale - every reading in the group is quoted in IRE and
+            # the two corrections are a level and a gain, so measuring them
+            # before `hz_to_output` would mean carrying the mapping through
+            # each of them by hand.
+            #
+            # THE ORDER IS NOT FREE. `sync_shape` reads the pulse AS IT
+            # ARRIVED, so it is first. `precursor` then takes the decoder's
+            # own anticausal ripple out of the front porch, and `sync_depth`
+            # follows it because the porch is the blanking reference its
+            # spacing is measured against. The three measurement nodes come
+            # last and write nothing.
+            #
+            # Each is a NODE in `pipeline/stages.toml`, seeded ON by its
+            # declaration (`declared_default = true`), and has no flag of its
+            # own: `--stages -sync_depth` turns one off by name.
+            if not picture_transform:
+                if self.rf.options.sync_shape:
+                    model_stages.measure_sync_shape(self, dsout)
+                if self.rf.options.precursor:
+                    model_stages.correct_precursor(self, dsout)
+                if self.rf.options.sync_depth:
+                    model_stages.correct_sync_depth(self, dsout)
+                if self.rf.options.vertical_interval:
+                    model_stages.measure_vertical_interval(self, dsout)
+                if self.rf.options.tape_speed_stage:
+                    model_stages.measure_tape_speed(self)
+
+            # THE RADIO-FREQUENCY, CAPTURE AND TRANSPORT GROUP
+            # (vhsdecode/model_stages.py). Eight measurements, and every one
+            # of them reads the RAW radio frequency this field was cut from
+            # rather than the picture: the capture's own samples, before the
+            # notch, the band-pass, the equalizer or the analytic signal.
+            #
+            # HERE AND NOT IN `demodblock`, for two reasons that are both
+            # about correctness rather than convenience. The field thread is
+            # serial, so a stage may pool across fields without a lock, where
+            # the RF blocks are demodulated on N worker threads. And the
+            # field carries the line locations, which is what lets a reading
+            # be confined to the sync tips and the burst - the RF band is
+            # where the picture's own sidebands live, so a spectrum taken
+            # over a whole field would be reading the picture.
+            #
+            # BESIDE THE SYNC GROUP AND NOT AFTER THE LEVELS GROUP, because
+            # one of the eight reads the picture: `filter_model` fits the
+            # de-emphasis shelf to the pooled sync pulse, and standing here
+            # means it reads the same pulse `sync_shape` measured rather than
+            # one two corrections have since moved.
+            #
+            # Not one of them writes a sample. Each is a NODE in
+            # `pipeline/stages.toml`, seeded ON by its declaration
+            # (`declared_default = true`), and has no flag of its own:
+            # `--stages -band_delay` turns one off by name.
+            #
+            # THE ONE RF TRANSFORM stands in for the eight while
+            # `rf_transform` is on: it measures the same raw radio frequency
+            # through the shared analytics, folds it, and publishes the
+            # per-head table the demodulator's equalizer site multiplies
+            # by. Main thread only, which this is.
+            if self.rf.options.rf_transform:
+                model_stages.transform_rf(self)
+            else:
+                if self.rf.options.capture_profile:
+                    model_stages.measure_capture_profile(self)
+                if self.rf.options.capture_filter:
+                    model_stages.measure_capture_filter(self)
+                if self.rf.options.rf_stages:
+                    model_stages.measure_rf_stages(self)
+                if self.rf.options.filter_model:
+                    model_stages.measure_filter_model(self, dsout)
+                if self.rf.options.transport_model:
+                    model_stages.measure_transport(self)
+                if self.rf.options.band_delay:
+                    model_stages.measure_band_delay(self)
+                if self.rf.options.head_switch_pair:
+                    model_stages.measure_head_switch_pair(self)
+                if self.rf.options.interference:
+                    model_stages.measure_interference(self)
+
+            # THE HEAD, THE MEDIUM AND THE PATH
+            # (vhsdecode/model_stages.py). Five measurements of the physical
+            # chain from the coil to the oxide to the clearance the two are
+            # separated by, and every one of them reads the SAME three
+            # reserved intervals: the synchronizing pulse's flat interior,
+            # the back porch after the burst, and the colour burst. Three
+            # windows and not one, because a head's response is a shape
+            # across frequency and one window holds one carrier.
+            #
+            # HERE AND NOT EARLIER, for the reason the group above stands
+            # here: the field thread is serial, so a stage may pool across
+            # fields without a lock, and the field carries the line
+            # locations, which is what confines every reading to an interval
+            # the format reserves. The three levels come off the decoder's
+            # own analytic envelope and its own demodulated channel, so no
+            # second band-pass is chosen and no second transform taken.
+            #
+            # THEY SHARE ONE MEASUREMENT. The reserved-interval levels are
+            # read once a field however many of the five are enabled, so
+            # turning on all five costs what turning on one costs.
+            #
+            # Not one of them writes a sample. Each is a NODE in
+            # `pipeline/stages.toml`, seeded ON by its declaration
+            # (`declared_default = true`), and has no flag of its own:
+            # `--stages -head_model` turns one off by name. Deferred to the
+            # picture transform on the same terms as the sync group.
+            if not picture_transform:
+                if self.rf.options.head_model:
+                    model_stages.measure_head_model(self)
+                if self.rf.options.head_differential:
+                    model_stages.measure_head_differential(self)
+                if self.rf.options.magnetic:
+                    model_stages.measure_magnetic(self)
+                if self.rf.options.magnetic_circuit:
+                    model_stages.measure_magnetic_circuit(self)
+                if self.rf.options.tape_path:
+                    model_stages.measure_tape_path(self)
+
+            # THE LEVELS, GAIN AND SOURCE-SIDE GROUP
+            # (vhsdecode/model_stages.py). Six measurements and one
+            # correction, all read on the sync pulses and the reserved
+            # intervals.
+            #
+            # THE MEASUREMENTS COME FIRST AND THE CORRECTION LAST, and that
+            # ordering is the whole of their meaning. `source_agc` derives a
+            # gain control by ASSERTING that the back porch is the specified
+            # zero and attributing the departure to the chain; `vcr_agc`
+            # bounds a loop by the straightness of the same two level series;
+            # `level_from_frequency` puts the picture's own gain beside the
+            # one the carrier carries. `standard_levels` then DRIVES THAT
+            # DEPARTURE TO ZERO, so an instrument standing after it would be
+            # reading its own effect and would find nothing on every decode.
+            # This is the same rule that puts `burst_instrument` ahead of the
+            # chroma corrections.
+            #
+            # `standard_levels` also follows `sync_depth` because the two own
+            # different halves of the same map: `sync_depth` owns the GAIN and
+            # applies it about the measured blanking, which leaves the zero
+            # untouched, and this owns the ZERO.
+            #
+            # Each is a NODE in `pipeline/stages.toml`, seeded ON by its
+            # declaration (`declared_default = true`), and has no flag of its
+            # own: `--stages -standard_levels` turns one off by name.
+            # Deferred to the picture transform on the same terms as the
+            # sync group.
+            if not picture_transform:
+                if self.rf.options.level_from_frequency:
+                    model_stages.measure_level_from_frequency(
+                        self, self.rf.options.level_from_frequency)
+                if self.rf.options.source_agc:
+                    model_stages.measure_source_agc(
+                        self, self.rf.options.source_agc)
+                if self.rf.options.vcr_agc:
+                    model_stages.measure_vcr_agc(self, self.rf.options.vcr_agc)
+                if self.rf.options.composite_channel:
+                    model_stages.measure_composite_channel(
+                        self, self.rf.options.composite_channel)
+                if self.rf.options.multipath:
+                    model_stages.measure_multipath(self,
+                                                   self.rf.options.multipath)
+                if self.rf.options.standard_levels:
+                    model_stages.correct_standard_levels(
+                        self, self.rf.options.standard_levels)
+
+                # THE SOURCE CHANNEL, and it is last on purpose. Every stage
+                # above corrects what the tape and the two decks did; this
+                # one corrects the luma response the signal already carried
+                # when the recording VCR received it, which is the other
+                # half of the chain and the one nothing reached before.
+                # Measured on the sync pulse alone, head-split so the
+                # per-head playback term is excluded, and referred to the
+                # flat luma SMPTE 170M clause 7.1 specifies. Seeded on by
+                # its declaration; `--stages -source_correction` turns it
+                # off. Deferred to the picture transform with the rest.
+                if getattr(self.rf.options, "source_correction", 0):
+                    model_stages.correct_source_response(
+                        self, self.rf.options.source_correction
+                    )
 
         return dsout, dsaudio, dsefm
 
@@ -2664,6 +2866,13 @@ class FieldPALTypeC(FieldPALShared, ldd.FieldPAL):
     def downscale(self, final=False, *args, **kwargs):
         dsout, dsaudio, dsefm = super(FieldPALTypeC, self).downscale(final=final, *args, **kwargs)
 
+        # Type C records its colour directly rather than under the luma,
+        # so `write_chroma` is false and this returns None - but the
+        # picture transform's luma half runs inside it, with None for the
+        # chroma this format does not have, so it is called here as every
+        # other format calls it.
+        decode_chroma(self)
+
         return (dsout, None), dsaudio, dsefm
 
 
@@ -2723,6 +2932,13 @@ class FieldNTSCTypeC(FieldNTSCShared, ldd.FieldNTSC):
 
     def downscale(self, final=False, *args, **kwargs):
         dsout, dsaudio, dsefm = super(FieldNTSCTypeC, self).downscale(final=final, *args, **kwargs)
+
+        # Type C records its colour directly rather than under the luma,
+        # so `write_chroma` is false and this returns None - but the
+        # picture transform's luma half runs inside it, with None for the
+        # chroma this format does not have, so it is called here as every
+        # other format calls it.
+        decode_chroma(self)
 
         return (dsout, None), dsaudio, dsefm
 

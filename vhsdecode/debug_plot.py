@@ -1702,3 +1702,156 @@ def plot_luma_averaging(probe, dod_threshold_p, source="", show=True):
     if show:
         plt.show()
     return figure
+
+
+def plot_single_transform(picture, rf, title: str = ""):
+    """The two transforms as one figure: every contrast against its floor,
+    the causal split, the remainders, and the wave against the null space.
+
+    Ethan, 2026-09-07: "I do want to see what the comparison is between the
+    wave and null space." Six panels, all read from the readings the two
+    stages attach to the field (`field.picture_transform`,
+    `field.rf_transform`); nothing here feeds back into the decode. A
+    reading that is absent leaves its panel labelled so, rather than empty.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    figure, axes = plt.subplots(2, 3, figsize=(17, 9))
+    figure.suptitle(("The single transform" + (" - " + title if title else "")))
+    readings = {"picture": picture, "radio frequency": rf}
+
+    def report_of(reading):
+        return (reading or {}).get("report") or {}
+
+    # 1 and 2: the contrasts of each transform, magnitude rms per channel,
+    # the kept ones in colour and the amount applied written beside each
+    for column, (name, reading) in enumerate(readings.items()):
+        ax = axes[0][column]
+        report = report_of(reading)
+        contrasts = report.get("contrasts") or {}
+        if not contrasts:
+            ax.set_title("%s: no latched contrasts yet" % name)
+            ax.axis("off")
+            continue
+        kept = set(report.get("kept") or [])
+        names = list(contrasts)
+        channels = [c for c in report.get("channels", {})]
+        width = 0.8 / max(len(channels), 1)
+        for k, channel in enumerate(channels):
+            values = [contrasts[n].get(channel, {}).get("magnitude_rms", 0.0)
+                      for n in names]
+            ax.bar(np.arange(len(names)) + k * width, values, width,
+                   label=channel)
+        for i, n in enumerate(names):
+            amount = np.mean([contrasts[n].get(c, {}).get("amount", 1.0)
+                              for c in channels]) if channels else 1.0
+            ax.text(i + 0.4, 0, "%s\n%.2f" % ("kept" if (n in kept or n == "mean")
+                                              else "null", amount),
+                    ha="center", va="bottom", fontsize=7)
+        ax.set_xticks(np.arange(len(names)) + 0.4)
+        ax.set_xticklabels(names, rotation=30, ha="right", fontsize=8)
+        ax.set_ylabel("magnitude rms (channel units)")
+        ax.set_title("%s: contrasts (%s)" % (
+            name, (report.get("latched") or {}).get("treatment", "unlatched")))
+        ax.legend(fontsize=7)
+
+    # 3: the floors, both transforms, in each channel's own power
+    ax = axes[0][2]
+    rows, labels = [], []
+    for name, reading in readings.items():
+        floors = report_of(reading).get("floors") or {}
+        for channel, entry in floors.items():
+            if not entry.get("used"):
+                continue
+            rows.append([entry.get(k, float("nan")) for k in
+                         ("instrument", "banks", "null_pool", "hypercube")])
+            labels.append("%s %s" % (name[:3], channel))
+    if rows:
+        rows = np.asarray(rows, dtype=float)
+        x = np.arange(len(labels))
+        for k, key in enumerate(("instrument", "banks", "null_pool", "hypercube")):
+            ax.bar(x + 0.2 * k, np.where(rows[:, k] > 0, rows[:, k], np.nan),
+                   0.2, label=key)
+        ax.set_yscale("log")
+        ax.set_xticks(x + 0.3)
+        ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+        ax.legend(fontsize=7)
+        ax.set_title("the three floors, and the instrument's own")
+    else:
+        ax.set_title("floors: not yet measurable")
+        ax.axis("off")
+
+    # 4: the causal split of every latched contrast
+    ax = axes[1][0]
+    drawn = False
+    for name, reading in readings.items():
+        contrasts = report_of(reading).get("contrasts") or {}
+        for n, entry in contrasts.items():
+            causal = entry.get("causal")
+            if not causal:
+                continue
+            ax.scatter(1e9 * causal.get("delay_s", 0.0), causal.get("allpass_rms", 0.0),
+                       label="%s %s (min-phase share %.2f)" % (
+                           name[:3], n, causal.get("minimum_phase_share", float("nan"))))
+            drawn = True
+    if drawn:
+        ax.set_xlabel("delay, ns")
+        ax.set_ylabel("all-pass, rad rms")
+        ax.legend(fontsize=6)
+        ax.set_title("the causal split per contrast")
+    else:
+        ax.set_title("causal split: no response contrasts latched")
+        ax.axis("off")
+
+    # 5: this field's remainders under each treatment, before and after
+    ax = axes[1][1]
+    drawn = False
+    for name, reading in readings.items():
+        remainders = (reading or {}).get("remainders") or {}
+        for treatment, rows in remainders.items():
+            if not isinstance(rows, dict):
+                continue
+            for key, entry in rows.items():
+                if not isinstance(entry, dict) or "before" not in entry:
+                    continue
+                after = entry.get("exact_inverse", entry.get("after"))
+                applied = entry.get("applied")
+                ax.plot([0, 1, 2], [entry["before"], applied if applied is not None
+                                     else np.nan, after],
+                        marker="o", label="%s %s %s" % (name[:3], treatment, key))
+                drawn = True
+    if drawn:
+        ax.set_xticks([0, 1, 2])
+        ax.set_xticklabels(["before", "applied", "exact inverse"])
+        ax.set_yscale("log")
+        ax.legend(fontsize=6)
+        ax.set_title("this field's remainder")
+    else:
+        ax.set_title("remainders: nothing latched yet")
+        ax.axis("off")
+
+    # 6: the wave against the null space
+    ax = axes[1][2]
+    drawn = False
+    for name, reading in readings.items():
+        wave = (reading or {}).get("wave") or {}
+        for vertex, entry in (wave.get("folded") or {}).items():
+            comparison = entry.get("null_space_against_wave") or {}
+            for channel, pair in comparison.items():
+                ax.plot([0, 1], [pair["after_constant"], pair["after_wave"]],
+                        marker="o", label="%s %s %s (admitted %s)" % (
+                            name[:3], vertex, channel,
+                            ", ".join(entry.get("admitted") or ["none"])))
+                drawn = True
+    if drawn:
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(["after the constant (null space)", "after the wave"])
+        ax.set_yscale("log")
+        ax.legend(fontsize=6)
+        ax.set_title("the wave against the null space, this field")
+    else:
+        ax.set_title("wave: no run folded yet")
+        ax.axis("off")
+    figure.tight_layout()
+    return figure

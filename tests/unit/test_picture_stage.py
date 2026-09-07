@@ -394,3 +394,134 @@ def test_the_picture_stage_adds_directions_to_the_rf_key():
     # module's to fix, and the claim being tested is that the picture stage
     # adds directions rather than duplicating what is already there
     assert effective(together) > effective(key) + 0.8
+
+
+# --------------------------------------------------------------------------
+# The colour lock, read one field at a time - Ethan's picture-stage
+# directive, and the first measurement in this module that reads a field.
+# --------------------------------------------------------------------------
+
+from vhsdecode.models import burst_sync_lock as _bsl   # noqa: E402
+
+CHROMA_FS = 4.0 * ps.SUBCARRIER_HZ
+LINES = 210
+SAMPLES = 910
+BURST_WINDOW = (74, 110)
+ACTIVE_WINDOW = (134, 894)
+FIRST_LINE = 30
+
+
+def _chroma_field(phase_deg=-33.0, amplitude=40.0, frequency_hz=None,
+                  jitter_deg=0.0, seed=0, lines=LINES):
+    """One synthetic up-heterodyned chroma field.
+
+    Built the way the format builds it: a continuous subcarrier, so the
+    phase at the same column advances by the standard's half cycle from one
+    line to the next, which is what `expected_burst_phase_rad` carries.
+    """
+    rng = np.random.default_rng(seed)
+    columns = np.arange(SAMPLES, dtype=np.float64)
+    seconds = columns / CHROMA_FS
+    carrier = ps.SUBCARRIER_HZ if frequency_hz is None else float(frequency_hz)
+    numbers = np.arange(FIRST_LINE, FIRST_LINE + lines, dtype=np.float64)
+    alternation = _bsl.expected_burst_phase_rad(numbers)
+    wobble = np.radians(jitter_deg) * rng.standard_normal(lines)
+    angle = (2.0 * np.pi * carrier * seconds[None, :]
+             + np.radians(phase_deg)
+             + alternation[:, None] + wobble[:, None])
+    return amplitude * np.cos(angle)
+
+
+def test_the_colour_lock_comes_back_complex():
+    """Ethan's standing rule, on the quantity it matters most for: the lock
+    is an amplitude AND a phase, so it is one complex number."""
+    got = ps.colour_lock(_chroma_field(), CHROMA_FS, BURST_WINDOW,
+                         ACTIVE_WINDOW, first_line=FIRST_LINE)
+    for side in ("burst", "active"):
+        assert isinstance(got[side]["lock"], complex)
+        assert got[side]["amplitude"] > 0.0
+    assert isinstance(got["difference"], complex)
+
+
+def test_a_planted_phase_and_amplitude_come_back():
+    for planted, size in ((-33.0, 40.0), (147.0, 25.0), (12.5, 60.0)):
+        got = ps.colour_lock(_chroma_field(planted, size), CHROMA_FS,
+                             BURST_WINDOW, ACTIVE_WINDOW,
+                             first_line=FIRST_LINE)
+        assert got["burst"]["phase_deg"] == pytest.approx(planted, abs=0.5)
+        assert got["active"]["phase_deg"] == pytest.approx(planted, abs=0.5)
+        # the two windows read one carrier, so they must agree
+        assert got["difference_deg"] == pytest.approx(0.0, abs=0.5)
+        # amplitude scales with the planted size; the phasor sums over the
+        # window, so only the ratio between two sizes is meaningful
+        assert got["burst"]["amplitude"] > 0.0
+
+
+def test_the_specified_alternation_is_removed_before_the_lines_combine():
+    """Without it every other line reads 180 degrees out and the field mean
+    is nothing, which is the whole reason the removal is not optional."""
+    locked = ps.colour_lock(_chroma_field(), CHROMA_FS, BURST_WINDOW,
+                            ACTIVE_WINDOW, first_line=FIRST_LINE)
+    assert locked["burst"]["line_coherence"] > 0.99
+    # the same field read as though it began one line later: the standard's
+    # half cycle now falls the other way on every line
+    shifted = ps.colour_lock(_chroma_field(), CHROMA_FS, BURST_WINDOW,
+                             ACTIVE_WINDOW, first_line=FIRST_LINE + 1)
+    assert abs(shifted["burst"]["phase_deg"]
+               - locked["burst"]["phase_deg"]) == pytest.approx(180.0, abs=1.0)
+
+
+def test_the_line_coherence_says_whether_the_window_is_locked():
+    """A window whose phase wanders line to line is not carrying a lock, and
+    the coherence is what reports that rather than the amplitude, which
+    barely moves."""
+    steady = ps.colour_lock(_chroma_field(jitter_deg=0.0), CHROMA_FS,
+                            BURST_WINDOW, ACTIVE_WINDOW, first_line=FIRST_LINE)
+    wandering = ps.colour_lock(_chroma_field(jitter_deg=90.0, seed=3),
+                               CHROMA_FS, BURST_WINDOW, ACTIVE_WINDOW,
+                               first_line=FIRST_LINE)
+    assert steady["burst"]["line_coherence"] > 0.99
+    assert wandering["burst"]["line_coherence"] < 0.65
+
+
+def test_the_heterodyne_frequency_is_measured_and_not_assumed():
+    """Ethan: the up-heterodyne need not use a fixed frequency. A carrier
+    written away from the subcarrier must be read as that departure."""
+    for offset in (-2000.0, 0.0, 5000.0):
+        got = ps.colour_lock(
+            _chroma_field(frequency_hz=ps.SUBCARRIER_HZ + offset), CHROMA_FS,
+            BURST_WINDOW, ACTIVE_WINDOW, first_line=FIRST_LINE)
+        assert got["within_line_frequency_hz"] == pytest.approx(offset, abs=60.0)
+        assert got["within_line_coherence"] > 0.99
+
+
+def test_the_burst_drift_is_zero_on_a_field_that_does_not_drift():
+    got = ps.colour_lock(_chroma_field(), CHROMA_FS, BURST_WINDOW,
+                         ACTIVE_WINDOW, first_line=FIRST_LINE)
+    assert got["burst_drift_hz"] == pytest.approx(0.0, abs=0.5)
+
+
+def test_one_field_at_a_time_with_no_averaging():
+    """Ethan's last clause, made a property of the code rather than a claim
+    about it: nothing is carried between calls, so the same field twice
+    gives the same answer and a different field gives its own."""
+    one = _chroma_field(phase_deg=-33.0, seed=1)
+    two = _chroma_field(phase_deg=+61.0, seed=2)
+    a = ps.colour_lock(one, CHROMA_FS, BURST_WINDOW, ACTIVE_WINDOW,
+                       first_line=FIRST_LINE)
+    b = ps.colour_lock(two, CHROMA_FS, BURST_WINDOW, ACTIVE_WINDOW,
+                       first_line=FIRST_LINE)
+    again = ps.colour_lock(one, CHROMA_FS, BURST_WINDOW, ACTIVE_WINDOW,
+                           first_line=FIRST_LINE)
+    assert again["burst"]["lock"] == a["burst"]["lock"]
+    assert b["burst"]["phase_deg"] == pytest.approx(61.0, abs=0.5)
+    assert a["burst"]["phase_deg"] == pytest.approx(-33.0, abs=0.5)
+
+
+def test_a_window_outside_the_line_is_refused():
+    field = _chroma_field()
+    with pytest.raises(ValueError, match="inside the line"):
+        ps.colour_lock(field, CHROMA_FS, (74, 110), (134, SAMPLES + 1),
+                       first_line=FIRST_LINE)
+    with pytest.raises(ValueError, match="one field"):
+        ps.colour_lock(field[0], CHROMA_FS, BURST_WINDOW, ACTIVE_WINDOW)

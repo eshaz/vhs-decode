@@ -1051,20 +1051,47 @@ def follows_time_base(width_deviation, burst_added, hsync_deviation
 
 
 def sync_pole_components() -> List[Component]:
-    """The sync pulse's damped modes, as a PICTURE-stage component."""
+    """SUPERSEDED by `sync_shape_components`; kept only as the record.
+
+    Ethan, 2026-09-06: *"I think the matrix pencil is the wrong approach.
+    Use the existing sync shape modeling in hilbert space not the matrix
+    pencil."*
+
+    He is right, and the reason is that the pencil's ANSWER IS NOT
+    DETERMINED BY THE DATA. A pencil fits damped exponentials and needs an
+    order; on planted data it validated and beat its alternative, but on
+    real data there is no singular-value knee to set that order, and
+    `luma_amplitude.py:2012-2017` already records the same conclusion for
+    the ripple. Measured on the arc's own exports, the pencil's count of
+    ringing modes against the effective rank the sync shape's own fit
+    supports, on the same profiles:
+
+        export        head   pencil modes   shape rank of 49
+        cd             a           8              8.79
+        cd             b           7              8.52
+        home           a          10             10.11
+        home           b           3             10.08
+        pnb            a           4             10.33
+        pnb            b           3              8.90
+
+    The two heads of the home tape read one signal path through one
+    demodulator, and the pencil says there are ten modes on one and three
+    on the other - a factor of 3.3 - while the shape's rank moves from
+    10.11 to 10.08, a factor of 1.003. Across all six the pencil's count
+    varies by 51 per cent about its mean and the rank by 8.5. A number
+    that swings by three between two readings of the same thing is a
+    setting, not a measurement.
+
+    This entry is left in place so the chain's position is not silently
+    vacated and so the reason is on the record. Nothing calls it.
+    """
     return [
         _component("sync-pulse damped modes",
-                   "a matrix pencil on the sync pulse's settled aftermath, "
-                   "per polarity: the fall rings against the tip carrier and "
-                   "the rise against the blanking carrier. Each mode is this "
-                   "arc's three axes at once - a frequency, a residue "
-                   "amplitude and a decay time - so the pencil is the "
-                   "parametric form of the same triple rather than a "
-                   "different measurement. Fitted on DEMODULATED video, so "
-                   "it belongs to the video path and not to either RF stage. "
-                   "Below about 0.3 MHz use the nonparametric response and "
-                   "never the poles: that is the witnessability bound the "
-                   "pencil's own contract states",
+                   "SUPERSEDED: a matrix pencil on the sync pulse's settled "
+                   "aftermath. The pencil needs an order the data does not "
+                   "fix - ten modes on one head of a tape and three on the "
+                   "other - so it is replaced by the nonparametric sync "
+                   "shape in Hilbert space. See `sync_shape_components`",
                    ("amplitude", "frequency", "time"), linear=True,
                    stage=PICTURE, machine=RECORDING),
         _component("sync transition slope",
@@ -1093,6 +1120,73 @@ def sync_pole_components() -> List[Component]:
                    "burst-locked time base, so it arrived with the input "
                    "signal",
                    ("time",), linear=True, stage=PICTURE, machine=RECORDING),
+    ]
+
+
+def sync_shape_components() -> List[Component]:
+    """The sync pulse's shape in Hilbert space, replacing the pencil.
+
+    Ethan, 2026-09-06: *"Use the existing sync shape modeling in hilbert
+    space not the matrix pencil."*
+
+    THE SAME THREE AXES, WITHOUT AN ORDER TO CHOOSE. `sync_shape.
+    shape_components` returns the pulse's response as a frequency axis, a
+    magnitude on it and a group delay on it - the arc's three axes read
+    off one fit of the shape rather than fitted as a handful of poles. The
+    count of modes is not a setting: the fit reports the EFFECTIVE RANK the
+    data supports, measured at 8.5 to 10.3 of 49 across three tapes and
+    both heads, against a pencil whose mode count on the same profiles ran
+    from three to ten.
+
+    AND THE TIME AXIS IS NOT FREE, which is the part the pencil could never
+    express. A minimum-phase response's delay is fixed by its own
+    magnitude through the Bode relation, so the group delay splits into the
+    part the amplitude already implies (`hypercomplex.minimum_phase`) and
+    the excess that is a genuinely separate mechanism
+    (`hypercomplex.excess_phase`). A damped-mode fit has no way to say
+    which of its decay times were already implied by its residues.
+
+    THE OUT-OF-BAND REMAINDER IS A MEASUREMENT TOO. The same fit returns
+    what falls outside the luma band, which is the noise the shape does not
+    describe, and the pencil returned nothing of the kind.
+    """
+    return [
+        _component("sync-pulse shape, magnitude",
+                   "the accumulated pulse's response magnitude over its own "
+                   "frequency axis, nonparametric, from "
+                   "`sync_shape.shape_components`. The number of modes the "
+                   "data supports is reported as an effective rank - 8.5 to "
+                   "10.3 of 49 on three tapes - rather than chosen. "
+                   "Measured on DEMODULATED video, so it belongs to the "
+                   "picture path and not to either radio-frequency stage",
+                   ("amplitude", "frequency"), linear=True,
+                   stage=PICTURE, machine=RECORDING),
+        _component("sync-pulse shape, minimum-phase delay",
+                   "the part of the pulse's group delay that its own "
+                   "magnitude already implies, through the Bode relation "
+                   "(`hypercomplex.minimum_phase`). It is NOT an "
+                   "independent quantity and must never be fitted beside "
+                   "the magnitude as though it were, which is the "
+                   "double-counting a damped-mode fit cannot even detect",
+                   ("frequency", "time"), linear=True,
+                   stage=PICTURE, machine=RECORDING),
+        _component("sync-pulse shape, excess delay",
+                   "what remains of the group delay once the minimum-phase "
+                   "share and a pure delay are removed "
+                   "(`hypercomplex.excess_phase`). This is the separate "
+                   "mechanism - a reflection or an all-pass - and it is the "
+                   "only part of the timing the magnitude does not already "
+                   "contain",
+                   ("frequency", "time"), linear=True,
+                   stage=PICTURE, machine=RECORDING),
+        _component("sync-pulse out-of-band remainder",
+                   "the share of the accumulated pulse that falls outside "
+                   "the luma band the format defines, returned by the same "
+                   "fit as `noise_rms`. It bounds what the shape does not "
+                   "describe, and a parametric mode fit returns no such "
+                   "quantity",
+                   ("amplitude", "frequency"), linear=False,
+                   stage=PICTURE, machine=RECORDING),
     ]
 
 

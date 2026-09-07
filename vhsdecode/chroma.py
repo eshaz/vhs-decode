@@ -7,6 +7,7 @@ import scipy.fft as sps_fft
 from vhsdecode.rust_utils import sosfiltfilt_rust
 from vhsdecode import luma_amplitude
 from vhsdecode import luma_beat
+from vhsdecode import model_stages
 
 import numba
 from numba import njit
@@ -543,6 +544,56 @@ def _shape_gain(gain, band_hz, band_response, freq_hz, half_width_hz):
     return gain
 
 
+def burst_sparing_mask(field, n):
+    """The per-sample weight that spares each line's colour burst from the
+    phase rotation: unity where the chroma content lives, zero across the
+    burst's fit window, and a half-cosine taper joining the two on either
+    side so no phase step is introduced. `n` is the length of the RF-grid
+    array the mask multiplies.
+
+    The rotation must taper to zero across each line's colour burst, or the
+    burst-referenced time base reads the applied phase as line timing and
+    fights the correction - measured on y-only content as a 100x-class luma
+    timing echo before this existed. The burst then reports true timing;
+    the correction applies where the chroma content lives.
+
+    The spared span covers the burst FIT windows, not just the specified
+    burst: the level and phase fits read margins beyond it (-4 and +8 output
+    pixels plus an adjustment - lddecode/core.py's burst slice and this
+    file's burst_start/burst_end), and a taper inside their reach was
+    measured to leave half the timing fight standing.
+
+    A field that carries no line locations yet gets a mask of ones, which is
+    what the inline computation this replaces did there: nothing. The mask
+    is built exactly as that computation multiplied the phase, so applying
+    it leaves the phase as it was left before.
+    """
+    rf = field.rf
+    mask = np.ones(n, dtype=np.float32)
+    linelocs = getattr(field, "linelocs2", None)
+    if linelocs is None:
+        return mask
+    fs_us = rf.freq_hz / 1e6
+    burst_us = rf.SysParams["colorBurstUS"]
+    out_us = 8.0 / (4.0 * rf.SysParams["fsc_mhz"])
+    b_lo = int(round((burst_us[0] - 2.0 * out_us) * fs_us))
+    b_hi = int(round((burst_us[1] + 2.0 * out_us) * fs_us))
+    taper = int(round(0.25 * fs_us))
+    ramp = (0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, taper)))).astype(
+        np.float32
+    )
+    for loc in np.asarray(linelocs, dtype=np.float64):
+        a = int(round(loc))
+        lo = a + b_lo - taper
+        hi = a + b_hi + taper
+        if lo < 0 or hi >= n:
+            continue
+        mask[lo:lo + taper] *= ramp
+        mask[lo + taper:hi - taper] = 0.0
+        mask[hi - taper:hi] *= ramp[::-1]
+    return mask
+
+
 def apply_chroma_envelope_gain(field):
     """Reverse the tape's amplitude noise on the color-under, in place.
 
@@ -859,38 +910,9 @@ def apply_chroma_envelope_gain(field):
             sel = (fr >= lo) & (fr < hi)
             Phi[sel] = -gains[b] * D[sel]
         phase = _sps_fft.irfft(Phi, n=n_samples, overwrite_x=True, workers=workers).astype(np.float32)
-        # BURST-SPARING: the rotation must taper to zero across each line's
-        # colour burst, or the burst-referenced time base reads the applied
-        # phase as line timing and fights the correction - measured on
-        # y-only content as a 100x-class luma timing echo before this
-        # existed. The burst then reports true timing; the correction
-        # applies where the chroma content lives. Half-cosine tapers avoid
-        # phase steps.
-        linelocs = getattr(field, "linelocs2", None)
-        if linelocs is not None:
-            fs_us = rf.freq_hz / 1e6
-            burst_us = rf.SysParams["colorBurstUS"]
-            # The spared span covers the burst FIT windows, not just the
-            # spec burst: the level/phase fits read margins beyond it (-4
-            # and +8 output px plus an adjustment - lddecode/core.py's
-            # burst slice and this file's burst_start/burst_end), and a
-            # taper inside their reach was measured to leave half the
-            # timing fight standing.
-            out_us = 8.0 / (4.0 * rf.SysParams["fsc_mhz"])
-            b_lo = int(round((burst_us[0] - 2.0 * out_us) * fs_us))
-            b_hi = int(round((burst_us[1] + 2.0 * out_us) * fs_us))
-            taper = int(round(0.25 * fs_us))
-            ramp = 0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, taper)))
-            n_ph = len(phase)
-            for loc in np.asarray(linelocs, dtype=np.float64):
-                a = int(round(loc))
-                lo = a + b_lo - taper
-                hi = a + b_hi + taper
-                if lo < 0 or hi >= n_ph:
-                    continue
-                phase[lo:lo + taper] *= ramp.astype(np.float32)
-                phase[lo + taper:hi - taper] = 0.0
-                phase[hi - taper:hi] *= ramp[::-1].astype(np.float32)
+        # BURST-SPARING: the rotation tapers to zero across each line's
+        # colour burst, for the reason `burst_sparing_mask` records.
+        phase *= burst_sparing_mask(field, len(phase))
         quad = quad64.astype(video["demod_burst"].dtype)
         _scale_color_under_complex(
             video["demod_burst"], quad, gain, phase,
@@ -2912,11 +2934,25 @@ def process_chroma(
         # this uses the burst measurements to interpolate the correct phase of the color under heterodyne
         # phase issues are corrected continiously for each sample using a linear spline interpolated from the burst measurements
         # the mixing is performed on the upsampled signal to avoid aliasing introduced from the up-heterodyne mixing product
-        if luma_beat_wanted(field):
+        if (luma_beat_wanted(field) or field.rf.options.colour_under
+                or field.rf.options.iq_imbalance
+                # The picture transform reads it too - it is the chroma's
+                # third dimension, the one the up-conversion rewrites.
+                or getattr(field.rf.options, "picture_transform", 0)):
             # The color-under as the time base correction leaves it, before the
             # up-conversion rewrites its phase. The beat in the luma carries the
             # phase the TAPE held, which the burst-locked interpolation below is
             # about to replace with a target one.
+            #
+            # The `colour_under` and `iq_imbalance` measurement stages read
+            # the same array, for the same reason and one step earlier in the
+            # chain: this is the only point in a decode where the signal the
+            # TAPE holds exists on a regular grid, and for the imbalance it is
+            # the only place the image can be told from its signal at all -
+            # at the composite burst's 180 degrees a line the two are the same
+            # sequence. The copy is taken only when one of the three asks for
+            # it, so a decode that enables none does no extra work and is
+            # unchanged sample for sample.
             field.chroma_under_tbc = np.array(chroma, dtype=np.float64)
         upconvert_chroma_phase_comp(
             chroma, # modifies this in place
@@ -3023,6 +3059,30 @@ def process_chroma(
     )
 
     chroma_average_state.append((field_average, chroma_noise_floor))
+
+    # THE COLOUR-UNDER PHASE EVENT AT THE HEAD SWITCH, compensated. Here, at
+    # the end of the up-conversion path, because the correction is a phase
+    # rotation of the up-converted chroma and has to see the signal the
+    # picture will get: after `upconvert_chroma_phase_comp`, after the final
+    # chroma band-pass, after the comb - which would otherwise smear a
+    # corrected line back into its uncorrected neighbours - and after the
+    # automatic gain, which zeroes the lines the colour killer refused and so
+    # keeps them out of the lock by construction. A rotation commutes with a
+    # gain exactly, so nothing above it is disturbed.
+    #
+    # This is the open half of the red book passage quoted with
+    # `upconvert_chroma_phase_comp`: the record-side rotation switch flips
+    # where the video heads change over, and the decoder's up-conversion does
+    # not follow it.
+    #
+    # Not while the picture transform is on: that realisation is then the
+    # transform's, applied with every other in `transform_picture`.
+    if field.rf.options.chroma_head_switch and not getattr(
+        field.rf.options, "picture_transform", 0
+    ):
+        model_stages.correct_chroma_head_switch(
+            field, uphet, field.rf.options.chroma_head_switch
+        )
 
     # CTI does NOT run here. It is a cosmetic sharpener - it accelerates the
     # sweep between colour states - so anything that measures a physical
@@ -3736,13 +3796,186 @@ def _run_luma_beat(field, uphet):
     return True
 
 
+def _run_colour_free_luma(field, uphet):
+    """THE COLOUR-FREE LUMA: the up-heterodyned residual chroma, locked to the
+    luma's own colour-under replica and subtracted over the active area.
+
+    Here, where `luma_beat` stands, because this is the only place the decoded
+    chroma and the time base corrected luma picture exist at once - and it
+    SUPERSEDES `luma_beat` rather than running beside it, which the pipeline
+    declaration states and the decoder refuses at startup."""
+    if not field.rf.options.colour_free_luma:
+        return False
+    return model_stages.correct_colour_free_luma(
+        field, uphet, field.rf.options.colour_free_luma
+    ) is not None
+
+
+def _run_colour_under(field, uphet):
+    """The colour-under channel, measured on the down-converted chroma.
+
+    FIRST in the list, and that is a requirement rather than a preference:
+    `field.chroma_under_tbc` is the only place the signal the tape holds
+    exists on a regular grid, and `_run_luma_beat` releases it. Measures and
+    applies nothing."""
+    if not field.rf.options.colour_under:
+        return False
+    return model_stages.measure_colour_under(
+        field, uphet, field.rf.options.colour_under
+    ) is not None
+
+
+def _run_iq_imbalance(field, uphet):
+    """The chroma's quadrature imbalance, from the colour-under burst.
+
+    Beside `_run_colour_under` and for the same reason: both read the burst
+    of `field.chroma_under_tbc`, which `_run_luma_beat` releases, and the
+    imbalance can only be seen there - at the composite burst's 180 degrees
+    a line the signal and its image are the same sequence. Measures and
+    applies nothing."""
+    if not field.rf.options.iq_imbalance:
+        return False
+    return model_stages.measure_iq_imbalance(
+        field, uphet, field.rf.options.iq_imbalance
+    ) is not None
+
+
+def _run_burst_instrument(field, uphet):
+    """The burst as the chroma's instrument, in all three dimensions.
+
+    Before the corrections, because the burst is what a correction would be
+    referenced to and an instrument that read a corrected burst would be
+    measuring its own effect. Measures and applies nothing."""
+    if not field.rf.options.burst_instrument:
+        return False
+    return model_stages.measure_burst_instrument(
+        field, uphet, field.rf.options.burst_instrument
+    ) is not None
+
+
+def _run_colour_framing(field, uphet):
+    """The colour frame: the specification checked against the shipped map
+    and against the counter's own sequence, and an explicit refusal to
+    measure a framing the colour-under does not carry. Applies nothing."""
+    if not field.rf.options.colour_framing:
+        return False
+    return model_stages.measure_colour_framing(
+        field, uphet, field.rf.options.colour_framing
+    ) is not None
+
+
+def _run_vectorscope(field, uphet):
+    """The colour difference coordinate system, from the directions the
+    transitions between colours run in.
+
+    Before `cti`, which is a cosmetic sharpener acting on exactly the
+    transitions this measures. Applies nothing."""
+    if not field.rf.options.vectorscope:
+        return False
+    return model_stages.measure_vectorscope(
+        field, uphet, field.rf.options.vectorscope
+    ) is not None
+
+
+def _run_picture_stage(field, uphet):
+    """THE REFERENCES AND ALIGNMENTS THAT ACT AFTER THE RF MATRIX: the
+    burst's lock to the horizontal reference, and what this decode's own
+    baseband can separate among the four modifications Ethan named.
+
+    Here, with the other instruments and before the corrections, for the
+    reason they all stand there: the burst is what an alignment would be
+    referenced to, and `cti` accelerates the sweep between colour states at
+    exactly the transitions the burst window abuts. Measures and applies
+    nothing."""
+    if not field.rf.options.picture_stage:
+        return False
+    return model_stages.measure_picture_stage(
+        field, uphet, field.rf.options.picture_stage
+    ) is not None
+
+
+def _run_chroma_leakage(field, uphet):
+    """Chroma left in the luma, on both channels, pooled under the framing.
+
+    LAST of the measurements and after every correction that touches the
+    picture, because the question is whether the luma being DELIVERED is
+    clean rather than whether the luma before the corrections was. Applies
+    nothing."""
+    if not field.rf.options.chroma_leakage:
+        return False
+    return model_stages.measure_chroma_leakage(
+        field, uphet, field.rf.options.chroma_leakage
+    ) is not None
+
+
+def _run_tape_bias(field, uphet):
+    """The tape-bias residual in the delivered luma: the third-order product
+    of the two carriers that the luma FM's own bias does not linearise away.
+
+    Stands beside `chroma_leakage` and after every correction for the same
+    reason - the question is about the luma being DELIVERED - but it reads a
+    different thing. `chroma_leakage` measures the colour under SURVIVING
+    the separation, which is a filter's business; this measures a product
+    that was written on the tape at 80 f_H and which no separation filter
+    can reach. Applies nothing."""
+    if not getattr(field.rf.options, "tape_bias", 0):
+        return False
+    return model_stages.measure_tape_bias(
+        field, getattr(field, "dspicture", None),
+        field.rf.options.tape_bias
+    ) is not None
+
+
+def _run_burst_sync_lock(field, uphet):
+    """THE BURST AGAINST THE SYNC PULSE, read here because this is the only
+    place both exist at once and the chroma has not yet been sharpened.
+
+    The burst is a phase reference, and `cti` accelerates the sweep between
+    colour states at exactly the transitions the burst window abuts - so
+    anything reading a physical property of the chroma must read it first,
+    which is why this stands with the other measurement stages and not after
+    them. Measures only; writes no sample."""
+    if not field.rf.options.burst_sync_lock:
+        return False
+    return model_stages.measure_burst_sync_lock(field, uphet) is not None
+
+
 FIELD_CHROMA_STAGES = (
+    _FieldChromaStage("burst_sync_lock", _run_burst_sync_lock),
+    _FieldChromaStage("colour_under", _run_colour_under),
+    _FieldChromaStage("iq_imbalance", _run_iq_imbalance),
+    _FieldChromaStage("burst_instrument", _run_burst_instrument),
+    _FieldChromaStage("colour_framing", _run_colour_framing),
+    _FieldChromaStage("vectorscope", _run_vectorscope),
+    _FieldChromaStage("picture_stage", _run_picture_stage),
     _FieldChromaStage("luma_beat", _run_luma_beat),
+    _FieldChromaStage("colour_free_luma", _run_colour_free_luma),
+    _FieldChromaStage("chroma_leakage", _run_chroma_leakage),
+    _FieldChromaStage("tape_bias", _run_tape_bias),
     _FieldChromaStage("cti", apply_chroma_transient_improvement),
 )
-"""In declared order. `cti` is LAST because it is a cosmetic sharpener:
-anything measuring a physical property of the chroma must read the chroma
-before it."""
+"""In declared order. `colour_free_luma` stands where `luma_beat` does because
+it is the same join - the chroma branch re-entering the luma - taken on the
+up-heterodyned channel instead of the down-converted one; it SUPERSEDES that
+stage rather than running beside it, which `pipeline/stages.toml` declares and
+the decoder refuses at startup. `cti` is LAST because it is a cosmetic
+sharpener: anything measuring a physical property of the chroma must read the
+chroma before it.
+
+THE MEASUREMENT STAGES stand in this list on the same terms as the
+corrections - named, gated by `--stages`, and ordered by the declaration -
+because a stage that measures is still a stage that has to be callable, and
+five of the colour group could not be reached from a decode at all. Not one
+of them writes a sample, so an enabled decode is byte-identical and the
+finding goes to the log; their positions are the measurement's meaning.
+`colour_under` is FIRST because `luma_beat` releases the down-converted
+chroma it reads. `burst_instrument`, `colour_framing` and `vectorscope`
+stand before the corrections, so the instrument is not reading its own
+effect. `chroma_leakage` stands AFTER them, because Ethan's question is
+about the luma being delivered, and `tape_bias` beside it for the same
+reason - it reads the delivered luma too, at a frequency no separation
+filter reaches. THE COUNT IS DELIBERATELY NOT GIVEN: it was a number here
+and it was already stale by two when this was last read."""
 
 
 def _stage_enabled(field, name):
@@ -3757,8 +3990,15 @@ def _stage_enabled(field, name):
 
 
 def decode_chroma(field, do_chroma_deemphasis=False):
+    """Do track detection if needed and up-convert the chroma signal, then
+    run the field-level picture stages on the luma and the chroma together.
+
+    Returns the up-converted chroma as unsigned 16-bit samples, or None for
+    a format that writes no chroma - in which case the picture transform
+    still runs, on the luma alone.
+    """
+    uphet = None
     if field.rf.options.write_chroma:
-        """Do track detection if needed and upconvert the chroma signal"""
         field.chroma_tbc_buffer = None
 
         uphet = process_chroma(
@@ -3769,6 +4009,35 @@ def decode_chroma(field, do_chroma_deemphasis=False):
         )
         field.uphet_temp = uphet
 
+    if getattr(field.rf.options, "picture_transform", 0):
+        # THE ONE PICTURE STAGE. It measures the field's luma (`dspicture`,
+        # already through `hz_to_output`) and its chroma - `uphet`, or None
+        # for a luma-only format, together with the colour-under as the
+        # time base correction left it - folds them, and applies every
+        # realisation in place: the three luma groups `downscale` deferred
+        # here and the field-level chroma stages the list below ran. Here
+        # and not in `downscale`, because this is the first point at which
+        # the luma and the chroma exist at once.
+        model_stages.transform_picture(field, uphet)
+        _plot = getattr(field.rf, "debug_plot", None)
+        if _plot and _plot.is_plot_requested("single_transform"):
+            # the two transforms as one figure, per field: contrasts against
+            # their floors, the causal split, the remainders, and the wave
+            # against the null space
+            from vhsdecode import debug_plot as _debug_plot
+            import matplotlib.pyplot as _plt
+            _debug_plot.plot_single_transform(
+                getattr(field, "picture_transform", None),
+                getattr(field, "rf_transform", None),
+                title="field %s" % getattr(field, "field_number", "?"))
+            _plt.show()
+        # `cti` is a cosmetic sharpener and not a realisation, so it is not
+        # the transform's to apply: it still runs LAST, after everything
+        # that measures the chroma, on the same gates as before - its name
+        # in `--stages`, and `cti_mix`, which the sharpener reads itself.
+        if uphet is not None and _stage_enabled(field, "cti"):
+            apply_chroma_transient_improvement(field, uphet)
+    elif uphet is not None:
         # THE FIELD-LEVEL CHROMA STAGES, run as a declared list rather than
         # as two hand-placed calls. `luma_beat` is a stage like any other -
         # gated by name, ordered by the declaration, and able to be turned
@@ -3786,11 +4055,12 @@ def decode_chroma(field, do_chroma_deemphasis=False):
                 continue
             stage.run(field, uphet)
 
-        # Release to avoid keeping this im memory - should do this in a cleaner manner.
-        field.chroma_tbc_buffer = None
-        return chroma_to_u16(uphet)
+    if uphet is None:
+        return None
 
-    return None
+    # Release to avoid keeping this im memory - should do this in a cleaner manner.
+    field.chroma_tbc_buffer = None
+    return chroma_to_u16(uphet)
 
 
 def get_burst_area(field):

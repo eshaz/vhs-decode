@@ -37,9 +37,12 @@ THE CONTRACT (stated here and in the npz metadata):
 
   VALIDITY: ~0.1-3 MHz determined; 0.05-0.1 MHz one marginal band;
   below 0.05 MHz nothing exists to measure (window length, per-field
-  porch anchoring).  The certified pole table (matrix pencil) rides
-  along for the ring band; below ~0.3 MHz use the nonparametric H,
-  never poles (witnessability bound).
+  porch anchoring).  For the ring band a per-polarity SHAPE reading
+  rides along (`ringing_tesseract.kernel_shape`, the Laplace eigenbasis
+  truncated at the format's luma band, plus Bode's excess phase); it
+  replaced the matrix-pencil pole table on 2026-09-06, because a
+  damped-mode fit needs an order the evidence does not fix.  Below
+  ~0.3 MHz use the nonparametric H (witnessability bound).
 
 Usage: RC_WORK=<dir> python3 sync_step_response.py <prefix>...
 Writes <RC_WORK>/<prefix>_sync_step_response.npz and a figure under
@@ -61,7 +64,7 @@ from scipy.special import erf
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 import hsync_model_report as report
-from vhsdecode.addons import ringing_cancellation as model
+from vhsdecode.models import ringing_tesseract as model
 from vhsdecode.formats import get_format_params, parse_tape_speed
 
 import logging
@@ -69,13 +72,15 @@ import logging
 WORK_DIRECTORY = os.environ.get("RC_WORK", "/output/claude_validation")
 PLOT_DIRECTORY = os.path.join(WORK_DIRECTORY, "hsync_plots")
 
-AVERAGE_FIELDS = 4
+# The luma band that separates the aftermath's SHAPE from its noise, a
+# format constant rather than a fitted knee (`sync_shape`).
+SHAPE_BAND_HZ = 3.0e6
 FFT_LENGTH = 4096
 BAND_MHZ = (0.04, 3.5)
 TAPER_ALPHA = 0.15
 
 # the VHS NTSC luma FM deviation map the module itself uses
-# (ringing_cancellation _event_landing_scales): sync tip 3.40 MHz,
+# (the VHS NTSC deviation map): sync tip 3.40 MHz,
 # blanking 3.69, white 4.40.  The fall lands at the tip, the rise at
 # blanking - two DIFFERENT carriers, so an LTI channel already rings
 # the two aftermaths at |f_pole - f_c(landing)| with no nonlinearity.
@@ -97,7 +102,16 @@ frequency_mhz = np.fft.rfftfreq(FFT_LENGTH, d=1.0 / rate)
 
 
 def accumulate(fields, parity, subset=None):
-    """One parity's model state over all (or a subset of) its fields."""
+    """One parity's accumulated sync interval over its fields.
+
+    THE POOLING IS THE EXPORT'S OWN, not the decoder's. The correction
+    stage is one field at a time and averages nothing across fields; this
+    instrument pools because its published contract is a standard error
+    from the cross-line scatter of an accumulated mean and a
+    first-half/second-half pair of independent estimates. That is why the
+    pooling lives in `ringing_tesseract.accumulate_field_lines`, which
+    nothing in the decode path calls.
+    """
     state = {}
     indices = range(parity, len(fields), 2)
     if subset == "first":
@@ -107,22 +121,14 @@ def accumulate(fields, parity, subset=None):
         full = list(range(parity, len(fields), 2))
         indices = full[len(full) // 2:]
     for index in indices:
-        model.measure_field_lines(fields[index], geometry, plan,
-                                  state, AVERAGE_FIELDS)
-        if state.get("slow_fields_accumulated", 0) >= AVERAGE_FIELDS:
-            model.fit_artifact_model(state, geometry, plan,
-                                     AVERAGE_FIELDS)
+        model.accumulate_field_lines(fields[index], geometry, plan, state)
     return state
 
 
 def effective_count(state, view):
-    lines = max(state.get("usable_lines_average", 1.0), 1.0)
-    if view == "rise":
-        fields_used = state.get("rise_fields_accumulated",
-                                state.get("slow_fields_accumulated", 1))
-    else:
-        fields_used = state.get("slow_fields_accumulated", 1)
-    return lines * max(float(fields_used), 1.0)
+    """How many independent line measurements a view's mean rests on."""
+    key = "rise_line_count" if view == "rise" else "slow_line_count"
+    return max(float(state.get(key, state.get("slow_line_count", 1.0))), 1.0)
 
 
 def step_response(state, view):
@@ -366,11 +372,14 @@ def pulse_response(state):
         # an edge by more than that edge's own transition width, so
         # the phase product ends where |group delay| first exceeds
         # the MEASURED sync edge width (spec width as fallback).  The
-        # whole-pulse phase is a roll-off product; the ring band
-        # belongs to the per-edge poles.
-        edges = (state.get("model") or {}).get("edges") or {}
-        fall_edge = edges.get("sync_fall")
-        edge_us = ((float(fall_edge[1]) / rate) if fall_edge is not None
+        # whole-pulse phase is a roll-off product; the ring band belongs
+        # to the per-edge shape reading.  The measured width now comes
+        # from the accumulated fall's own 10-90 crossings
+        # (`ringing_tesseract._edge_width`) rather than from a fitted
+        # edge model, which is the same quantity read without a fit.
+        measured_edge = state.get("fall_edge_width_samples")
+        edge_us = ((float(measured_edge) / rate)
+                   if measured_edge is not None and np.isfinite(measured_edge)
                    else geometry.sync_transition_samples / rate)
         over = ((frequency_mhz[idx] > 0.3)
                 & (np.abs(smooth_delay) > edge_us))
@@ -598,17 +607,32 @@ def vertical_low_frequency_reach(sys_params):
     return rate
 
 
-def polarity_poles(product, view):
-    """Per-polarity matrix-pencil poles from one view's settled
-    aftermath (the module's own estimator, one view at a time).
+def polarity_shape(product, view):
+    """Per-polarity SHAPE of one view's settled aftermath, in Hilbert
+    space, with no order to choose.
 
-    Gives the polarity split the combined export's certified pole
-    table cannot: the fall aftermath rings against the tip carrier,
-    the rise against the blanking carrier.  These carry pencil
-    magnitude, NOT the certified significance (alpha) - that needs the
-    joint fit's certification, which the combined head_<h>_pole_alpha
-    already provides; use these for the frequency/decay/carrier split,
-    the combined table for significance.
+    WHAT THIS REPLACES, AND WHY (Ethan, 2026-09-06: *"I think the matrix
+    pencil is the wrong approach. Use the existing sync shape modeling in
+    hilbert space not the matrix pencil."*). This used to fit damped
+    exponentials by a matrix pencil and export their poles. A pencil needs
+    an ORDER, and the order was never fixed by the evidence: on planted
+    data it validated, but on real data there is no singular-value knee,
+    so the answer follows the pencil's own capacity parameter rather than
+    the tape - the same conclusion `vhsdecode/luma_amplitude.py` records
+    for the response ripple.
+
+    `ringing_tesseract.kernel_shape` asks the question the data can
+    answer instead. The aftermath is fitted in the Laplace eigenbasis
+    truncated at the format's own luma band, which makes the split between
+    shape and noise a constant rather than a threshold, and its three axes
+    - frequency, amplitude and time - are three readings of ONE fit. Bode's
+    relation then says how much of the phase the magnitude already
+    implies, and what is left is the excess: a delay, or an all-pass that
+    no magnitude can invert.
+
+    Still the polarity split the combined export cannot give: the fall
+    aftermath settles against the tip carrier, the rise against the
+    blanking carrier.
     """
     mean = np.asarray(product["mean"], np.float64)
     ideal = np.asarray(product["ideal"], np.float64)
@@ -617,25 +641,20 @@ def polarity_poles(product, view):
     start = int(t0_local + settle)
     segment = residual[start:]
     if len(segment) < 16:
-        return []
-    capacity = model._pencil_capacity(plan)
-    # a plain noise floor from the residual's own far tail (this
-    # diagnostic omits the module's ghost subtraction and line-locked
-    # floor - stated in the metadata)
-    tail = segment[-max(8, len(segment) // 4):]
-    floor = float(np.std(tail)) if len(tail) else 1e-3
-    poles = model.estimate_decay_modes([segment], capacity,
-                                       max(floor, 1e-4))
-    out = []
-    for pole in poles:
-        magnitude = min(abs(pole), 1.0 - 1e-6)
-        frequency = abs(np.angle(pole)) / (2.0 * math.pi) * rate
-        decay_us = (-1.0 / math.log(magnitude)) / rate
-        is_ring = (model._mode_rotation(pole)
-                   > model.RINGING_MINIMUM_ROTATION)
-        out.append((frequency, decay_us, float(abs(pole)),
-                    bool(is_ring)))
-    return out
+        return None
+    reading = model.kernel_shape(segment, geometry, SHAPE_BAND_HZ)
+    shape = reading["shape"]
+    return {
+        "amplitude": np.asarray(shape["amplitude"], dtype=float),
+        "frequency_hz": np.asarray(shape["frequency_hz"], dtype=float),
+        "group_delay_s": np.asarray(shape["group_delay_s"], dtype=float),
+        "centroid_hz": float(shape["centroid_hz"]),
+        "effective_rank": float(shape["effective_rank"]),
+        "noise_rms": float(shape["noise_rms"]),
+        "amplitude_rms": float(shape["amplitude_rms"]),
+        "excess_phase_rms": float(reading["excess_phase_rms"]),
+        "in_band_share": float(reading["in_band_share"]),
+    }
 
 
 METADATA = {
@@ -675,25 +694,29 @@ METADATA = {
     "validity": ("~0.1-3 MHz determined; 0.05-0.1 one marginal band; "
                  "below 0.05 MHz structurally absent (window length, "
                  "per-field porch anchoring). Ring band belongs to "
-                 "the pole table; below ~0.3 MHz use H, never poles"),
+                 "the per-polarity shape reading; below ~0.3 MHz use H"),
     "operating_point": ("fall spans ~0 to -40 IRE, rise ~-40 to 0; "
                         "~40 IRE linearizations - the span law b(S) "
                         "and the >4.9 MHz blind zone bound "
                         "extrapolation to large edges"),
-    "per_polarity_poles": ("head_<h>_<view>_pole_{freq_mhz,decay_us,"
-                           "magnitude,is_ring} + _carrier_hz: pencil "
-                           "poles per polarity from that view's "
-                           "settled aftermath, WITHOUT the module's "
-                           "ghost subtraction or line-locked floor or "
-                           "joint-fit significance - use for the "
-                           "frequency/decay/carrier split; the "
-                           "combined head_<h>_pole_alpha carries the "
-                           "certified significance. carrier_hz is the "
-                           "VHS NTSC deviation-map carrier the view "
-                           "landed on (tip 3.40 MHz fall, blank 3.69 "
-                           "rise) - the LTI landing term is "
-                           "|f_pole - carrier|, separable from the "
-                           "true nonlinearity by the single-H fit"),
+    "per_polarity_shape": ("head_<h>_<view>_shape_{amplitude,"
+                           "frequency_hz,group_delay_s,centroid_hz,"
+                           "effective_rank,noise_rms,amplitude_rms,"
+                           "excess_phase_rms,in_band_share} + "
+                           "_carrier_hz: the settled aftermath fitted in "
+                           "the Laplace eigenbasis truncated at the "
+                           "format's 3.0 MHz VHS luma band "
+                           "(models/sync_shape), which splits shape from "
+                           "noise by a format constant instead of a "
+                           "threshold, plus what Bode's relation leaves "
+                           "as excess phase. THIS REPLACES THE PENCIL "
+                           "POLE TABLE (2026-09-06, Ethan's ruling): a "
+                           "damped-mode fit needs an order the evidence "
+                           "does not fix - on real data there is no "
+                           "singular-value knee - while a shape reading "
+                           "needs none. carrier_hz is the VHS NTSC "
+                           "deviation-map carrier the view landed on "
+                           "(tip 3.40 MHz fall, blanking 3.69 rise)"),
     "wiener_kernel": ("head_<h>_<view>_wiener_kernel (+_us time axis, "
                       "+_wiener_H): the sync edge's DERIVATIVE "
                       "deconvolved against the ideal's derivative "
@@ -745,7 +768,7 @@ METADATA = {
 if __name__ == "__main__":
     os.makedirs(PLOT_DIRECTORY, exist_ok=True)
     for prefix in sys.argv[1:]:
-        fields = report.load_decode(prefix)
+        fields, _video_parameters = report.load_decode(prefix)
         export = {"frequency_mhz": frequency_mhz,
                   "rate_mhz": np.float64(rate),
                   "metadata": np.array(json.dumps(METADATA))}
@@ -754,21 +777,11 @@ if __name__ == "__main__":
             state = accumulate(fields, parity)
             halves = {half: accumulate(fields, parity, half)
                       for half in ("first", "second")}
-            fitted = state.get("model")
-            if fitted is not None and fitted.get("sections"):
-                poles = fitted["sections"]
-                export[f"head_{head}_pole_freq_mhz"] = np.array(
-                    [abs(np.angle(s["pole"])) / (2 * math.pi) * rate
-                     for s in poles])
-                export[f"head_{head}_pole_decay_us"] = np.array(
-                    [(-1.0 / math.log(min(abs(s["pole"]),
-                                          1.0 - 1e-6))) / rate
-                     for s in poles])
-                export[f"head_{head}_pole_alpha"] = np.array(
-                    [s["alpha"] for s in poles])
-                export[f"head_{head}_pole_is_ring"] = np.array(
-                    [model._mode_rotation(s["pole"])
-                     > model.RINGING_MINIMUM_ROTATION for s in poles])
+            # THE HEAD-LEVEL CERTIFIED POLE TABLE IS GONE, deliberately.
+            # It came from the parametric channel fit the correction no
+            # longer makes, and the estimator behind it needed an order
+            # the evidence does not fix. What stands in its place is the
+            # per-polarity shape reading below, which needs none.
             per_polarity = {}
             for view in ("fall", "rise"):
                 product = step_response(state, view)
@@ -792,18 +805,15 @@ if __name__ == "__main__":
                     half_product = step_response(half_state, view)
                     if half_product is not None:
                         export[f"{base}_H_{label}"] = half_product["H"]
-                # per-polarity poles + the carrier this view landed on
-                # (46's request: the LTI-landing / nonlinearity split)
-                poles = polarity_poles(product, view)
-                if poles:
-                    export[base + "_pole_freq_mhz"] = np.array(
-                        [p[0] for p in poles])
-                    export[base + "_pole_decay_us"] = np.array(
-                        [p[1] for p in poles])
-                    export[base + "_pole_magnitude"] = np.array(
-                        [p[2] for p in poles])
-                    export[base + "_pole_is_ring"] = np.array(
-                        [p[3] for p in poles])
+                # the per-polarity SHAPE of the settled aftermath, and the
+                # carrier this view landed on (the LTI-landing against
+                # nonlinearity split). Replaces the pencil pole table.
+                shape = polarity_shape(product, view)
+                if shape is not None:
+                    for key, value in shape.items():
+                        export[f"{base}_shape_{key}"] = (
+                            value if isinstance(value, np.ndarray)
+                            else np.float64(value))
                 export[base + "_carrier_hz"] = np.float64(
                     CARRIER_TIP_HZ if view == "fall"
                     else CARRIER_PORCH_HZ)
@@ -942,9 +952,13 @@ if __name__ == "__main__":
         # top-level aliases matching the head_switch consumer's
         # pre-written loader (baseband_eq.py::_load_sync_step): freqs
         # in Hz, H_even_<head>/H_odd_<head>/se_even_<head>, scalar
-        # site/ideal_preemphasized/valid_hz, ring_poles_hz_<head>.
-        # The head_<head>_* names remain the canonical form; these are
-        # additive so the file reads with zero adaptation on their end.
+        # site/ideal_preemphasized/valid_hz. The head_<head>_* names
+        # remain the canonical form; these are additive so the file reads
+        # with zero adaptation on their end. `ring_poles_hz_<head>` is no
+        # longer written: it came from the certified pole table, and the
+        # pole table is gone with the estimator whose order the data did
+        # not fix (2026-09-06). A consumer that wants the ring band should
+        # read head_<h>_<view>_shape_* instead.
         export["freqs"] = frequency_mhz * 1e6
         export["site"] = np.array(METADATA["site"])
         export["ideal_preemphasized"] = np.array(
@@ -958,14 +972,6 @@ if __name__ == "__main__":
                     (f"se_even_{head}", f"head_{head}_H_even_se")):
                 if canonical in export:
                     export[consumer_key] = export[canonical]
-            freq_key = f"head_{head}_pole_freq_mhz"
-            ring_key = f"head_{head}_pole_is_ring"
-            if freq_key in export and ring_key in export:
-                freqs_mhz = np.asarray(export[freq_key])
-                is_ring = np.asarray(export[ring_key], dtype=bool)
-                export[f"ring_poles_hz_{head}"] = (
-                    freqs_mhz[is_ring] * 1e6 if freqs_mhz.size
-                    else np.array([]))
         out = os.path.join(WORK_DIRECTORY,
                            f"{prefix}_sync_step_response.npz")
         np.savez(out, **export)

@@ -315,9 +315,10 @@ class TestStageSelection:
     """
 
     def test_it_parses_stages_and_components(self, declared):
-        chosen = pg.parse_selection("+head_switch,-cti,-ringing.ghost", declared)
+        chosen = pg.parse_selection("+head_switch,-cti,-ringing.chroma_gate",
+                                    declared)
         assert chosen["stages"] == {"head_switch": True, "cti": False}
-        assert chosen["components"] == {("ringing", "ghost"): False}
+        assert chosen["components"] == {("ringing", "chroma_gate"): False}
 
     def test_a_bare_name_means_on(self, declared):
         assert pg.parse_selection("carrier_tbc", declared)["stages"] == {
@@ -375,13 +376,219 @@ class TestStageSelection:
         assert gate["state"] == "off"
 
     def test_components_default_to_on(self, declared):
-        chosen = pg.parse_selection("-ringing.ghost", declared)
-        assert pg.component_enabled(chosen, "ringing", "ghost") is False
-        assert pg.component_enabled(chosen, "ringing", "smear") is True
-        assert pg.component_enabled(None, "ringing", "ghost") is True
+        chosen = pg.parse_selection("-ringing.chroma_gate", declared)
+        assert pg.component_enabled(chosen, "ringing", "chroma_gate") is False
+        assert pg.component_enabled(chosen, "ringing", "depth") is True
+        assert pg.component_enabled(None, "ringing", "chroma_gate") is True
 
     def test_every_declared_component_is_named_and_explained(self, declared):
         for node in declared["node"]:
             for part in node.get("components", []):
                 assert part.get("name"), node["name"]
                 assert part.get("note", "").strip(), (node["name"], part)
+
+
+class TestDeclaredDefaults:
+    """The declaration is DATA, and this is the boundary where it becomes a
+    value the decoder computes with.
+
+    Written after a declared default of `"format"` - which documents that the
+    format definition supplies the value, and is not a value - was seeded into
+    `high_boost` and reached `high_part * self._high_boost`, where the
+    demodulator raised on multiplying a float32 array by a six-character
+    string. A type check belongs at the boundary, not at the multiply.
+    """
+
+    def test_every_seeded_value_is_one_its_predicate_can_evaluate(
+            self, declared):
+        """No string reaches a numeric option, and no gate is seeded with a
+        value its own predicate cannot test."""
+        options = {}
+        pg.apply_defaults(options, declared)
+        by_option = {}
+        for node in declared["node"]:
+            gate = node.get("gate")
+            if isinstance(gate, dict) and gate.get("option"):
+                by_option.setdefault(gate["option"], gate)
+        for option, value in options.items():
+            gate = by_option[option]
+            predicate = str(gate.get("predicate", "!= 0")).split(" and ")[0]
+            test = pg.PREDICATES.get(predicate.strip())
+            assert test is not None, (option, predicate)
+            assert not isinstance(value, str), (option, value)
+            test(value)                      # must not raise
+
+    def test_a_descriptive_default_is_not_a_value(self):
+        """`default = "format"` names where the value comes from."""
+        verdict = pg.declared_default({"option": "high_boost",
+                                       "predicate": "is not None",
+                                       "default": "format",
+                                       "declared_default": True})
+        assert verdict["seed"] is False
+        assert "not the value" in verdict["why"]
+
+    def test_the_null_placeholder_is_a_value(self):
+        """TOML cannot express null, so an absent default is "none"."""
+        verdict = pg.declared_default({"option": "notch",
+                                       "predicate": "is not None",
+                                       "default": "None",
+                                       "declared_default": True})
+        assert verdict["seed"] is True and verdict["value"] is None
+
+    def test_a_derived_predicate_is_not_seeded(self):
+        verdict = pg.declared_default({"option": "color_under",
+                                       "predicate": "derived",
+                                       "default": True,
+                                       "declared_default": True})
+        assert verdict["seed"] is False
+
+    def test_only_a_declaration_owned_default_is_seeded(self, declared):
+        """A node documenting what some other fallback comes to must not
+        override it - `sharpness` documents 1 while the code falls back to
+        the format's own value."""
+        options = {}
+        pg.apply_defaults(options, declared)
+        owned = {node["gate"]["option"] for node in declared["node"]
+                 if isinstance(node.get("gate"), dict)
+                 and node["gate"].get("declared_default")}
+        assert set(options) == owned
+
+    def test_a_present_option_is_never_overwritten(self, declared):
+        """The safety property the whole scheme rests on: a decode taken
+        with no `--stages` argument is unchanged by declaring a node."""
+        options = {node["gate"]["option"]: "untouched"
+                   for node in declared["node"]
+                   if isinstance(node.get("gate"), dict)
+                   and node["gate"].get("option")}
+        before = dict(options)
+        assert pg.apply_defaults(options, declared) == []
+        assert options == before
+
+    def test_a_supersession_must_name_a_declared_node(self):
+        with pytest.raises(ValueError, match="supersedes unknown node"):
+            pg.validate(_declaration(_node("a", supersedes=["nowhere"])))
+
+    def test_two_enabled_nodes_that_supersede_each_other_are_refused(
+            self, declared):
+        """`colour_free_luma` and `luma_beat` remove the same coupling."""
+        options = {}
+        pg.apply_defaults(options, declared)
+        options["luma_beat"] = 1.0
+        pg.apply_selection(options, pg.parse_selection("+colour_free_luma",
+                                                       declared), declared)
+        conflicts = pg.supersessions(options, declared)
+        assert len(conflicts) == 1 and "luma_beat" in conflicts[0]
+
+    def test_a_superseded_node_that_is_off_is_not_a_conflict(self, declared):
+        options = {}
+        pg.apply_defaults(options, declared)
+        options["luma_beat"] = 0
+        pg.apply_selection(options, pg.parse_selection("+colour_free_luma",
+                                                       declared), declared)
+        assert pg.supersessions(options, declared) == []
+
+
+def _subgraph_members(text, ident):
+    """The node identifiers drawn inside one mermaid subgraph, nested
+    subgraphs included, so a test can ask what a box holds."""
+    members, depth = [], 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if depth == 0:
+            if line.startswith("subgraph %s[" % ident):
+                depth = 1
+            continue
+        if line.startswith("subgraph "):
+            depth += 1
+        elif line == "end":
+            depth -= 1
+            if depth == 0:
+                break
+        else:
+            found = re.match(r"(n_[A-Za-z0-9_]+)\[", line)
+            if found:
+                members.append(found.group(1))
+    return members
+
+
+class TestTheSingleTransforms:
+    """Two nodes that stand for thirty-six.
+
+    Ethan, 2026-09-07: "There doesn't need to be sequencing, just all the
+    dimensions execute at once in a single transform." Each absorbed node's
+    measurement fills one vertex of its transform's cube; the absorbed nodes
+    keep their declarations, and what the transform removes is the order.
+
+    Nothing here resolves a site. The call sites are being written beside
+    this declaration, and the citation test above will say when the anchors
+    exist; these tests hold on the declaration alone.
+    """
+
+    TRANSFORMS = ("picture_transform", "rf_transform")
+
+    def test_both_transforms_are_declared_on_all_three_axes(self, declared):
+        for name in self.TRANSFORMS:
+            node = declared["by_name"][name]
+            assert node["scope"] == "field"
+            assert node["axis"] == ["amplitude", "frequency", "time"]
+            assert node["entry"] == (
+                "vhsdecode.model_stages:transform_%s" % name.split("_")[0])
+            assert node["absorbs"], name
+
+    def test_both_are_on_by_default_from_the_declaration_alone(self, declared):
+        """No command line flag carries these; the declaration owns them."""
+        options = {}
+        pg.apply_defaults(options, declared)
+        for name in self.TRANSFORMS:
+            assert options[name] == 1, name
+            gate = pg.resolve_gate(declared["by_name"][name], options)
+            assert gate["state"] == "on", name
+
+    def test_each_is_turned_off_by_name(self, declared):
+        for name in self.TRANSFORMS:
+            options = {}
+            pg.apply_defaults(options, declared)
+            changed = pg.apply_selection(
+                options, pg.parse_selection("-" + name, declared), declared)
+            assert options[name] == 0, name
+            gate = pg.resolve_gate(declared["by_name"][name], options)
+            assert gate["state"] == "off", name
+            assert any("%s off" % name in line for line in changed)
+
+    def test_every_absorbed_name_is_a_declared_node_and_not_a_transform(
+            self, declared):
+        by_name = declared["by_name"]
+        seen = set()
+        for name in self.TRANSFORMS:
+            for absorbed in by_name[name]["absorbs"]:
+                assert absorbed in by_name, (name, absorbed)
+                assert not by_name[absorbed].get("absorbs"), absorbed
+                # one vertex belongs to one cube
+                assert absorbed not in seen, absorbed
+                seen.add(absorbed)
+
+    def test_an_absorbs_naming_an_unknown_node_is_refused(self):
+        with pytest.raises(ValueError, match="absorbs unknown node"):
+            pg.validate(_declaration(_node("a", absorbs=["nowhere"])))
+
+    def test_a_component_of_a_transform_is_switched_by_name(self, declared):
+        chosen = pg.parse_selection("-picture_transform.remove_residuals",
+                                    declared)
+        assert chosen["stages"] == {}
+        assert chosen["components"] == {
+            ("picture_transform", "remove_residuals"): False}
+        assert pg.component_enabled(
+            chosen, "picture_transform", "remove_residuals") is False
+        assert pg.component_enabled(chosen, "picture_transform", "latch") is True
+
+    def test_the_graph_draws_each_cube_as_one_box(self, declared):
+        """The hypercube: the transform and every vertex inside one subgraph,
+        because a vertex has no order and a chain would draw one."""
+        text = pg.render_mermaid(declared, _options())
+        for name in self.TRANSFORMS:
+            inside = _subgraph_members(text, "field_%s" % name)
+            assert pg._identifier(name) in inside, name
+            for absorbed in declared["by_name"][name]["absorbs"]:
+                assert pg._identifier(absorbed) in inside, (name, absorbed)
+            # and each is drawn once: inside the box and nowhere else
+            assert text.count('%s["' % pg._identifier(name)) == 1

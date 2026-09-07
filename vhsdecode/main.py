@@ -733,7 +733,7 @@ def main(args=None, use_gui=False):
         default=None,
         help=(
             "Turn correction stages, and components within a stage, on or off by name."
-            "\n  A comma separated list of +name or -name, where a name is a stage or stage.component - for example `--stages +head_switch,-cti,-ringing.ghost`."
+            "\n  A comma separated list of +name or -name, where a name is a stage or stage.component - for example `--stages +head_switch,-cti,-ringing.chroma_gate`."
             "\n  Names are validated against the pipeline's own declaration, so a typo fails here with the valid list. `--debug_plot pipeline_graph` draws what a given selection resolves to."
             "\n  This is on and off only. How MUCH of a correction to apply is derived from the residual, not set here."
         ),

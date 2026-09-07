@@ -1287,3 +1287,58 @@ def test_real_parameters_buys_the_gain_delay_split_and_costs_the_blindness():
                        real_parameters=True)["sigma"])
     assert hermitian_cost < 5.0
     assert stacked_cost > 5.0 * max(hermitian_cost, 1.0)
+
+
+def test_the_sync_shape_replaces_the_pencil_on_the_same_three_axes():
+    """Ethan: use the sync shape in Hilbert space, not the matrix pencil.
+
+    The replacement must cover the axes the pencil covered, or the chain
+    has lost a measurement rather than changed its estimator.
+    """
+    shape = ie.sync_shape_components()
+    pencil = ie.sync_pole_components()
+    covered = set()
+    for entry in shape:
+        covered.update(entry.resolution)
+    for entry in pencil:
+        assert set(entry.resolution) <= covered
+
+
+def test_the_superseded_pencil_entry_says_so_and_names_its_successor():
+    entry = ie.sync_pole_components()[0]
+    assert "SUPERSEDED" in entry.criterion
+    assert "sync_shape_components" in entry.criterion
+
+
+def test_the_minimum_phase_delay_is_declared_dependent_on_the_magnitude():
+    """A delay the magnitude already implies must not be fitted beside it."""
+    by_name = {entry.name: entry for entry in ie.sync_shape_components()}
+    minimum = by_name["sync-pulse shape, minimum-phase delay"]
+    assert "NOT an independent quantity" in minimum.criterion
+    excess = by_name["sync-pulse shape, excess delay"]
+    assert "separate mechanism" in excess.criterion
+
+
+def test_the_sync_shape_entries_belong_to_the_picture_path():
+    """They are fitted on demodulated video, past the demodulator."""
+    for entry in ie.sync_shape_components():
+        assert entry.stage == ie.PICTURE
+
+
+def test_the_effective_rank_is_a_reading_and_not_a_setting():
+    """The data fixes how many modes there are; nothing chooses it.
+
+    Two profiles of very different complexity must return different
+    effective ranks from the same call with the same arguments.
+    """
+    from vhsdecode.models import sync_shape
+    rate, n = 14318181.818181818, 79
+    index = np.arange(n)
+    step = -40.0 / (1.0 + np.exp(-(index - 30.0) / 2.0))
+    plain = sync_shape.shape_components(step, rate, 3.0e6)
+    busy = sync_shape.shape_components(
+        step + 3.0 * np.sin(index / 1.7) * np.exp(-index / 40.0),
+        rate, 3.0e6)
+    assert plain["effective_rank"] != busy["effective_rank"]
+    assert 0.0 < plain["effective_rank"] <= plain["modes"]
+    assert 0.0 < busy["effective_rank"] <= busy["modes"]

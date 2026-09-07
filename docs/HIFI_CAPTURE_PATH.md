@@ -1,5 +1,73 @@
 # Reaching the Hi-Fi carriers
 
+---
+
+> ## CORRECTION, 2026-09-07 — read this before section 2
+>
+> **Two of the five records section 2 reports on carry no Hi-Fi audio.**
+> Ethan, 2026-09-06: *"These sample may not have hifi audio. The zaroff
+> samples should have hifi carriers, home and cd will not."*
+>
+> So the `countdown` and `home` rows searched for a signal that was never
+> recorded, and **their −50 dB and −45 dB bounds are withdrawn** — an absent
+> signal found absent is not a bound on leakage. Four of the ten
+> (record, channel) pairs in the results table are those two records, and the
+> verdict line *"no AFM carrier reaches the video tap in any capture in this
+> repository"* overstates what the valid subjects support.
+>
+> **What survives, and it is weaker than what was withdrawn.** The zaroff
+> records are the only valid subjects. The **record-tap control is
+> unaffected and is the strongest part of the original measurement**, because
+> the audio carriers go to separate heads (clause 5.1) and can never appear
+> at the video record-current tap.
+>
+> Re-measured over **all 32 zaroff playback captures and all 32 record
+> captures** — 128 (file, channel) pairs against the one programme sampled
+> below, with the published SP row reproduced to four figures first — three
+> things changed:
+>
+> 1. **The narrow-line statistic is not safe.** It divides a peak by the
+>    scatter of its own neighbourhood, so a flat neighbourhood manufactures
+>    significance. Ten of 64 playback pairs cross 3σ and none of 64
+>    record-tap control pairs does — yet the control shows *larger* bumps
+>    (up to 27.1 dB over its floor against the firing pairs' 11.2 dB median)
+>    and only its rougher surround stops it firing. Ensembled, the AFM-free
+>    record tap peaks *higher* than the playback tap at channel 1
+>    (+15.70 dB against +9.57 dB). **No candidate survives the control.**
+> 2. **The colour-under second-harmonic confound named in section 2 is
+>    misattributed.** Tested on the chrominance-free y-only recordings:
+>    removing 18.93 dB of colour-under fundamental removed **0.14 dB** at
+>    1.258741 MHz, where a square-law product would have lost about 38 dB.
+>    What sits there is the luma lower-sideband continuum and tape noise.
+>    Excluding it by name buys nothing.
+> 3. **The operative statistic reverses.** Section 2 argues that no audio was
+>    connected, so the carrier is unmodulated and the narrow line is the
+>    bound to quote. Clause **5.6**'s 2:1 logarithmic compressor is at
+>    maximum gain on silence, so noise on an open input is amplified before
+>    it modulates the carrier. Planted at −45 dB, an unmodulated carrier is
+>    detected (line rise +3.033) and one with 500 Hz of deviation is not
+>    (+2.744) — and 500 Hz is what that compressor makes of an input 84 dB
+>    down. The hump statistic is nearly indifferent to deviation
+>    (rise 2.556 to 2.697 over the whole range) and is the conservative one.
+>
+> **THE RESTATED BOUND.** On the only records that could carry a carrier, no
+> audio carrier is attributable to the video tap at either frequency. The
+> figure to quote is the **hump** bound: **−40 dB relative to the luma band
+> on channel 1** for the chroma-bearing SP record, **−45 dB** for the y-only
+> SP record, and **−35 dB on channel 2** at both speeds — channel 2 is 10 dB
+> weaker than channel 1 throughout. The repository's tightest supported
+> figure moves from the withdrawn −50 dB to **−45 dB**.
+>
+> The numbers below are left exactly as measured rather than edited, because
+> this arc's rule is that a withdrawn claim stays visible with its reason.
+> The restatement lives in `capture_alignment.carrier_route_bound`, the
+> withdrawal in `capture_alignment.WITHDRAWN`, the wider sweep in
+> `capture_alignment.WIDE_SWEEP`, and what would lower the bound (chiefly
+> **+27 dB for time-base correcting the record before the transform**) in
+> `capture_alignment.bound_lowering` and **docs/CAPTURE_ALIGNMENT.md** §1.4.
+
+---
+
 Ethan's question, verbatim: *"Capture question unresolved: cxadc exposes raw
 mode only on the video ADC. Scope whether a wideband tap ahead of the
 video/audio split gets both, or whether the second ADC's raw path can be

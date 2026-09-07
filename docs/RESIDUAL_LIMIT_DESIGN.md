@@ -535,6 +535,59 @@ the variance BETWEEN the heads is described rather than merely duplicated.
 
 ---
 
+## 2a. RULING: no matrix pencil. The sync shape in Hilbert space instead
+
+Ethan, 2026-09-06:
+
+> I think the matrix pencil is the wrong approach. Use the existing sync
+> shape modeling in hilbert space not the matrix pencil.
+
+**The reason, and it is a measurement rather than a preference.** A matrix
+pencil fits damped exponentials, and that requires an ORDER. On planted
+data the pencil validated and beat its alternative; on real data there is
+no singular-value knee to set the order, so the answer moves with the
+pencil's own parameter. `vhsdecode/luma_amplitude.py:2012-2017` already
+recorded exactly that for the response ripple.
+
+The evidence on the sync pulse itself. The pencil's count of ringing modes
+against the effective rank the sync shape's own fit supports, measured on
+the same accumulated profiles from the same exports:
+
+| export | head | pencil modes | shape rank, of 49 |
+|---|---|---|---|
+| cd | a | 8 | 8.79 |
+| cd | b | 7 | 8.52 |
+| home | a | 10 | 10.11 |
+| home | b | 3 | 10.08 |
+| pnb | a | 4 | 10.33 |
+| pnb | b | 3 | 8.90 |
+
+The two heads of the home tape read one signal path through one
+demodulator. The pencil says ten modes on one and three on the other, a
+factor of 3.3; the shape's rank moves from 10.11 to 10.08, a factor of
+1.003. Across all six the pencil's count varies by 51 per cent about its
+mean and the rank by 8.5 per cent. **A number that swings by three between
+two readings of the same thing is a setting, not a measurement.**
+
+**What replaces it.** `vhsdecode/models/sync_shape.py` with
+`vhsdecode/models/hypercomplex.py`. The same three axes come off one
+non-parametric fit of the pulse's shape: a frequency axis, a magnitude on
+it, and a group delay on it, with the effective rank REPORTED rather than
+chosen. The time axis gains something the pencil could not express at all,
+because a minimum-phase response's delay is fixed by its own magnitude
+through the Bode relation: the group delay splits into the share the
+amplitude already implies (`hypercomplex.minimum_phase`) and the excess
+that is a genuinely separate mechanism (`hypercomplex.excess_phase`). A
+damped-mode fit has no way to say which of its decay times its own
+residues had already implied. The fit also returns the out-of-band
+remainder, which bounds what the shape does not describe and which the
+pencil returned nothing of.
+
+Registered as `information_extrapolation.sync_shape_components`. The
+superseded entry is left in place as
+`information_extrapolation.sync_pole_components` so the chain's position
+is not silently vacated and the reason stays on the record.
+
 ## 3. What driving a residual to zero does NOT license
 
 The deviation is *supposed to be* the tape's own amplitude error. A model

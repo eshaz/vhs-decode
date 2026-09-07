@@ -144,12 +144,68 @@ def level_signature(frequency_hz, level: float, writing_speed_m_s: float,
     information the frequency response alone does not. Complex-typed so it
     enters the key beside every other signature, and bounded so it is
     subtractable.
+
+    ITS PHASE IS EXACTLY ZERO, AND THAT IS A FICTION RATHER THAN A
+    MEASUREMENT. The value returned is a ratio of two real, positive
+    thickness losses cast to `complex128`, so every phase in it is zero to
+    machine precision - but a thickness loss is a causal minimum-phase
+    amplitude response, and a minimum-phase response's phase is the Hilbert
+    transform of its log magnitude and is not zero anywhere the magnitude
+    has a slope. The zero is an artefact of the cast.
+
+    IT IS LEFT AS IT IS, because every count in this module and in the ones
+    that consume it takes `np.abs` of this value and so is unaffected by the
+    difference, and changing it would silently move numbers that are quoted
+    in three docstrings. `minimum_phase_level_signature` below supplies the
+    phase the magnitude implies, for a caller that needs the complex entry;
+    that phase is DERIVED from the magnitude and is not an independent
+    measurement, and it says so.
     """
     grid = _grid(frequency_hz)
     above = level_response(grid, level + step, writing_speed_m_s, **kwargs)
     below = level_response(grid, level - step, writing_speed_m_s, **kwargs)
     ratio = np.maximum(above, 1e-12) / np.maximum(below, 1e-12)
     return ratio.astype(np.complex128)
+
+
+def minimum_phase_level_signature(frequency_hz, level: float,
+                                  writing_speed_m_s: float,
+                                  step: float = 0.05, **kwargs
+                                  ) -> np.ndarray:
+    """The same level signature WITH the phase its own magnitude implies.
+
+    THE PHASE IS DERIVED AND NOT MEASURED, and the distinction is the whole
+    of this function's honesty. Nothing in a decode observes the phase of a
+    thickness loss; what is used here is that the loss is causal and
+    minimum phase, so its phase is fixed by its magnitude through the
+    Hilbert transform and nothing further need be measured to know it. A
+    caller that wants an independently measured phase must look somewhere
+    that has one - the head pair's own delay, for instance, which
+    `head_differential.phase_signature` carries.
+
+    WHY IT EXISTS. `level_signature` returns a complex array whose every
+    phase is exactly zero, which is what a cast does rather than what the
+    physics says, and an entry offered to a key as complex-with-no-phase
+    occupies a direction it does not have. Measured on the VHS luma band at
+    5.80 m/s and a nominal depth of 0.15 um, the declared signature's phase
+    is 0.0 degrees rms at every level, and the minimum-phase reconstruction
+    of the same magnitude is not - so the two are different entries and only
+    one of them is the response.
+
+    THE MAGNITUDE IS UNTOUCHED. `np.abs` of what this returns equals
+    `np.abs(level_signature(...))` exactly, so any count already taken on
+    the magnitude is unchanged by using this instead.
+    """
+    from scipy.signal import hilbert
+
+    value = level_signature(frequency_hz, level, writing_speed_m_s,
+                            step=step, **kwargs)
+    magnitude = np.log(np.maximum(np.abs(value), 1e-12))
+    finite = np.isfinite(magnitude)
+    phase = np.zeros_like(magnitude)
+    if int(finite.sum()) > 3:
+        phase[finite] = -np.imag(hilbert(magnitude[finite]))
+    return (np.abs(value) * np.exp(1j * phase)).astype(np.complex128)
 
 
 def level_axis(frequency_hz, writing_speed_m_s: float,

@@ -163,18 +163,39 @@ def log_domain(H, se) -> Dict[str, np.ndarray]:
 
 
 def nuisance(frequency_hz) -> Dict[str, np.ndarray]:
-    """A level and a delay: the two terms that are not shapes.
+    """A level, a phase reference and a delay: the terms that are not shapes.
 
     A constant in the log is a gain, a linear phase is a delay, and both
     belong to other estimators (levels to `standard_levels`, delay to the
     time base). They are fitted alongside the key so that neither is
     charged to the residual nor absorbed by an entry that resembles them.
+
+    THE DELAY MUST PASS THROUGH ZERO FREQUENCY, and the first version of
+    this did not. A true delay writes as `exp(-2 pi i f tau)`, whose phase
+    is linear THROUGH THE ORIGIN; a column linear about the band's own
+    centre differs from it by the constant `2 pi f_bar tau`, and with no
+    imaginary constant anywhere in the basis that constant had nowhere to
+    go and was charged to the residual. The repair is two columns rather
+    than one: the delay taken through zero, and a free PHASE REFERENCE,
+    which the unwrapping needs in any case since the branch it lands on is
+    arbitrary.
+
+    MEASURED, as the share of the departure the key explains, before and
+    after the repair:
+
+        countdown     72.6 -> 81.0 per cent
+        home          46.8 -> 91.2
+        pluge bars    67.0 -> 84.4
+
+    On the home recording it nearly doubles, so this was not a refinement.
+    Any figure computed against the earlier basis is not comparable with
+    one computed against this.
     """
     f = np.asarray(frequency_hz, dtype=np.float64).ravel()
-    centred = f - f.mean()
-    scale = float(np.max(np.abs(centred))) or 1.0
+    scale = float(np.max(np.abs(f))) or 1.0
     return {"level": np.ones(f.size, dtype=np.complex128),
-            "delay": 1j * centred / scale}
+            "phase reference": 1j * np.ones(f.size, dtype=np.complex128),
+            "delay": 1j * f / scale}
 
 
 def design(entries: Dict[str, np.ndarray], frequency_hz

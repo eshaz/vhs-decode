@@ -22,6 +22,7 @@ from vhsdecode import baseband_eq
 from vhsdecode import channel_eq
 from vhsdecode import luma_amplitude
 from vhsdecode import luma_transient
+from vhsdecode import model_stages
 
 import vhsdecode.formats as vhs_formats
 
@@ -676,6 +677,24 @@ class VHSDecode(ldd.LDdecode):
                     if not redo:
                         redo = self.fdoffset - offset
 
+                # The same one-shot for the RF transform, for the same
+                # reason: the demod prefetch runs ahead of field assembly,
+                # so the blocks in flight when the transform latched a table
+                # were demodulated without it. `transform_wants_redo`
+                # answers True exactly once per published version, and the
+                # redo repays those blocks exactly as the head-switch
+                # one-shot does - FFTs cached, only the demod repaid. It is
+                # asked BEFORE the pending-redo test so that a redo already
+                # owed for another reason consumes the request as well: that
+                # redo flushes and re-demodulates the same blocks against
+                # the table that is now live.
+                if (
+                    self.rf.options.rf_transform != 0
+                    and model_stages.transform_wants_redo(self.rf)
+                    and not redo
+                ):
+                    redo = self.fdoffset - offset
+
                 if adjusted is False and redo:
                     # No direct flush_demod() here: decodefield passes the
                     # redo offset as forceredo, and read() performs the
@@ -855,22 +874,49 @@ class VHSRFDecode(ldd.RFDecode):
             and not (system == "405")
         )
 
-        # The stage selection is folded into the option values BEFORE the
-        # Options namedtuple is built, so every existing gate reads the
-        # selection through its own flag and there is still exactly one
-        # gate per stage.
+        # THE DECLARATION SUPPLIES THE DEFAULTS, AND THE SELECTION OVERRIDES
+        # THEM, both folded into the option values BEFORE the Options
+        # namedtuple is built - so every existing gate reads its own option
+        # and there is still exactly one gate per stage.
+        #
+        # Ethan: "Let's retire all the one-off options and have everything we
+        # have done so far live in the graph." A stage declared with no flag
+        # behind it takes its default from `pipeline/stages.toml` and is
+        # turned on or off by name with `--stages`; a stage that still has a
+        # flag is untouched, because `apply_defaults` only writes keys that
+        # are absent and `main.py` writes every flag-backed key.
         _stage_selection_value = _resolve_stage_selection(
             rf_options.get("stages"))
-        if _stage_selection_value is not None:
-            try:
-                from vhsdecode import pipeline_graph as _pipeline_graph
+        # `ldd.logger` is None until a decode initialises it, and a unit test
+        # that constructs this class never does. Logging what the declaration
+        # supplied must not be the thing that breaks the demodulator.
+        _log = getattr(ldd, "logger", None)
+        try:
+            from vhsdecode import pipeline_graph as _pipeline_graph
 
-                _changes = _pipeline_graph.apply_selection(
-                    rf_options, _stage_selection_value, _pipeline_graph.load())
-                for _line in _changes:
-                    ldd.logger.info("--stages: %s", _line)
-            except Exception as _error:                      # noqa: BLE001
-                ldd.logger.warning("--stages could not be applied: %s", _error)
+            _declared = _pipeline_graph.load()
+            for _line in _pipeline_graph.apply_defaults(rf_options, _declared):
+                if _log is not None:
+                    _log.debug("pipeline: %s", _line)
+            if _stage_selection_value is not None:
+                for _line in _pipeline_graph.apply_selection(
+                        rf_options, _stage_selection_value, _declared):
+                    if _log is not None:
+                        _log.info("--stages: %s", _line)
+            # A node that SUPERSEDES another must not run beside it. Refused
+            # here rather than warned about: the two would apply the same
+            # correction twice and the second would be fitted against a
+            # picture the first had already emptied, so the decode would
+            # complete and be wrong rather than fail.
+            _conflicts = _pipeline_graph.supersessions(rf_options, _declared)
+            if _conflicts:
+                raise ValueError(" ".join(_conflicts))
+        except ValueError:
+            raise
+        except Exception as _error:                          # noqa: BLE001
+            if _log is not None:
+                _log.warning("the pipeline declaration could not be "
+                             "applied: %s", _error)
 
         # No idea if this is a common pythonic way to accomplish it but this gives us values that
         # can't be changed later.
@@ -904,6 +950,128 @@ class VHSRFDecode(ldd.RFDecode):
                 "chroma_env_phase",
                 "luma_transient",
                 "luma_beat",
+                # The model-based stages (vhsdecode/model_stages.py). All
+                # default to zero, so an unflagged decode is unchanged.
+                "chroma_head_switch",
+                "colour_free_luma",
+                # The only one of these on the SOURCE side of the record
+                # head: it corrects the luma response the signal already
+                # carried when the recording VCR received it, rather than
+                # anything the tape or either deck did.
+                "source_correction",
+                # And the ones that MEASURE and apply nothing. Their gates
+                # exist for the same reason the corrections' do - every stage
+                # has to be callable by name from `--stages` - and each of
+                # them leaves the decode byte-identical whether it is on or
+                # off, writing what it found to the log instead.
+                #
+                # `colour_under` here is the colour-under CHANNEL MEASUREMENT
+                # and is not `color_under` five lines above, which is the
+                # boolean saying whether this format records its chrominance
+                # heterodyned down at all. Two different things one letter
+                # apart, so they are named together rather than left to be
+                # confused at a call site.
+                "burst_instrument",
+                "chroma_leakage",
+                # `tape_bias` measures the third-order product the luma FM's
+                # own bias leaves in the delivered luma at 80 f_H. It stands
+                # beside `chroma_leakage` and reads something else: that one
+                # measures the colour under SURVIVING THE SEPARATION, which
+                # a filter owns, and this one a product WRITTEN ON THE TAPE
+                # that no separation filter can reach.
+                "tape_bias",
+                "colour_framing",
+                "colour_under",
+                "iq_imbalance",
+                "vectorscope",
+                # THE SYNC AND TIMING GROUP. Two corrections and four
+                # measurements, every one of them read on the sync pulses
+                # and the reserved intervals alone. `precursor` and
+                # `sync_depth` write samples; `sync_shape`,
+                # `burst_sync_lock`, `vertical_interval` and `tape_speed`
+                # leave the decode byte-identical and write what they found
+                # to the log. All default to zero.
+                "sync_shape",
+                "precursor",
+                "sync_depth",
+                "burst_sync_lock",
+                "vertical_interval",
+                # `tape_speed_stage`, not `tape_speed`: the latter is the
+                # existing SP / LP / EP option and is a non-empty string, so
+                # a gate sharing its name would read as permanently on.
+                "tape_speed_stage",
+                # THE LEVELS, GAIN AND SOURCE-SIDE GROUP. One correction and
+                # six measurements, every one of them read on the sync
+                # pulses, the reserved intervals or the colour burst.
+                # `standard_levels` writes samples - it drives the back
+                # porch to the specified zero with the two known chroma
+                # carriers projected out of it first; the other six leave
+                # the decode byte-identical and write what they found to
+                # the log. All default to zero.
+                #
+                # EVERY NAME HERE WAS CHECKED AGAINST THE LIST ABOVE before
+                # it was added, for the reason `tape_speed_stage` records:
+                # a gate whose option name collides with an existing
+                # non-empty option reads as permanently on and the stage
+                # runs on every decode.
+                "standard_levels",
+                "level_from_frequency",
+                "source_agc",
+                "vcr_agc",
+                "composite_channel",
+                "picture_stage",
+                "multipath",
+                # THE RADIO-FREQUENCY, CAPTURE AND TRANSPORT GROUP. Eight
+                # measurements, every one of them read on the RAW radio
+                # frequency the capture card delivered rather than on the
+                # demodulated picture, and confined to the sync tips, the
+                # burst and the intervals above the video band where no
+                # picture exists. Not one of them writes a sample, so a
+                # decode is byte-identical whether they are on or off and
+                # the finding goes to the log. All default to zero.
+                #
+                # EVERY NAME HERE WAS CHECKED AGAINST THE LISTS ABOVE
+                # before it was added, for the reason `tape_speed_stage`
+                # records: a gate whose option name collides with an
+                # existing non-empty option reads as permanently on and the
+                # stage runs on every decode. `head_switch_pair` in
+                # particular is NOT `head_switch`, which is the amplitude
+                # correction ten lines below.
+                "capture_profile",
+                "capture_filter",
+                "rf_stages",
+                "filter_model",
+                "transport_model",
+                "band_delay",
+                "head_switch_pair",
+                "interference",
+                # THE HEAD, THE MEDIUM AND THE PATH. Five more measurements
+                # of the same kind, read in the synchronizing pulse's flat
+                # interior, the back porch after the burst and the colour
+                # burst - reserved intervals every one, so no sample of
+                # active picture reaches a level, a fit or a verdict. Not
+                # one of them writes a sample. All default to zero.
+                #
+                # EVERY NAME HERE WAS CHECKED AGAINST THE LISTS ABOVE, for
+                # the reason `tape_speed_stage` records. `magnetic` is not
+                # `magnetic_circuit`, and neither is `head_model` the
+                # `filter_model` twelve lines up: three different modules
+                # whose names share a word.
+                "head_model",
+                "head_differential",
+                "magnetic",
+                "magnetic_circuit",
+                "tape_path",
+                # THE TWO TRANSFORM STAGES. `picture_transform` is the one
+                # picture stage that stands in for the sync, head-and-medium
+                # and levels groups above and for the field-level chroma
+                # stages; `rf_transform` is the one RF stage that stands in
+                # for the radio-frequency group and publishes the per-head
+                # table the demodulator's equalizer site multiplies by.
+                # Both are seeded ON by their declaration and have no flag
+                # of their own; `--stages -rf_transform` turns one off.
+                "picture_transform",
+                "rf_transform",
                 "luma_eq",
                 "head_switch",
                 "carrier_tbc",
@@ -967,6 +1135,44 @@ class VHSRFDecode(ldd.RFDecode):
             rf_options.get("chroma_env_phase", 0),
             rf_options.get("luma_transient", 0),
             rf_options.get("luma_beat", 0),
+            rf_options.get("chroma_head_switch", 0),
+            rf_options.get("colour_free_luma", 0),
+            rf_options.get("source_correction", 0),
+            rf_options.get("burst_instrument", 0),
+            rf_options.get("chroma_leakage", 0),
+            rf_options.get("tape_bias", 0),
+            rf_options.get("colour_framing", 0),
+            rf_options.get("colour_under", 0),
+            rf_options.get("iq_imbalance", 0),
+            rf_options.get("vectorscope", 0),
+            rf_options.get("sync_shape", 0),
+            rf_options.get("precursor", 0),
+            rf_options.get("sync_depth", 0),
+            rf_options.get("burst_sync_lock", 0),
+            rf_options.get("vertical_interval", 0),
+            rf_options.get("tape_speed_stage", 0),
+            rf_options.get("standard_levels", 0),
+            rf_options.get("level_from_frequency", 0),
+            rf_options.get("source_agc", 0),
+            rf_options.get("vcr_agc", 0),
+            rf_options.get("composite_channel", 0),
+            rf_options.get("picture_stage", 0),
+            rf_options.get("multipath", 0),
+            rf_options.get("capture_profile", 0),
+            rf_options.get("capture_filter", 0),
+            rf_options.get("rf_stages", 0),
+            rf_options.get("filter_model", 0),
+            rf_options.get("transport_model", 0),
+            rf_options.get("band_delay", 0),
+            rf_options.get("head_switch_pair", 0),
+            rf_options.get("interference", 0),
+            rf_options.get("head_model", 0),
+            rf_options.get("head_differential", 0),
+            rf_options.get("magnetic", 0),
+            rf_options.get("magnetic_circuit", 0),
+            rf_options.get("tape_path", 0),
+            rf_options.get("picture_transform", 0),
+            rf_options.get("rf_transform", 0),
             rf_options.get("luma_eq", 0),
             rf_options.get("head_switch", 0),
             rf_options.get("carrier_tbc", 0),
@@ -1619,8 +1825,21 @@ class VHSRFDecode(ldd.RFDecode):
         return out_video, demod, demod_fft, head_switch_trace, baseband_eq_trace
 
     def demodblock(
-        self, data=None, mtf_level=0, fftdata=None, cut=False, thread_benchmark=False
+        self,
+        data=None,
+        mtf_level=0,
+        fftdata=None,
+        cut=False,
+        thread_benchmark=False,
+        block_start=None,
     ):
+        """Demodulate one RF block.
+
+        `block_start` is the block's absolute start sample on the capture,
+        which the cache's worker supplies as `blocknum * blocksize` and which
+        the RF transform picks a head's table by. None where a caller has no
+        position to give; the transform then answers for an unplaced block.
+        """
         rv = {}
         demod_block_debug = False
         demod_start_time = time.time()
@@ -1687,6 +1906,22 @@ class VHSRFDecode(ldd.RFDecode):
         # instead costs 17% of the chroma correction's benefit to buy 1.8% on
         # the luma.
         luma_eq = self.Filters.get("LumaPathEQ")
+        # THE RF TRANSFORM'S TABLE stands between the two equalizers this
+        # site already knows: an identified channel response the user
+        # supplied (`ChannelEQ`, an offline file) outranks it, and it
+        # outranks the luma path equalizer - whose measurement keeps running
+        # underneath it on every field and is what feeds the transform.
+        # Chosen per block by the head schedule from the block's absolute
+        # start sample, on this block's own FFT grid; None until a table has
+        # been published, and the luma equalizer then stands as before. It
+        # is carried in `luma_eq` to the line below, whose text the
+        # declaration anchors the `rf_eq` node on.
+        if self.options.rf_transform != 0 and self.Filters.get("ChannelEQ") is None:
+            transform_table = model_stages.rf_transform_table(
+                self, block_start, indata_fft.size
+            )
+            if transform_table is not None:
+                luma_eq = transform_table
         # The identified channel response (`channel_eq`) takes the luma
         # equalizer's place at this site while it is declared; with neither
         # present, nothing below touches the signal.
@@ -1712,6 +1947,18 @@ class VHSRFDecode(ldd.RFDecode):
         # analytic signal was taken; where neither did, it still holds.
         if boosted or rf_eq is not None:
             hilbert = npfft.ifft(indata_fft * self.Filters["hilbert"])
+
+        # THE LUMA'S QUADRATURE IMAGE, in the chroma's own correction
+        # pattern: a conjugate map on the carrier's complex baseband, which
+        # no table can carry, applied to the analytic signal once the
+        # transform has latched and published the pair. The envelope above
+        # was taken before it, as before every luma correction at this site.
+        if self.options.rf_transform != 0 and block_start is not None:
+            luma_image = model_stages.rf_transform_image(self)
+            if luma_image is not None:
+                hilbert = model_stages.apply_luma_image(
+                    hilbert, luma_image, block_start, self.freq_hz
+                )
 
         if not demod_block_debug:
             del indata_fft
@@ -1794,6 +2041,10 @@ class VHSRFDecode(ldd.RFDecode):
             # --carrier_tbc refines the time base from the carrier's own
             # sync-edge trace, which is measured on this channel.
             or self.options.carrier_tbc != 0
+            # The RF transform is fed by the same field-level amplitude
+            # measurement `luma_eq` is, and that measurement reads this
+            # channel.
+            or self.options.rf_transform != 0
             # --baseband_eq's head_switch prior and plots read this channel.
             or (self.options.baseband_eq != 0 and self._baseband_eq_declared)
             # --channel_eq's plots and residual channels read it too.

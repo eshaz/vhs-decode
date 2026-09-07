@@ -84,6 +84,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import json
 import numpy as np
 
+from vhsdecode.models import standard_levels
 from vhsdecode.models import sync_geometry
 
 CHAIN_PREFIX = "decoder precursor"
@@ -471,13 +472,100 @@ def deconvolved_drive(edge, kernel: Dict[str, object], noise_rms: float
 # --------------------------------------------------------------------------
 
 
+LEVEL_ADJUST_SEARCH = (0.0, 0.95)
+"""Where `--level_adjust` is looked for when it is inverted below. Its own
+default is 0.1 and values approaching one would put white outside the
+container, so the bracket spans everything the option can usefully be
+without assuming which value was used."""
+
+
+def output_scale(parameters: Dict[str, object],
+                 level_adjust: Optional[float] = None) -> Dict[str, float]:
+    """THE OUTPUT'S TRUE UNITS PER IRE, WITH `--level_adjust` TAKEN BACK OUT.
+
+    A DEFECT FOUND AND FIXED HERE ON 2026-09-06, and it had corrupted every
+    absolute IRE figure this module and `sync_depth` produced. The decoder
+    does not write the black and white levels it used; it writes them
+    SPREAD APART by `--level_adjust`, whose default is 0.1 and which exists
+    to give the RGB conversion headroom (`VHSDecode.build_json`):
+
+        black16bIre  = black  * (1 - level_adjust)
+        white16bIre  = white  * (1 + level_adjust)
+
+    `blanking16bIre` is written unadjusted. So an offline reader taking
+    `(white16bIre - blanking16bIre) / 100` as the units per IRE gets 409.6
+    where the decode used 358.4 - too large by 14.3 per cent - and every IRE
+    it then reports is short by the same factor. Measured on this session's
+    75-bar SP decode: the sync spacing read 34.17 IRE that way against the
+    39.05 IRE the decode's own scale gives, which is the difference between
+    a 15 per cent level deficit and a 2 per cent one.
+
+    CONFIRMED BY DECODING THE SAME CAPTURE WITH `--level_adjust 0`, which
+    writes blanking 15360, black 18048 and white 51200: 358.4 units to the
+    IRE, and black at exactly the specified 7.5 IRE setup. The adjusted
+    decode's 16243.2 and 56320 are those two values times 0.9 and 1.1.
+
+    THE INVERSION IS EXACT AND NEEDS NOTHING FITTED, because the setup is
+    specified (`standard_levels.SETUP_IRE`, 7.5 IRE on System M and zero on
+    625-line systems) and blanking is written unadjusted. Two equations,
+    two unknowns:
+
+        black16b = (blanking + setup * u) * (1 - L)
+        white16b = (blanking + 100   * u) * (1 + L)
+
+    Pass `level_adjust` to skip the search where the caller knows it.
+    """
+    blanking = float(parameters["blanking16bIre"])
+    black = float(parameters["black16bIre"])
+    white = float(parameters["white16bIre"])
+    setup = (0.0 if str(parameters.get("system", "NTSC")).upper().startswith("PAL")
+             else standard_levels.SETUP_IRE)
+
+    def scale_at(adjust: float) -> float:
+        if setup > 0:
+            return (black / (1.0 - adjust) - blanking) / setup
+        return (white / (1.0 + adjust) - blanking) / 100.0
+
+    def mismatch(adjust: float) -> float:
+        return (blanking + 100.0 * scale_at(adjust)) * (1.0 + adjust) - white
+
+    solved = float(level_adjust) if level_adjust is not None else None
+    if solved is None:
+        low, high = LEVEL_ADJUST_SEARCH
+        try:
+            from scipy import optimize
+            if mismatch(low) * mismatch(high) <= 0.0:
+                solved = float(optimize.brentq(mismatch, low, high))
+        except (ImportError, ValueError):
+            solved = None
+    if solved is None or not np.isfinite(scale_at(solved)) \
+            or scale_at(solved) <= 0.0:
+        # NO ROOT: say so rather than returning a number that looks fine.
+        return {"units_per_ire": (white - blanking) / 100.0,
+                "level_adjust": float("nan"), "inverted": False,
+                "black_ire": (black - blanking) / max(
+                    (white - blanking) / 100.0, 1e-9),
+                "setup_ire": setup}
+    scale = scale_at(solved)
+    return {"units_per_ire": float(scale),
+            "level_adjust": float(solved),
+            "inverted": True,
+            "black_ire": float((black / (1.0 - solved) - blanking) / scale),
+            "setup_ire": float(setup),
+            "white_16b": float(white / (1.0 + solved)),
+            "black_16b": float(black / (1.0 - solved))}
+
+
 def load_tbc(stem: str) -> Dict[str, object]:
     """A decoded luma TBC and its geometry, from the JSON beside it - never
     assumed. Samples are 16-bit unsigned; the field count is what the file
-    holds. Levels: 0 IRE at `blanking16bIre`, 100 IRE at `white16bIre`,
-    which is how the decoder wrote them (`iretohz(0)` and `iretohz(100)`)."""
+    holds. Levels: 0 IRE at `blanking16bIre`, and the units per IRE from
+    `output_scale`, which takes `--level_adjust` back out of the black and
+    white levels the decoder wrote - see there for the defect this repairs
+    and the control that confirmed it."""
     meta = json.load(open(stem + ".tbc.json"))
     vp = meta["videoParameters"]
+    scale = output_scale(vp)
     width, height = int(vp["fieldWidth"]), int(vp["fieldHeight"])
     raw = np.fromfile(stem + ".tbc", dtype=np.uint16)
     count = raw.size // (width * height)
@@ -495,8 +583,9 @@ def load_tbc(stem: str) -> Dict[str, object]:
         "height": height,
         "sample_rate_hz": float(vp["sampleRate"]),
         "system": str(vp.get("system", "NTSC")),
-        "units_per_ire": (float(vp["white16bIre"])
-                          - float(vp["blanking16bIre"])) / 100.0,
+        "units_per_ire": float(scale["units_per_ire"]),
+        "level_adjust": float(scale["level_adjust"]),
+        "scale_inverted": bool(scale["inverted"]),
         "blanking": float(vp["blanking16bIre"]),
         "active_end": int(vp["activeVideoEnd"]),
         "burst": (int(vp["colourBurstStart"]), int(vp["colourBurstEnd"])),

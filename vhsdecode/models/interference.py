@@ -417,7 +417,14 @@ def full_chain(strict: bool = True) -> Dict[str, int]:
                         "transport_dimensions",
                         "head_differential", "rf_stages", "colour_under",
                         "sync_geometry", "vcr_agc",
-                        "picture_stage", "vertical_interval"):
+                        "picture_stage", "vertical_interval",
+                        # the Hi-Fi audio carriers, if a video-tap capture
+                        # ever shows one. The entry is declared so that a
+                        # detection goes through the same door as every
+                        # other component rather than round it; on present
+                        # evidence it is refused for want of a detection
+                        # (capture_alignment.carrier_route_bound).
+                        "capture_alignment"):
         try:
             module = __import__(f"vhsdecode.models.{module_name}",
                                 fromlist=[module_name])

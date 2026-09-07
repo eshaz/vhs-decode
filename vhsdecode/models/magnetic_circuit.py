@@ -57,10 +57,18 @@ __all__ = [
     "field_intensity", "flux_density", "reluctance", "flux",
     "induced_voltage", "anhysteretic_b", "differential_permeability",
     "hysteresis_branch", "writing_speed_m_s", "wavelength_m",
-    "rotation_response", "spacing_loss_db", "spacing_over_time",
+    "rotation_response", "rotation_transfer", "spacing_loss_db",
+    "spacing_over_time",
     "dropouts_from_spacing", "record_side_observability",
     "capture_input_profile", "reference_properties",
     "normative_status", "NORMATIVE_SOURCE", "NOT_IN_ANY_STANDARD",
+    "PHASE_COHERENCE_FLOOR",
+    "spec_band_centres", "band_delay_difference", "spacing_from_band_delay",
+    "spacing_from_band_tilt", "two_band_delay_pair",
+    "head_efficiency", "deep_gap_field_a_m", "karlqvist_field",
+    "write_depth_m", "drive_ratio_for_depth", "optimum_record_drive",
+    "recorded_layer", "recorded_magnetisation", "linked_flux",
+    "record_current_curve",
 ]
 
 
@@ -249,6 +257,19 @@ def anhysteretic_b(field_intensity_a_m, saturation_t: float,
     linearity is not required of it - what is required is that the
     saturated level be STABLE, because it sets the flux the playback head
     recovers at every wavelength alike.
+
+    BUT THE CHROMA IS THE BIASED CASE THE FIRST PARAGRAPH DESCRIBES, and
+    this module said "without bias" as though VHS had none. It has one:
+    SMPTE 32M 7.5.1.2.2 - *"The chrominance signal shall be recorded with
+    the luminance FM signal acting as bias"* - and the JVC guide says the
+    same for baseline VHS at 1.1.6. The colour under is an AM carrier
+    recorded on the luma FM's own bias, so THIS curve, not
+    `hysteresis_branch`, is the one it rides, and 3.9.2.1.2's order to
+    record it 7 to 10 dB below saturation is the linearity budget that
+    choice buys. `tape_bias` carries the clauses, the measurement and the
+    limit - the bias is a FEW-CYCLE bias, three tenths of a cycle across
+    the switching band, so the linearisation is partial and a third-order
+    product survives.
     """
     h = np.asarray(field_intensity_a_m, dtype=np.float64)
     return float(saturation_t) * np.tanh(h / max(float(coercivity_a_m), 1e-30))
@@ -365,6 +386,106 @@ def rotation_response(frequency_hz, turns: float, spacing_m: float,
     }
 
 
+def rotation_transfer(frequency_hz, turns: float, spacing_m: float,
+                      writing_speed: float, gap_m: float = 0.30e-6,
+                      remanence_t: float = 0.15,
+                      track_width_m: float = 58e-6,
+                      phase_reference_hz: Optional[float] = None
+                      ) -> Dict[str, np.ndarray]:
+    """THE SAME RESPONSE AS A COMPLEX QUANTITY, which is what it always was.
+
+    `rotation_response` returns magnitudes, and every one of its three terms
+    has a phase that it throws away:
+
+      FARADAY is a differentiator. `e = -N dPhi/dt` is `j omega` and not
+              `omega`, so the term carries exactly a quarter turn at every
+              frequency. Written as `2 pi f N` that quarter turn is gone.
+      SPACING is minimum phase, and its companion is not a constant. It is
+              the `ln f` law `band_delay_difference` derives below, which is
+              the entire subject of this module's time axis.
+      GAP     is `sinc`, and a sinc that has gone negative is a `pi` flip.
+              `np.abs` around it removes a sign change rather than a level.
+
+    So this returns `H(f)` and the caller may take a magnitude if a magnitude
+    is what is wanted. The sign of the gap sinc is taken from
+    `head_model.sinc_sign_phase` rather than reimplemented, so there is one
+    account of it in the tree - but that function applies the standard
+    fringing correction to the gap before taking the sinc, and
+    `rotation_response` has always used the PHYSICAL gap, so the gap is
+    scaled by that factor on the way in. A sign taken from a sinc that nulls
+    at a different frequency from the magnitude's would be worse than no
+    sign at all.
+
+    MEASURED, at the standard's own writing speed and this project's typical
+    head, over the standard's own luma band and colour-under carrier:
+
+        gap 0.30 um, writing speed 5.80 m/s -> first sinc null 19.33 MHz
+        sign flips inside 0.4 to 4.4 MHz     0
+        Faraday phase                        +90.000 deg at every frequency
+        spacing-loss phase, 0.2045 um        -40.76 ns of group delay
+                                             between the two bands
+
+    - so in this band the gap's sign contributes nothing, the Faraday
+    quarter turn is a constant that cancels out of any band DIFFERENCE, and
+    the whole of the recoverable time information is the spacing term.
+
+    `phase_reference_hz` PINS THE ONE ARBITRARY QUANTITY. The minimum-phase
+    companion of an unbounded log magnitude is fixed only up to a linear
+    term, which is a constant group delay and therefore an origin of time.
+    Left to itself this function anchors it at the grid's lowest positive
+    frequency, so two calls on different grids return phases that differ by
+    a delay - the same grid dependence recorded against
+    `head_model.group_delay_s` above. Pass this to pin it, and the returned
+    `phase_reference_hz` says which was used either way. What the anchor
+    cannot move is any difference of group delays between two frequencies,
+    which is exactly the quantity this module measures.
+    """
+    from vhsdecode.models import head_model
+
+    f = np.asarray(frequency_hz, dtype=np.float64)
+    lam = wavelength_m(f, writing_speed)
+    # Faraday: j omega, the quarter turn written out
+    faraday = 1j * 2.0 * np.pi * f * float(turns)
+    # the separation loss and its minimum-phase companion. The companion is
+    # `phi = (2 d / v) omega ln(omega / omega_ref)`, whose derivative is the
+    # `ln f` group delay; the reference is arbitrary and cancels out of every
+    # difference, so the grid's own lowest positive frequency is used.
+    exponent = 2.0 * np.pi * float(spacing_m) / lam
+    positive = f[f > 0]
+    if phase_reference_hz is not None:
+        reference = float(phase_reference_hz)
+    else:
+        reference = float(positive.min()) if positive.size else 1.0
+    if reference <= 0:
+        raise ValueError("the phase reference must be a positive frequency")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        companion = np.where(
+            f > 0,
+            (2.0 * float(spacing_m) / float(writing_speed))
+            * (2.0 * np.pi * f) * np.log(np.maximum(f, 1e-30) / reference)
+            / np.pi,
+            0.0)
+    spacing = np.exp(-exponent + 1j * companion)
+    ratio = float(gap_m) / lam
+    sign = head_model.sinc_sign_phase(
+        f, float(writing_speed), float(track_width_m),
+        gap_m=float(gap_m) / head_model.EFFECTIVE_GAP_FACTOR)
+    gap = np.abs(np.sinc(ratio)) * np.exp(1j * sign)
+    flux_amplitude = float(remanence_t) * float(track_width_m)
+    transfer = faraday * spacing * gap
+    return {
+        "wavelength_m": lam,
+        "faraday": faraday,
+        "spacing_loss": spacing,
+        "gap_loss": gap,
+        "volts_per_tesla_metre": transfer,
+        "response": transfer * flux_amplitude,
+        "gap_null_hz": float(writing_speed) / max(float(gap_m), 1e-30),
+        "gap_sign_flips": int(np.count_nonzero(np.diff(sign) != 0.0)),
+        "phase_reference_hz": reference,
+    }
+
+
 # --------------------------------------------------------------------------
 # Distance over time, and the dropouts it derives
 # --------------------------------------------------------------------------
@@ -461,6 +582,27 @@ def record_side_observability() -> Dict[str, object]:
          arrive with known shape - so its phase departure is measurable.
          The record head's input was the source signal, which was never
          captured, so there is nothing its phase can be referred to.
+
+         THIS ONE IS NO LONGER TRUE OF THIS PROJECT'S CAPTURES, and the
+         change is worth stating rather than leaving the reasoning to
+         stand on a premise that has since altered. The test-pattern set
+         holds MATCHED taps - the drive going to the record head and the
+         signal coming back from the playback head, of the same signals
+         on the same machine - so the original being recorded to tape IS
+         captured, and it is the reference. Measured through
+         `tap_transfer` on 75bars SP, the record tap is coherent with
+         itself to 0.99799 and the record-to-playback transfer's phase is
+         determined across the luma band to 0.209 and 0.184 degrees rms
+         for the two heads over 13 and 14 fields. That is a phase
+         measurement of the write and read path together, referred to the
+         drive.
+
+         WHAT REMAINS TRUE, and it is the operative limit, is reason 2
+         below plus one this list did not have: on a single deck the head
+         that wrote a track is the same physical head that reads it, so
+         the record and playback contributions are not two terms to be
+         separated but one head measured twice. `record_head_derivable`
+         names the three experiments that would part them.
       2. THE PROFILE VARIED IN TIME AND THAT TIME IS GONE. The record
          head's spacing wandered while it wrote, exactly as the playback
          head's does while it reads, but that wander is now written into
@@ -484,8 +626,13 @@ def record_side_observability() -> Dict[str, object]:
         "amplitude": "observable - a scalar on a carrier of known shape, "
                      "and the two heads' records can be differenced against "
                      "each other at the head switch",
-        "phase": "NOT observable - phase needs a reference and the source "
-                 "signal was never captured",
+        "phase": "observable where a MATCHED RECORD TAP exists, which this "
+                 "project's test-pattern captures have - the drive is the "
+                 "reference, and the transfer's phase is determined to "
+                 "about 0.2 degrees rms across the luma band; NOT separable "
+                 "into a record share and a playback share on one deck, "
+                 "because the head that wrote the track is the head that "
+                 "reads it",
         "witness": "the colour phase rotation change near the bottom of the "
                    "screen, i.e. the head-switch region",
         "why_dropouts_are_baked_in":
@@ -493,9 +640,14 @@ def record_side_observability() -> Dict[str, object]:
             "perfect playback recovers exactly the magnetisation present, "
             "so the loss is an absence in the medium rather than a failure "
             "of the reading",
-        "consequence": "the record head enters the key as an AMPLITUDE axis "
-                       "only; offering it a phase direction would let the "
-                       "playback head's phase leak into it",
+        "consequence": "without a record tap the record head enters the key "
+                       "as an AMPLITUDE axis only, since offering it a phase "
+                       "direction would let the playback head's phase leak "
+                       "into it; with a matched record tap the phase of the "
+                       "write and read path together is measurable, and what "
+                       "is still not available is the split between them",
+        "reference_when_tapped": "the record tap itself, coherent with "
+                                 "itself to 0.99799 on 75bars SP",
     }
 
 
@@ -1291,6 +1443,17 @@ def record_head_derivable() -> Dict[str, object]:
          except that the two playback heads also alternate, so what the
          switch actually gives is the difference of differences. That is
          the four-way contrast the tesseract fold already measures.
+
+    MEASURED, so that "a PRODUCT" is a number rather than a caution. On the
+    matched taps of one Sony SLV-778HF, 75bars SP, the difference between
+    the two heads comes out as 37.22 +/- 0.13 nm of separation by the
+    amplitude route and 57.73 +/- 1.94 nm by the timing route - see
+    `two_band_delay_pair`. That is a real and well determined difference
+    between the drum's two heads, and it is a difference of PAIRS: head A's
+    write and read against head B's write and read. On one deck the head
+    that wrote a track is the head that reads it, so no arrangement of this
+    capture set parts the two, and the separators above are not optional
+    refinements but the only route.
     """
     return {
         "static_geometry": "IN THE SIGNAL - gap, spacing and azimuth "
@@ -1358,6 +1521,18 @@ def two_band_pair(luma_hz=(3.4e6, 4.4e6), colour_under_hz=(0.4e6, 0.9e6),
     So the pair buys a scale and a loss, well determined. It does not buy
     the head's geometry term by term, and a fit offered four names will
     still split one measurement between them.
+
+    AND ALL OF THAT IS AMPLITUDE. Everything above is a Jacobian of a log
+    MAGNITUDE, so the numbers describe how well two levels determine a
+    spacing and say nothing about time. The two bands carry a second and
+    independent reading of the same spacing in their relative TIMING, which
+    `band_delay_difference` derives and `two_band_delay_pair` puts beside
+    this one. The timing route has a property this one lacks: the flux scale
+    `N B A` is flat in frequency and therefore contributes exactly nothing
+    to a group delay, so the delay reads the spacing with no nuisance
+    parameter to marginalise over at all. Measured against the 23.2 nm this
+    function reaches with both bands, a delay known to 4.6 ns would match it
+    and one known to a nanosecond would beat it four-fold.
     """
     def band(edges):
         return np.linspace(float(edges[0]), float(edges[1]), int(points))
@@ -1400,3 +1575,845 @@ def two_band_pair(luma_hz=(3.4e6, 4.4e6), colour_under_hz=(0.4e6, 0.9e6),
         "spacing from the transition length - they are the SAME function "
         "exp(-2 pi x / lambda), so they are one parameter at any bandwidth")
     return out
+
+
+# --------------------------------------------------------------------------
+# The two bands on the TIME axis: the head's delay between luma and chroma
+# --------------------------------------------------------------------------
+
+# The coherence below which a band's PHASE is not measured at all, derived
+# rather than chosen. The random phase error of a transfer estimated from n
+# averages at coherence gamma has standard deviation
+# `sqrt((1 - gamma^2) / (2 n gamma^2))` radians, so at n = 1 the error
+# reaches one radian - the point past which a phase is no longer a
+# measurement of anything - when `gamma^2 = 1/3`. Nothing below this can
+# contribute to a delay however many fields are averaged, because the
+# averaging is already inside the estimate the instrument reports.
+PHASE_COHERENCE_FLOOR = 1.0 / math.sqrt(3.0)
+
+
+def spec_band_centres() -> Dict[str, object]:
+    """The two on-tape bands, taken from the standard rather than declared.
+
+    SMPTE 32M gives the luma FM carrier by its two reference points - sync
+    tip at 3.4 MHz and peak white at 4.4 MHz, clause 3.9.1.1.4 - and the
+    colour-under carrier as forty times the line rate, 629.371 kHz, clause
+    3.9.2.1.4. Those three figures and the standard's own 5.80 m/s writing
+    speed are the whole of this module's time axis; nothing here is fitted
+    and nothing is chosen.
+
+    TWO CENTRES, BECAUSE THE TWO LAWS WEIGHT THE BAND DIFFERENTLY. Wallace's
+    log magnitude is linear in frequency, so a band average of it lands on
+    the band's ARITHMETIC centre; the group delay the same loss implies is
+    linear in the LOGARITHM of frequency, so a band average of that lands on
+    the geometric one. Using one centre for both is a small error and an
+    avoidable one.
+
+    Measured from the standard's figures: the luma band's arithmetic centre
+    is 3.900 MHz and its geometric centre 3.868 MHz, against a colour-under
+    carrier of 0.629 MHz - a frequency ratio of 6.146 and a wavelength lever
+    of the same, which is what makes two bands worth more than one.
+    """
+    from vhsdecode.models import vhs_specification as spec
+
+    low = float(spec.value_of("fm_sync_tip_hz"))
+    high = float(spec.value_of("fm_peak_white_hz"))
+    colour = float(spec.value_of("colour_under_hz"))
+    speed = float(spec.value_of("writing_speed_m_s"))
+    linear = 0.5 * (low + high)
+    geometric = math.sqrt(low * high)
+    return {
+        "luma_low_hz": low,
+        "luma_high_hz": high,
+        "luma_linear_centre_hz": linear,
+        "luma_geometric_centre_hz": geometric,
+        "colour_under_hz": colour,
+        "writing_speed_m_s": speed,
+        "frequency_ratio": geometric / colour,
+        "frequency_difference_hz": linear - colour,
+        "clauses": "3.9.1.1.4 (luma), 3.9.2.1.4 (colour under), "
+                   "3.1.4 (writing speed)",
+    }
+
+
+def band_delay_difference(spacing_m: float, low_hz: Optional[float] = None,
+                          high_hz: Optional[float] = None,
+                          writing_speed_m_s: Optional[float] = None) -> float:
+    """THE DELAY BETWEEN THE TWO BANDS THAT A HEAD SEPARATION PRODUCES.
+
+    Ethan: *"The difference in time between the luma and chroma bands are
+    the measurement we can use to observe the delay on each video head."*
+    This is that quantity in closed form, and it is exact:
+
+        tau(f2) - tau(f1) = -(2 d / (pi v)) ln(f2 / f1)
+
+    WHERE IT COMES FROM. Wallace's separation loss is `exp(-2 pi d / lambda)`
+    and therefore `log|H| = -(d / v) omega` - linear in frequency. A loss is
+    minimum phase, so its phase is the Hilbert transform of its log
+    magnitude, and the Hilbert transform of `|omega|` is `omega ln|omega|` up
+    to a linear term. Differentiating gives a group delay that is
+    LOGARITHMIC in frequency, `tau = -(2 d / (pi v)) ln omega + constant`,
+    and the unknown constant - which is the arbitrary reference the Hilbert
+    transform of an unbounded function leaves behind - cancels the moment two
+    frequencies are subtracted. That cancellation is the whole reason the
+    measurement works.
+
+    AND IT IS WHY THIS IS MEASURABLE AT ALL. Two captures with no common
+    clock cannot measure an absolute delay: any instrument comparing them
+    must remove a linear phase, which removes a constant from the group
+    delay at every frequency alike. A DIFFERENCE BETWEEN TWO BANDS is
+    invariant under exactly that removal. So the one time quantity the
+    apparatus can see is the one the physics puts information into.
+
+    THE SIGN IS AN ADVANCE, not a delay. A separation loss is a low pass and
+    a minimum-phase low pass has its largest group delay at its low end, so
+    the LUMA BAND ARRIVES EARLIER than the colour-under band. Measured
+    through this function at the standard's bands and this project's typical
+    effective spacing of 0.2045 um, the luma band leads by 40.757 ns - which
+    is 0.583 of a sample at 4fsc, so an instrument that cannot interpolate
+    below a sample cannot see it.
+
+    THE TREE'S OTHER ROUTE TO THIS NUMBER DOES NOT WORK, and that is why
+    this function exists. `head_model.group_delay_s` takes the Hilbert
+    transform of the log magnitude on whatever grid the caller passes, and a
+    discrete Hilbert transform assumes its input is periodic. A separation
+    loss is a straight line, so the wrap-around at the grid's ends dominates
+    the answer. Measured on ONE head - 0.2045 um at 5.80 m/s - asking that
+    function for the same 3.9 MHz against 0.629 MHz difference:
+
+        grid                       answer
+        0.2-7 MHz, 1024 points     +165.5 ns
+        0.2-7 MHz, 4096 points     +166.9 ns
+        0.5-7 MHz, 1024 points     +539.7 ns
+        0.2-12 MHz, 1024 points    +114.8 ns
+        0.05-20 MHz, 4096 points    -34.3 ns
+        this closed form            -40.8 ns
+
+    The sign itself depends on the window. Only the widest grid comes near
+    the truth, and no caller knows to ask for one.
+
+    THE CLOSED FORM IS VERIFIED, on a control that can fail. Reconstructing
+    the minimum phase of a first-order minimum-phase filter `1 - r z^-1`,
+    whose phase is known exactly, the cepstral method used for the check
+    agrees to 2.2e-15 radians at r = 0.95. Put the separation loss through
+    that same machinery and the band-to-band group delay difference comes
+    back as -(2a/pi) ln(w2/w1) to within 0.372 per cent, and the ratio is
+    1.00372 for a = 0.5, 1.0 and 2.0 alike - so the residual is the grid's
+    and not the law's, which is what a scaling check is for.
+    """
+    bands = spec_band_centres()
+    low = bands["colour_under_hz"] if low_hz is None else float(low_hz)
+    high = (bands["luma_geometric_centre_hz"] if high_hz is None
+            else float(high_hz))
+    speed = (bands["writing_speed_m_s"] if writing_speed_m_s is None
+             else float(writing_speed_m_s))
+    if low <= 0 or high <= 0:
+        raise ValueError("a band centre must be a positive frequency")
+    return -(2.0 * float(spacing_m) / (math.pi * speed)) * math.log(high / low)
+
+
+def spacing_from_band_delay(delay_difference_s: float,
+                            delay_error_s: float = 0.0,
+                            low_hz: Optional[float] = None,
+                            high_hz: Optional[float] = None,
+                            writing_speed_m_s: Optional[float] = None
+                            ) -> Dict[str, object]:
+    """THE ESTIMATOR: a measured two-band delay, read back as a separation.
+
+    The inverse of `band_delay_difference`,
+
+        d = -(pi v / 2) * (tau(f2) - tau(f1)) / ln(f2 / f1)
+
+    and its sensitivity, which is the number an instrument builder needs
+    before building anything. At the standard's own bands and writing speed
+    one nanosecond of delay is 5.018 nanometres of separation, so the whole
+    of this project's typical 0.2045 um effective spacing is 40.8 ns and the
+    difference between two heads of one drum - measured below at about 37 nm
+    - is 7.4 ns, which is 0.106 of a sample at 4fsc.
+
+    WHAT IT MEASURES IS A SUM AND NOT A HEAD. The separation enters once
+    when the signal is written and again when it is read, and both are the
+    same exponential, so what comes back is the record-side and playback-side
+    separations added - the confound `tape_path.clearance_signature` records
+    and `record_head_derivable` explains. The quantity that IS a head is the
+    difference between the two heads of one drum, where everything shared -
+    the tape, the record electronics, the preamplifier, the cable - cancels.
+    """
+    bands = spec_band_centres()
+    low = bands["colour_under_hz"] if low_hz is None else float(low_hz)
+    high = (bands["luma_geometric_centre_hz"] if high_hz is None
+            else float(high_hz))
+    speed = (bands["writing_speed_m_s"] if writing_speed_m_s is None
+             else float(writing_speed_m_s))
+    lever = math.log(high / low)
+    metres_per_second = math.pi * speed / (2.0 * lever)
+    return {
+        "spacing_m": -metres_per_second * float(delay_difference_s),
+        "spacing_error_m": metres_per_second * abs(float(delay_error_s)),
+        "metres_per_second_of_delay": metres_per_second,
+        "log_lever": lever,
+        "low_hz": low,
+        "high_hz": high,
+        "writing_speed_m_s": speed,
+        "measures": "the record-side and playback-side separations ADDED; "
+                    "only a difference between the two heads of one drum "
+                    "isolates a head",
+    }
+
+
+def spacing_from_band_tilt(log_tilt_nepers: float,
+                           tilt_error_nepers: float = 0.0,
+                           low_hz: Optional[float] = None,
+                           high_hz: Optional[float] = None,
+                           writing_speed_m_s: Optional[float] = None
+                           ) -> Dict[str, object]:
+    """THE OTHER READING OF THE SAME NUMBER: the same separation, from the
+    two bands' LEVELS instead of their timing.
+
+    Wallace's law in the form the amplitude axis uses it,
+
+        log|H(f2)| - log|H(f1)| = -(2 pi d / v) (f2 - f1)
+
+    so a measured tilt between the two bands gives the same `d` that the
+    delay does. This is the estimator the amplitude side of `two_band_pair`
+    already implies; it is written out here so that the two routes can be
+    put beside one another, which is the whole point of a pair.
+
+    Its sensitivity at the standard's bands and writing speed is 282.2
+    nanometres per neper, so this project's typical 0.2045 um effective
+    spacing is a tilt of 0.7245 nepers, or 6.294 dB, between the two bands.
+    Matching a one-nanosecond delay measurement therefore takes a level
+    measurement good to 0.0178 nepers, which is 0.154 dB.
+
+    THE TWO ROUTES ARE NOT THE SAME MEASUREMENT WEARING TWO HATS. One is a
+    difference of levels and the other a difference of slopes of phase; one
+    responds to every loss in the path and the other only to the part that
+    is minimum phase; and the frequency dependence differs - `f2 - f1`
+    against `ln(f2 / f1)` - so they weight the band differently even when
+    they agree.
+    """
+    bands = spec_band_centres()
+    low = bands["colour_under_hz"] if low_hz is None else float(low_hz)
+    high = (bands["luma_linear_centre_hz"] if high_hz is None
+            else float(high_hz))
+    speed = (bands["writing_speed_m_s"] if writing_speed_m_s is None
+             else float(writing_speed_m_s))
+    span = high - low
+    if span == 0.0:
+        raise ValueError("the two bands must differ in frequency")
+    metres_per_neper = speed / (2.0 * math.pi * span)
+    return {
+        "spacing_m": -metres_per_neper * float(log_tilt_nepers),
+        "spacing_error_m": metres_per_neper * abs(float(tilt_error_nepers)),
+        "metres_per_neper": metres_per_neper,
+        "frequency_span_hz": span,
+        "low_hz": low,
+        "high_hz": high,
+        "writing_speed_m_s": speed,
+    }
+
+
+def two_band_delay_pair(delay_difference_s: float, log_tilt_nepers: float,
+                        delay_error_s: float = 0.0,
+                        tilt_error_nepers: float = 0.0,
+                        coherence: Optional[float] = None,
+                        delay_low_hz: Optional[float] = None,
+                        delay_high_hz: Optional[float] = None,
+                        tilt_low_hz: Optional[float] = None,
+                        tilt_high_hz: Optional[float] = None,
+                        writing_speed_m_s: Optional[float] = None
+                        ) -> Dict[str, object]:
+    """THE PAIR: the same separation read twice, once in time and once in
+    amplitude, so that the two can disagree.
+
+    A pair is not two views of one arithmetic. These two share a parameter
+    and nothing else: the timing route reads the slope of the phase and the
+    amplitude route the difference of the levels, and a discrepancy between
+    them says the path is not the pure minimum-phase separation loss the
+    model assumes. That is a finding rather than a failure, which is what a
+    pair is for.
+
+    MEASURED, ON REAL DATA, and this is the result. The instrument is
+    `tap_transfer`'s record-tap to playback-tap complex transfer of one Sony
+    SLV-778HF, per head, 75bars SP, 13 and 14 fields, colour-under band
+    0.4-0.9 MHz against luma band 3.4-4.4 MHz:
+
+        head 0   tau(luma) - tau(colour under)  +84.33 +/- 0.30 ns
+                 log-magnitude tilt             +0.4752 +/- 0.0004 nepers
+        head 1   tau(luma) - tau(colour under)  +72.80 +/- 0.25 ns
+                 log-magnitude tilt             +0.3389 +/- 0.0003 nepers
+
+    Neither head's own figure is the head: the transfer also carries the
+    preamplifier's equalisation and the head's electrical resonance, both of
+    which are large and positive where the separation loss is small and
+    negative. The head is the DIFFERENCE, where everything the two heads
+    share cancels:
+
+        head 0 minus head 1, delay         +11.533 +/- 0.388 ns
+        head 0 minus head 1, tilt          +0.13625 +/- 0.00046 nepers
+        separation by the TIME route       -57.74 +/- 1.94 nm
+        separation by the AMPLITUDE route  -37.22 +/- 0.13 nm
+
+    Same sign, same order, ratio 1.551, and 10.5 standard deviations apart.
+    So the two heads of this drum genuinely differ by something close to
+    forty nanometres of separation - head 0 running the closer of the two -
+    and that something is not ONLY separation, because a pure separation
+    difference would have to give both numbers alike.
+
+    AND ACROSS PATTERNS THE TWO ROUTES ARE NOT EQUALLY GOOD. Over the ten SP
+    captures whose colour-under coherence clears the floor below:
+
+        amplitude route   -39.97 nm, scatter   6.10 nm, range -52.5 to -31.3
+        time route       -107.32 nm, scatter 203.60 nm, range -630.7 to +86.1
+
+    - a scatter thirty-three times larger, and a route that changes sign
+    from pattern to pattern. The reason is visible one level down: over the
+    seven SP captures whose delay error bar is under five nanoseconds, head
+    0's own colour-under group delay runs from -135.6 ns to -10.3 ns - a
+    125 ns swing on one head from content alone, against the 11.5 ns that
+    separates the two heads. These are luma-dominated test charts and not
+    one of them holds a steady full-amplitude colour-under carrier. The time
+    route is sound and the captures are not yet good enough for it.
+
+    THE COHERENCE GATE IS LOAD-BEARING AND THE ERROR BAR IS NOT ENOUGH. The
+    luma-only captures have no colour-under signal at all and their
+    coherence there falls to 0.002-0.35, so they must be refused; but
+    `pulseandbar-y-only`, at coherence 0.127, reports a head delay difference
+    of +2229.70 +/- 104.29 ns - twenty-one standard deviations of pure
+    nonsense. An instrument that trusted the reported error bar alone would
+    have accepted it. `PHASE_COHERENCE_FLOOR` refuses it on the coherence,
+    and the honest-but-noisy captures are then handled by their own error
+    bars, which is what those are for.
+
+    THE TWO ROUTES TAKE THEIR OWN BAND CENTRES and the arguments are named
+    apart for that reason. A delay averaged over a band lands on its
+    geometric centre and a level on its arithmetic one, because one law is
+    linear in the logarithm of frequency and the other in frequency itself.
+    Handing one pair of centres to both is a small, silent error - on the
+    measurement above it moves the amplitude route from -37.22 to -38.59 nm,
+    which is ten times its own error bar - and a single catch-all argument
+    would have invited it.
+    """
+    delay = spacing_from_band_delay(delay_difference_s, delay_error_s,
+                                    low_hz=delay_low_hz,
+                                    high_hz=delay_high_hz,
+                                    writing_speed_m_s=writing_speed_m_s)
+    tilt = spacing_from_band_tilt(log_tilt_nepers, tilt_error_nepers,
+                                  low_hz=tilt_low_hz, high_hz=tilt_high_hz,
+                                  writing_speed_m_s=writing_speed_m_s)
+    combined = math.hypot(delay["spacing_error_m"], tilt["spacing_error_m"])
+    difference = delay["spacing_m"] - tilt["spacing_m"]
+    out: Dict[str, object] = {
+        "time_spacing_m": delay["spacing_m"],
+        "time_spacing_error_m": delay["spacing_error_m"],
+        "amplitude_spacing_m": tilt["spacing_m"],
+        "amplitude_spacing_error_m": tilt["spacing_error_m"],
+        "difference_m": difference,
+        "difference_error_m": combined,
+        "sigma": abs(difference) / combined if combined > 0 else float("inf"),
+        "ratio": (delay["spacing_m"] / tilt["spacing_m"]
+                  if tilt["spacing_m"] != 0.0 else float("nan")),
+        "metres_per_second_of_delay": delay["metres_per_second_of_delay"],
+        "metres_per_neper": tilt["metres_per_neper"],
+        "usable": True,
+        "why": "a discrepancy means the path is not the pure minimum-phase "
+               "separation loss the model assumes, which is a finding",
+    }
+    if coherence is not None:
+        out["coherence"] = float(coherence)
+        out["coherence_floor"] = PHASE_COHERENCE_FLOOR
+        if float(coherence) < PHASE_COHERENCE_FLOOR:
+            out["usable"] = False
+            out["why"] = (
+                "the colour-under band's coherence is %.3f, below the %.3f at "
+                "which a single average's phase error reaches one radian; the "
+                "delay is not measured here whatever error bar is reported "
+                "beside it" % (float(coherence), PHASE_COHERENCE_FLOOR))
+    return out
+
+
+# --------------------------------------------------------------------------
+# THE RECORD SIDE: the field that magnetises the tape, and the layer it writes
+# --------------------------------------------------------------------------
+#
+# Ethan asked for this twice and the module had only half of it:
+#
+#   "model the head in terms of voltage and current that is being used
+#    magnetize the head"
+#   "Head current to magnetic ratio is the number of turns divided by the
+#    length of the coil ... Use the expected properties of this and use the
+#    BH curve to model this part"
+#
+# What existed was the field inside the CORE - `field_intensity` gives
+# `H = N I / l`, which is the coil's own field - and the core's B-H curve in
+# `anhysteretic_b`. What did not exist was the step from there to the tape:
+# the fraction of the magnetomotive force that appears across the gap, the
+# field that fraction produces in the coating, and the depth to which that
+# field exceeds the tape's coercivity and therefore records anything at all.
+#
+# That step is the whole of the record side. Without it the recording depth
+# is a free scale - `magnetic.NOMINAL_DEPTH_M` says so in its own comment -
+# and the record current, which SMPTE 32M defines only by what it achieves,
+# has no model to achieve it in.
+
+
+def head_efficiency(gap_m: float = 0.30e-6, core_length_m: float = 2e-3,
+                    core_area_m2: float = 58e-6 * 20e-6,
+                    core_permeability_r: float = 3000.0) -> Dict[str, float]:
+    """THE FRACTION OF THE DRIVE THAT REACHES THE TAPE.
+
+    A record head is a magnetic circuit in series: the core carries the flux
+    round to the gap, and the two reluctances divide the magnetomotive force
+    between them exactly as two resistors divide a voltage. The share that
+    falls across the GAP is the head's efficiency,
+
+        eta = R_gap / (R_gap + R_core)
+
+    and the field in the gap - the deep-gap field, which is what the
+    Karlqvist expression below is written in terms of - is `eta N I / g`.
+
+    `head_transformer` has computed this number all along and called it
+    `gap_share`, without ever naming it as the efficiency or using it to
+    reach the tape. With the values that function defaults to it is 0.3103,
+    so two thirds of the drive is spent turning the core and one third does
+    the recording.
+
+    THE EFFICIENCY IS NOT A LOSS TO BE CORRECTED. It is a design quantity:
+    an efficiency near one would mean a core contributing no reluctance,
+    which also means a core that saturates at once. `head_transformer`
+    measures the consequence - with these values the core saturates at
+    3.462 mA while the tape reaches its coercivity at 0.4615 mA, a headroom
+    of 7.50 - and that headroom is the ceiling on everything below.
+    """
+    permeability = float(core_permeability_r) * VACUUM_PERMEABILITY
+    core = reluctance(core_length_m, core_area_m2, permeability)
+    gap = reluctance(gap_m, core_area_m2)
+    total = core + gap
+    return {
+        "efficiency": gap / max(total, 1e-300),
+        "core_reluctance": core,
+        "gap_reluctance": gap,
+        "why": "the core and the gap divide the magnetomotive force in "
+               "proportion to their reluctances, and only the gap's share "
+               "reaches the tape",
+    }
+
+
+def deep_gap_field_a_m(current_a: float, turns: float = 100.0,
+                       gap_m: float = 0.30e-6, **head) -> float:
+    """The field in the gap, `eta N I / g`, in amperes per metre. This is
+    the one number the whole record side is written in terms of, and it is
+    where the coil's current finally becomes a field the tape can feel."""
+    eta = head_efficiency(gap_m=gap_m, **head)["efficiency"]
+    return eta * float(turns) * float(current_a) / max(float(gap_m), 1e-30)
+
+
+def karlqvist_field(x_m, y_m, gap_m: float = 0.30e-6,
+                    deep_gap_field_a_m: float = 1.0) -> Dict[str, np.ndarray]:
+    """THE FIELD THE RECORD HEAD PUTS INTO THE COATING, as a complex number.
+
+    Karlqvist's approximation (O. Karlqvist, "Calculation of the magnetic
+    field in the ferromagnetic layer of a magnetic drum", Transactions of
+    the Royal Institute of Technology, Stockholm, number 86, 1954), the
+    standard closed form for a gap of length `g` in an infinitely permeable
+    head carrying a deep-gap field `H_g`, at a point `x` along the track and
+    `y` below the head's surface:
+
+        Hx = (H_g / pi) [ arctan((g/2 + x)/y) + arctan((g/2 - x)/y) ]
+        Hy = -(H_g / 2 pi) ln[ ((x + g/2)^2 + y^2) / ((x - g/2)^2 + y^2) ]
+
+    RETURNED COMPLEX, AND NOT AS A CONVENTION. A field with no sources and
+    no currents in the region it occupies is both divergence-free and
+    curl-free there, which is precisely the statement that `Hx - j Hy` is an
+    ANALYTIC function of `x + j y`. The complex form is what the field is;
+    the pair of real components is the shadow of it.
+
+    THAT IS ALSO THE CONTROL, and it settles the sign of `Hy`, which
+    different sources write differently. Measured at 0.07 um along the track
+    and 0.22 um deep, with the sign above: `div H` is 1.3e-01 and `curl H`
+    is 1.9e-01 against a derivative scale of 5.5e+05, a relative 2.4e-07
+    which is the finite difference's own error. With the sign reversed both
+    read 1.1e+06 and 2.4e+06 - the size of the terms themselves. A sign
+    error here is not subtle and the control catches it at once.
+
+    THE APPROXIMATION'S RANGE. Karlqvist assumes the gap's faces are
+    equipotentials and is accurate for `y` greater than about half the gap.
+    At the depths the format records - a fifth of a micrometre against a
+    gap of three tenths - `y/g` is near 0.7, which is inside that range but
+    not far inside, so the depths below are good to a few per cent and not
+    to a part in a thousand.
+    """
+    x = np.asarray(x_m, dtype=np.float64)
+    y = np.asarray(y_m, dtype=np.float64)
+    half = 0.5 * float(gap_m)
+    field = float(deep_gap_field_a_m)
+    along = (field / np.pi) * (np.arctan((half + x) / y)
+                               + np.arctan((half - x) / y))
+    across = -(field / (2.0 * np.pi)) * np.log(
+        ((x + half) ** 2 + y ** 2) / ((x - half) ** 2 + y ** 2))
+    return {
+        "along_track_a_m": along,
+        "perpendicular_a_m": across,
+        "field": (along - 1j * across).astype(np.complex128),
+        "magnitude_a_m": np.hypot(along, across),
+    }
+
+
+def write_depth_m(drive_ratio: float, gap_m: float = 0.30e-6) -> float:
+    """HOW DEEP THE RECORDING GOES, in closed form.
+
+    A coating records where the head's field exceeds its coercivity and
+    nowhere else, so the recorded layer's lower boundary is the deepest
+    point of the contour `|H| = Hc`. That contour's deepest point lies
+    directly under the gap's centre - measured on a 3001 by 2001 grid it is
+    at `x` = 0.0000 um - and there the perpendicular component vanishes by
+    symmetry and the field is the along-track term alone:
+
+        Hx(0, y) = (2 H_g / pi) arctan( (g/2) / y )
+
+    Setting that equal to the coercivity and solving gives the depth in one
+    line, with `r = H_g / Hc` the drive in units of the coercivity:
+
+        y = (g / 2) / tan( pi / (2 r) )
+
+    and it inverts as cleanly, which `drive_ratio_for_depth` does.
+
+    MEASURED, at the format's 0.30 um gap, against the numerical contour on
+    the full two-dimensional field: the closed form gives 0.2064 um at
+    `r = 2.5` and the grid search 0.2063 um. The two agree because the
+    argument above is exact rather than approximate.
+
+    A drive at or below the coercivity records nothing at all, and the
+    formula says so: at `r = 1` the tangent's argument is `pi/2` and the
+    depth is zero.
+    """
+    ratio = float(drive_ratio)
+    if ratio <= 1.0:
+        return 0.0
+    return 0.5 * float(gap_m) / math.tan(math.pi / (2.0 * ratio))
+
+
+def drive_ratio_for_depth(depth_m: float, gap_m: float = 0.30e-6) -> float:
+    """The drive, in units of the tape's coercivity, that records to a given
+    depth. The inverse of `write_depth_m`,
+
+        H_g / Hc = pi / (2 arctan( (g/2) / y ))
+
+    and it is the function that turns the recording depth from a free scale
+    into a record current. `magnetic.NOMINAL_DEPTH_M` calls its own 0.15 um
+    "a SCALE, not a constant of the format"; measured through here, with the
+    format's gap and this project's 0.05 um head-to-tape spacing, that
+    layer corresponds to a drive of 2.441 times the coercivity, and
+    `tape_model`'s 0.20 um recording depth to 2.907. The two numbers the
+    tree assumed independently turn out to be one quantity at two record
+    currents, which is the axis `magnetic.level_axis` measures the shape of.
+    """
+    depth = float(depth_m)
+    if depth <= 0.0:
+        return float("inf")
+    return math.pi / (2.0 * math.atan(0.5 * float(gap_m) / depth))
+
+
+def optimum_record_drive(frequency_hz: Optional[float] = None,
+                         gap_m: float = 0.30e-6,
+                         spacing_m: float = 0.05e-6,
+                         writing_speed_m_s: Optional[float] = None
+                         ) -> Dict[str, float]:
+    """SMPTE 32M's OPERATIONAL DEFINITION OF THE RECORD CURRENT, IMPLEMENTED.
+
+    Clause 3.9.1.1.6 states it and states nothing else: *"The record current
+    shall be set to the optimum value over the entire bandwidth of the FM
+    carrier. Optimum record current shall be that which returns the maximum
+    output signal level during playback."* `vhs_specification` records that
+    as a value of None - the standard gives no number, no units and no
+    tolerance - and nothing in this tree has ever computed what the clause
+    describes.
+
+    It is computable, because the clause names a maximum and the maximum has
+    a cause. Driving harder writes deeper, and depth stops helping at the
+    point where the layer written is as deep as the reproduce head can see:
+    magnetisation below `lambda / (2 pi)` returns no flux to the gap, and it
+    does add to the transition's own demagnetising field. So the output
+    peaks where the write depth meets the read depth, and the optimum drive
+    follows from `drive_ratio_for_depth` at that depth plus the head-to-tape
+    spacing, since the coating begins there and not at the head's surface.
+
+    MEASURED, at the format's own figures - a 0.30 um gap, 0.05 um of
+    separation, the standard's 5.80 m/s:
+
+        band              wavelength   read depth   optimum H_gap / Hc
+        sync tip 3.4 MHz    1.7059 um    0.2715 um        3.598
+        luma centre         1.4996 um    0.2387 um        3.278
+        peak white 4.4 MHz  1.3182 um    0.2098 um        3.000
+        colour under        9.2156 um    1.4667 um       15.934
+
+    AND THE LAST ROW EXPLAINS THE CLAUSE'S OWN WORDING. Across the FM
+    carrier's band the optimum moves only from 3.000 to 3.598, so one
+    current serves the whole of it and the standard can sensibly ask for
+    one. The colour-under carrier's optimum is 15.9 - 4.9 times the luma's,
+    and above the 7.50 of headroom `head_transformer` measures before the
+    core itself saturates. The chroma's optimum is therefore not merely
+    unchosen but unreachable, and the standard is right to define the
+    optimum over the FM carrier alone and to say nothing of the chroma.
+
+    AND THE REASON IT SAYS NOTHING IS THAT THE CHROMA IS NOT RECORDED THIS
+    WAY AT ALL. The colour under is recorded on the luma FM's own AC bias
+    (SMPTE 32M 7.5.1.2.2; JVC VTG82063 1.1.6, which also states the chroma
+    record current is a CONSTANT current rather than an optimised one), so
+    it is a small signal on the anhysteretic curve and never needs a field
+    of its own that reaches the coercivity - 3.9.2.1.2 deliberately keeps it
+    7 to 10 dB below saturation. The 15.9 is therefore not a requirement
+    that fails: it is the drive a 9.2156 um wavelength WOULD need if it were
+    recorded the way the luma is, 2.12 times the whole of the core's
+    headroom, which is the quantitative reason the format had to bias it
+    instead. See `tape_bias.record_current_scope`.
+    """
+    band = spec_band_centres()
+    speed = (float(band["writing_speed_m_s"]) if writing_speed_m_s is None
+             else float(writing_speed_m_s))
+    frequency = (float(band["luma_geometric_centre_hz"])
+                 if frequency_hz is None else float(frequency_hz))
+    wavelength = speed / max(frequency, 1e-30)
+    read = wavelength / (2.0 * math.pi)
+    ratio = drive_ratio_for_depth(read + float(spacing_m), gap_m)
+    return {
+        "frequency_hz": frequency,
+        "wavelength_m": wavelength,
+        "read_depth_m": read,
+        "drive_ratio": ratio,
+        "write_depth_m": write_depth_m(ratio, gap_m),
+        "clause": "SMPTE 32M 3.9.1.1.6",
+        "why": "the output stops rising once the layer written is as deep "
+               "as the reproduce head can see, which is lambda / (2 pi)",
+    }
+
+
+def recorded_layer(drive_ratio: float, gap_m: float = 0.30e-6,
+                   spacing_m: float = 0.05e-6,
+                   frequency_hz: Optional[float] = None,
+                   writing_speed_m_s: Optional[float] = None
+                   ) -> Dict[str, float]:
+    """THE LAYER THAT ACTUALLY CARRIES THE SIGNAL, and it has two lids.
+
+    The record side sets the lower boundary and the playback side sets what
+    of it is visible, and the two obey different laws:
+
+      THE WRITE DEPTH DOES NOT DEPEND ON FREQUENCY. The head's field knows
+      the drive and the geometry and nothing about the signal, so every
+      band recorded by one head at one current is written to the same depth.
+      THE READ DEPTH DOES. `lambda / (2 pi)` is a wavelength, so the
+      colour-under band reads six times deeper into the coating than the
+      luma band does.
+
+    So the layer carrying a band is the INTERSECTION, and which lid binds is
+    a per-band question rather than a property of the tape. Measured at a
+    drive of 3.000 times the coercivity - the value `optimum_record_drive`
+    returns for peak white - with the format's 0.30 um gap and this
+    project's 0.05 um separation, every depth in micrometres:
+
+        band            write   read   layer   bound by
+        sync tip       0.2598 0.2715  0.2098   write
+        luma centre    0.2598 0.2387  0.2098   write
+        peak white     0.2598 0.2098  0.2098   read
+        colour under   0.2598 1.4667  0.2098   write
+
+    Peak white is read-bound because this is exactly its own optimum, which
+    is what an optimum means; everything at a longer wavelength is
+    write-bound, and the last row is the finding. The colour-under band's
+    own reading limit is 1.4667 um and there is nothing recorded below
+    0.2598 um for it to read, so the chroma's effective thickness is set by
+    the RECORD CURRENT and not by its wavelength at all. Any account that
+    gives the colour under a 1.5 um recorded thickness is describing coating
+    the head never magnetised.
+
+    WHICH RECORD CURRENT, THOUGH - AND UNTIL NOW THIS FUNCTION COULD NOT
+    SAY. One `drive_ratio` is applied to every row, which is right for the
+    luma because the luma's current is what the argument names, and was
+    unjustified for the colour under because the chroma has a current of its
+    own. Bias supplies the justification: the anhysteretic process runs
+    exactly where the BIAS field exceeds the coercivity, and the bias is the
+    luma, so the layer carrying the chroma is the layer the LUMA wrote and
+    the chroma's own current does not enter the depth at all. See
+    `tape_bias.chroma_recorded_layer`.
+
+    `margin_m` is the signed distance between the two lids, `read + spacing
+    - write`, and it is the quantity rather than the label: negative means
+    the reproduce head is the limit, positive means the record current is,
+    and zero is the optimum. At the tie the label falls one way or the other
+    on rounding and the margin does not.
+    """
+    band = spec_band_centres()
+    speed = (float(band["writing_speed_m_s"]) if writing_speed_m_s is None
+             else float(writing_speed_m_s))
+    frequency = (float(band["luma_geometric_centre_hz"])
+                 if frequency_hz is None else float(frequency_hz))
+    write = write_depth_m(drive_ratio, gap_m)
+    read = speed / max(frequency, 1e-30) / (2.0 * math.pi)
+    top = float(spacing_m)
+    bottom = min(write, read + top)
+    return {
+        "frequency_hz": frequency,
+        "write_depth_m": write,
+        "read_depth_m": read,
+        "layer_top_m": top,
+        "layer_bottom_m": bottom,
+        "thickness_m": max(bottom - top, 0.0),
+        "margin_m": (read + top) - write,
+        "bound_by": "read" if (read + top) <= write else "write",
+        "why": "the write depth is set by the current and the geometry and "
+               "is the same for every band; the read depth is a wavelength "
+               "and is not, so which lid binds is a per-band question",
+    }
+
+
+def recorded_magnetisation(drive_ratio: float,
+                           coercivity_a_m: float = 600.0 * 1000.0
+                           / (4.0 * math.pi),
+                           remanence_t: float = 0.15,
+                           gap_m: float = 0.30e-6,
+                           spacing_m: float = 0.05e-6,
+                           points: int = 4000
+                           ) -> Dict[str, np.ndarray]:
+    """WHAT THE TAPE KEEPS, depth by depth - Ethan's B-H curve, at last used
+    on the tape rather than on the core.
+
+    His directive was to "use the BH curve to model this part", and until
+    now the curve in this module was only ever applied to the head's own
+    ferrite: `head_transformer` and `saturation_response` both put the CORE
+    on it. The tape has a B-H curve too, and it is the one that decides what
+    survives, because what a coating keeps after the field has passed is its
+    REMANENCE curve - the same sigmoid, saturating at the remanent
+    magnetisation rather than at the material's full saturation.
+
+    So the chain finally runs end to end: a current makes a deep-gap field
+    through `head_efficiency`, that field reaches into the coating through
+    `karlqvist_field`, and the coating's own curve turns it into the
+    magnetisation left behind. Below the depth where the field falls under
+    the coercivity nothing is written, which is where `write_depth_m` comes
+    from and where this profile stops.
+    """
+    depth = write_depth_m(drive_ratio, gap_m)
+    top = float(spacing_m)
+    if depth <= top:
+        empty = np.zeros(0)
+        return {"depth_m": empty, "field_a_m": empty,
+                "magnetisation_t": empty, "write_depth_m": depth}
+    y = np.linspace(top, depth, int(points))
+    field = karlqvist_field(np.zeros_like(y), y, gap_m,
+                            float(drive_ratio) * float(coercivity_a_m)
+                            )["magnitude_a_m"]
+    return {
+        "depth_m": y,
+        "field_a_m": field,
+        "magnetisation_t": anhysteretic_b(field, float(remanence_t),
+                                          float(coercivity_a_m)),
+        "write_depth_m": depth,
+    }
+
+
+def linked_flux(drive_ratio: float, frequency_hz: float,
+                writing_speed_m_s: Optional[float] = None,
+                gap_m: float = 0.30e-6, spacing_m: float = 0.05e-6,
+                coercivity_a_m: float = 600.0 * 1000.0 / (4.0 * math.pi),
+                remanence_t: float = 0.15,
+                transition: bool = True, **kwargs) -> float:
+    """The flux the reproduce head actually links from that profile.
+
+    Two things stand between the magnetisation and the output and both are
+    already in this module. Wallace's `exp(-2 pi y / lambda)` weights each
+    depth by how much of it the head can see, and the transition length -
+    the distance over which a reversal actually turns over, which
+    `transition_length` computes from Williams-Comstock - blurs the
+    reversal itself and costs `exp(-2 pi a / lambda)`.
+
+    THE SECOND TERM IS WHAT MAKES AN OPTIMUM EXIST. Driving harder always
+    writes more magnetisation, so the depth integral alone rises without
+    limit - measured, it is monotone in the drive over 1.02 to 20 times the
+    coercivity at every frequency in the band. What turns it over is that a
+    deeper recording carries a longer transition, and a longer transition
+    costs short wavelengths. `transition=False` removes the term and is the
+    control for that statement rather than an option worth using.
+    """
+    band = spec_band_centres()
+    speed = (float(band["writing_speed_m_s"]) if writing_speed_m_s is None
+             else float(writing_speed_m_s))
+    wavelength = speed / max(float(frequency_hz), 1e-30)
+    profile = recorded_magnetisation(drive_ratio, coercivity_a_m, remanence_t,
+                                     gap_m, spacing_m, **kwargs)
+    y = profile["depth_m"]
+    if y.size < 2:
+        return 0.0
+    linked = float(np.trapezoid(
+        profile["magnetisation_t"] * np.exp(-2.0 * np.pi * y / wavelength), y))
+    if not transition:
+        return linked
+    length = transition_length(coercivity_a_m=coercivity_a_m,
+                               remanence_t=remanence_t,
+                               thickness_m=profile["write_depth_m"]
+                               - float(spacing_m),
+                               spacing_m=float(spacing_m))
+    return linked * math.exp(-2.0 * np.pi * length / wavelength)
+
+
+def record_current_curve(frequency_hz: Optional[float] = None,
+                         drives=None, **kwargs) -> Dict[str, object]:
+    """THE STANDARD'S OWN CURVE, COMPUTED, AND THE SECOND ROUTE TO ITS PEAK.
+
+    SMPTE 32M 3.9.1.1.6 defines the optimum record current as the one
+    "which returns the maximum output signal level during playback".
+    `optimum_record_drive` answers that with a geometric argument - write
+    until the layer is as deep as the reproduce head can see. This answers
+    the same question by actually building the curve the clause describes:
+    the flux linked at each drive, through the tape's own remanence curve,
+    Wallace's depth weighting and the transition length.
+
+    THE TWO ROUTES ARE INDEPENDENT AND THEY AGREE. Measured over 1200
+    drives from 1.02 to 20 times the coercivity, at the format's 0.30 um
+    gap, 0.05 um separation and the standard's 5.80 m/s:
+
+        band            curve peak   geometric   ratio
+        sync tip           3.616       3.598     1.005
+        luma centre        3.315       3.278     1.011
+        peak white         3.046       3.000     1.015
+        colour under      15.520      15.934     0.974
+
+    Nothing was tuned to make those agree. One route knows only the depth
+    the head can see and the depth the field reaches; the other knows only
+    the tape's remanence curve and the length of a reversal. That they land
+    within one and a half per cent of each other across a factor of five in
+    drive is the check on both.
+
+    AND THE CONTROL FAILS INFORMATIVELY. With the transition term removed
+    the curve has no peak at all - it is monotone to the end of the grid at
+    every frequency - so the maximum the standard names is created by the
+    transition length and by nothing else in this model. A curve that peaked
+    without it would mean the depth integral was wrong.
+    """
+    band = spec_band_centres()
+    frequency = (float(band["luma_geometric_centre_hz"])
+                 if frequency_hz is None else float(frequency_hz))
+    if drives is None:
+        # from just above the coercivity, below which nothing is recorded at
+        # all, to well past the core's own saturation headroom
+        drives = np.linspace(1.02, 20.0, 1200)
+    drives = np.asarray(drives, dtype=np.float64)
+    flux = np.array([linked_flux(float(drive), frequency, **kwargs)
+                     for drive in drives])
+    plain = np.array([linked_flux(float(drive), frequency, transition=False,
+                                  **kwargs) for drive in drives])
+    peak = int(np.argmax(flux))
+    geometric = optimum_record_drive(frequency, **{
+        key: value for key, value in kwargs.items()
+        if key in ("gap_m", "spacing_m", "writing_speed_m_s")})
+    return {
+        "frequency_hz": frequency,
+        "drive_ratio": drives,
+        "linked_flux": flux,
+        "linked_flux_without_transition": plain,
+        "peak_drive_ratio": float(drives[peak]),
+        "geometric_drive_ratio": geometric["drive_ratio"],
+        "agreement": float(drives[peak]) / geometric["drive_ratio"],
+        "without_transition_is_monotone": bool(int(np.argmax(plain))
+                                               == len(plain) - 1),
+        "clause": "SMPTE 32M 3.9.1.1.6",
+    }

@@ -1,0 +1,78 @@
+# Modelled-residual report: one readable file for this tool, edited by hand.
+# Read by tools/ringing_measure/modelled_residuals.py. Every key has a
+# documented default, so the tool runs with no file at all.
+#
+# Ethan, 2026-09-06: "generate a report on all the modeled residuals. I need
+# to see what I am modeling and what the difference is for each field."
+#
+# WHAT THIS TOOL MEASURES, so the keys below mean something. Every decoded
+# field carries about 254 horizontal sync pulses, and the sync pulse is the
+# only deterministic step the signal contains. Measured against its
+# specified shape, one field's pulse gives one complex frequency response -
+# the channel as that field witnessed it. The component key is then fitted
+# to each field separately, so every number in the report has a field axis
+# instead of being pooled into one figure for the whole decode.
+
+[decodes]
+# Where the decoded time base files live. Each entry of `prefixes` names a
+# <directory>/<prefix>.tbc and its <prefix>.tbc.json.
+directory = "/output/decodes"
+
+# The decodes to report on. The three uncorrected captures are the default
+# set: the measurement layer runs BEFORE any correction is applied, so an
+# uncorrected decode is what the instrument is specified against
+# (hsync_model_report: "Run it against UNCORRECTED decodes").
+prefixes = ["ss_cd_off", "ss_home_off", "ss_pnb_off"]
+
+# Human names for the report's tables, one per prefix. Optional.
+[decodes.labels]
+ss_cd_off = "countdown tape, correction off"
+ss_home_off = "home recording, correction off"
+ss_pnb_off = "pluge/needle-pulse bars, correction off"
+ss_cd_on = "countdown tape, correction on"
+ss_home_on = "home recording, correction on"
+ss_pnb_on = "pluge/needle-pulse bars, correction on"
+
+[measurement]
+# The video standard, tape format and speed whose SysParams fix the sync
+# geometry. Every timing in the instrument is derived from these, never
+# typed: front porch, sync width, sync transition, active start, sample rate.
+system = "NTSC"
+tape_format = "VHS"
+tape_speed = "sp"
+
+# Which polarity of the sync edge to model. "fall" is the falling edge into
+# the sync tip - the view the arc's recorded results use, and the one whose
+# window is entirely inside blanking. The rising edge is available as "rise".
+view = "fall"
+
+# The band the response is modelled over, in hertz. Below 200 kHz the
+# 79-sample fall window has no information (the export's own validity note);
+# above 3.5 MHz the ideal step's spectrum falls under the instrument's 2 per
+# cent amplitude gate and the ratio is noise over noise.
+band_hz = [2.0e5, 4.0e6]
+
+[model]
+# The rank cut for the modelable-subspace projection, as a fraction of the
+# operator's largest singular value. The export's own measured relative
+# standard error is the honest choice: a direction the measurement cannot
+# see above its own noise is not a direction the measurement has.
+# 0.01093 is the figure recorded in vhsdecode/models/modelable_subspace.py.
+relative_error = 0.01093
+
+# Include the entry-wise admitted key (55 entries) alongside the 14-entry
+# base key. It costs about a minute per decode and is what the held-out
+# ladder refuses most of, so it is off by default.
+admitted_key = false
+
+[output]
+# Where the figures are written. They are PNG files, not an interactive
+# window: this container is headless and a plot that only calls plt.show()
+# produces nothing at all.
+figures = "/output"
+
+# Where the written report is placed, relative to the repository root.
+document = "docs/MODELLED_RESIDUALS.md"
+
+# Figure resolution in dots per inch.
+dpi = 140

@@ -446,10 +446,25 @@ def field_constant(amplitudes) -> Dict[str, object]:
 
         decode                 within field   between fields   white would
                                      (IRE)            (IRE)      give (IRE)
-        wide 75bars SP              0.5770           0.1014        0.0372
-        filt 75bars SP              0.5774           0.1016        0.0372
-        wide chromanoise SP         0.5282           0.1142        0.0340
-        wide 75bars EP              0.6659           0.2144        0.0429
+        wide 75bars SP              0.6452           0.1134        0.0416
+        filt 75bars SP              0.6457           0.1136        0.0416
+        wide chromanoise SP         0.5906           0.1277        0.0380
+        wide 75bars EP              0.7446           0.2397        0.0480
+
+    THOSE ABSOLUTE FIGURES WERE FIRST PUBLISHED 11.82 PER CENT LOW, and the
+    correction is recorded rather than quietly applied. The time-base
+    file's own `black16bIre` and `white16bIre` have been spread apart by
+    the decoder's `--level_adjust`, which defaults to a tenth, while
+    `blanking16bIre` is left alone - so the familiar
+    `(white16bIre - black16bIre) / 100` returns 400.768 units an IRE where
+    the decode itself used 358.4. Reconstructing the unadjusted trio gives
+    15360, 18048 and 51200, which puts black at exactly the specified 7.5
+    IRE setup and white at exactly 100, and that exactness is the check
+    that the reconstruction is right rather than merely plausible.
+
+    EVERY RATIO IN THIS MODULE IS UNAFFECTED, which is why the conclusions
+    stand: the excess over white noise, the correlation inflation and the
+    verdict are all scale-free, and only the absolute IRE columns moved.
 
     So the field-to-field term is 2.73 to 5.00 times what independent line
     noise would produce, on all four. The two readings of one specification
